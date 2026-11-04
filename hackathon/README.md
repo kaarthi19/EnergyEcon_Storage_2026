@@ -1,0 +1,143 @@
+# BESS Bidding Algorithm: EMA Hackathon (Nov 2026)
+
+This is a bidding algorithm for the [EMA BESS Bidding Algorithm Hackathon](https://www.ema.gov.sg/content/dam/corporate/our-energy-story/energy-grid/EMA-Our-Energy-Story-Energy-Grid-BESS-Bidding-Algorithm-Hackathon.pdf.coredownload.pdf). It bids a 100 MW / 100 MWh battery (5–95 % SOC, 85 % round-trip efficiency) into the Singapore Wholesale Electricity Market.
+
+For every half-hourly trading period it produces price–quantity offers for:
+- **Energy**: charging is negative MW, discharging is positive MW;
+- **Regulation**
+- **Primary Reserve**
+- **Contingency Reserve**
+
+The package adapts the storage model in `../code/bilevel_cvx.jl`. It keeps Julia and JuMP but replaces Gurobi with the open-source HiGHS solver, so EMA can run it without a commercial licence.
+
+- Method: [`docs/ALGORITHM.md`](docs/ALGORITHM.md) (submission item 7b)
+- Data and software: [`docs/EXTERNAL_DATA_AND_SOFTWARE.md`](docs/EXTERNAL_DATA_AND_SOFTWARE.md) (submission item 7c)
+
+## Install
+
+You need Julia 1.10 (LTS) or later.
+
+```bash
+julia --project=hackathon -e 'using Pkg; Pkg.instantiate()'
+```
+
+## Quick start
+
+All commands run from the repository root.
+
+1. Run the tests:
+
+```bash
+julia --project=hackathon hackathon/test/runtests.jl
+```
+
+2. Create synthetic data, used until EMA releases the datasets on 13 Nov 2026:
+
+```bash
+julia --project=hackathon hackathon/scripts/make_synthetic.jl --days 21
+```
+
+3. Run a closed-loop backtest. Results go to `hackathon/results/backtest/`:
+
+```bash
+julia --project=hackathon hackathon/scripts/backtest.jl --data hackathon/data/synthetic/market.csv
+```
+
+4. Generate offers from the data available at a decision time and the current SOC:
+
+```bash
+julia --project=hackathon hackathon/scripts/generate_bids.jl --data hackathon/data/synthetic/market.csv --origin 2026-01-10T17:30:00 --soc 60 --out hackathon/results/bids.csv
+```
+
+### Backtest options
+
+| Option | Meaning |
+|---|---|
+| `--config <toml>` | Configuration file (default `configs/default.toml`) |
+| `--start <timestamp or row>` | First evaluated period (default: day 8) |
+| `--end <timestamp or row>` | Last evaluated period |
+| `--out <dir>` | Output folder |
+
+The backtest writes three files:
+- `periods.csv`: dispatch, awards, SOC and revenue for each period;
+- `bids.csv`: every offer tranche;
+- `summary.csv`: revenue by product, penalties, violations, cycles, and the perfect-foresight bound with the capture ratio.
+
+### From Julia
+
+```julia
+include("hackathon/src/BESSBidding.jl"); using .BESSBidding
+cfg = load_config("hackathon/configs/default.toml")
+df  = load_market_data("path/to/ema_data", cfg)
+bids = generate_bids(df, origin_row, soc_mwh, cfg)   # Vector{PeriodBids}
+write_bids("bids.csv", bids, cfg)
+```
+
+`generate_bids` reads only rows up to `origin_row`, plus pre-dispatch values within the pre-dispatch horizon. It works when the table ends at the decision time, so EMA's simulator can call it once per trading period (rolling mode) or once per day (day-ahead mode).
+
+## When EMA releases the data (13 Nov 2026)
+
+1. Map EMA's column names in `[data]` / `[data.columns]` of the config. The loader accepts either a timestamp column or date plus trading-period columns. It accepts one CSV or a folder of CSVs joined on time.
+2. Check every `ASSUMPTION` in `configs/default.toml` against EMA's notes, the SWEM Market Rules and **RC383 §3.1.2**:
+   - offer layout and sign convention;
+   - price limits and tranche counts;
+   - regulation definition;
+   - reserve deployment and sustain duration;
+   - gate-closure lead time;
+   - the initial SOC.
+
+   If the layout differs, adapt `offers_table` in `src/bids.jl`.
+3. Backtest on EMA's data up to the cut-off. Tune these parameters:
+   - `forecast.method`;
+   - `battery.degradation_cost`;
+   - `strategy.horizon_periods`;
+   - the grid quantiles;
+   - `strategy.soc_guard`.
+4. Add the sources of any external data to `docs/EXTERNAL_DATA_AND_SOFTWARE.md`.
+
+## Layout
+
+```
+hackathon/
+├── Project.toml, Manifest.toml   # pinned Julia environment
+├── configs/default.toml          # battery, market-rule assumptions, strategy, data mapping
+├── src/
+│   ├── BESSBidding.jl            # module
+│   ├── config.jl                 # typed configuration
+│   ├── data.jl                   # EMA data loading -> canonical half-hourly table
+│   ├── synthetic.jl              # synthetic SWEM-like data for development
+│   ├── forecast.jl               # ridge / pre-dispatch / seasonal-naive forecasts (no look-ahead)
+│   ├── optimizer.jl              # energy + reserve co-optimisation (JuMP + HiGHS)
+│   ├── strategy.jl               # price sweeps -> offers; rolling and day-ahead modes
+│   ├── bids.jl                   # offer curves, SOC safety guard, validation, export
+│   ├── simulator.jl              # local co-optimised, price-taking market clearing
+│   ├── backtest.jl               # closed-loop backtest + perfect-foresight benchmark
+│   └── io.jl                     # outputs, generate_bids entry point
+├── scripts/                      # command-line entry points
+├── test/runtests.jl
+└── docs/
+```
+
+## Results on synthetic data
+
+The backtest ran over 14 synthetic days in rolling mode (lead = 1, ridge forecast), with the default config and `scripts/backtest.jl`:
+
+| Metric | Value |
+|---|---|
+| Net market revenue | $953k (energy 168k, regulation 619k, primary 0.2k, contingency 165k) |
+| Perfect-foresight bound | $1,042k, so the capture ratio is **91.5 %** |
+| SOC or sustainability violations | **0** (SOC stayed within 5.0–95.0 MWh) |
+| Cycling | 0.56 equivalent full cycles per day |
+| Runtime | 83 s in total, about 6 s per simulated day |
+
+Two settings cost a lot of revenue on five synthetic days:
+- `lead_periods = 2` with the worst-case guard: capture falls to 44 %.
+- Day-ahead mode with the worst-case guard: capture falls to about 1 %. The guaranteed-feasible offers compound over 48 periods.
+
+With `soc_guard = "expected"` these two settings recover 73–79 % of perfect foresight, but they then produce SOC violations. Confirm EMA's gate-closure rules before choosing between them.
+
+Synthetic prices are illustrative only. Expect different numbers on EMA's data.
+
+## IP and confidentiality
+
+Clause 20 of the Call for Participation assigns all IP in submitted code and materials to EMA on submission. Clause 21 restricts disclosure of hackathon data. Agree how this package will be submitted with the repository's authors and your institution before you submit. Do not commit EMA's datasets to this public repository. `hackathon/data/` and `hackathon/results/` are git-ignored.

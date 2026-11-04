@@ -1,0 +1,94 @@
+# Default configuration for the EMA BESS Bidding Algorithm Hackathon.
+# Values marked "ASSUMPTION" are not given in the Call for Participation; check them
+# against the SWEM Market Rules / EMC Rule Change Paper RC383 and EMA's dataset notes.
+
+[battery]
+power_mw = 100.0            # hackathon spec
+energy_mwh = 100.0          # hackathon spec
+soc_min_frac = 0.05         # hackathon spec (5%)
+soc_max_frac = 0.95         # hackathon spec (95%)
+round_trip_eff = 0.85       # hackathon spec; split evenly, one-way = sqrt(0.85)
+initial_soc_frac = 0.50     # ASSUMPTION: EMA will specify the starting SOC
+degradation_cost = 5.0      # $/MWh of throughput (charge + discharge); strategy parameter
+
+[market]
+period_hours = 0.5          # SWEM half-hourly trading periods
+periods_per_day = 48
+price_floor = -4500.0       # ASSUMPTION: offer price floor, $/MWh
+price_cap = 4500.0          # ASSUMPTION: offer price cap, $/MWh
+max_energy_tranches = 10    # ASSUMPTION: verify against RC383 / Market Rules
+max_reserve_tranches = 5    # ASSUMPTION
+
+# Expected energy deployed per MW of reserve award per hour (MWh/MW/h). ASSUMPTION.
+# Regulation is modelled as a symmetric raise/lower product.
+[market.deployment]
+regulation_up = 0.10
+regulation_down = 0.10
+primary = 0.02
+contingency = 0.01
+
+# Hours a raise-reserve award must be sustainable from stored energy. ASSUMPTION.
+[market.sustain_hours]
+regulation = 0.5
+primary = 0.5
+contingency = 0.5
+
+# Optional per-product MW caps on reserve offers (0 = use battery power rating).
+[market.reserve_cap_mw]
+regulation = 0.0
+primary = 0.0
+contingency = 0.0
+
+[strategy]
+mode = "rolling"            # "rolling" (re-bid each period from actual SOC) | "day_ahead"
+horizon_periods = 96        # look-ahead window of the co-optimisation (2 days)
+lead_periods = 1            # periods between decision time and the trading period bid for.
+                            # ASSUMPTION: set to the gate-closure lead EMA specifies. Values > 1
+                            # cost revenue because open offers must stay SOC-feasible (soc_guard).
+terminal_soc_frac = 0.50    # SOC target / reference at the end of the look-ahead window
+terminal_value_mode = "soft" # "soft" (value stored energy at forecast price) | "hard" (SOC >= target)
+use_binary = false          # true: binary forbids simultaneous charge/discharge (MILP, ~400x slower).
+                            # Offers and settlement use net MW, so the LP is the default.
+energy_grid_quantiles = [0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]
+reserve_grid_quantiles = [0.05, 0.25, 0.5, 0.75, 0.95]
+# Linear price impact of the BESS's own net energy ($/MWh per MW). 0 = price taker.
+# > 0 enables the price-maker extension adapted from the repo's bilevel model (QP, no binaries).
+price_impact = 0.0
+# How the SOC at the start of a bid period is bounded when earlier offers are still open
+# (rolling mode with lead_periods > 1, and every period after the first in day_ahead mode).
+# "worst_case": feasible for every clearing outcome of the open offers (no violations, but
+#               conservative). "expected": expected SOC path +/- soc_margin_mwh (more revenue,
+#               violations possible when prices deviate strongly from forecast).
+soc_guard = "worst_case"
+soc_margin_mwh = 5.0
+
+[forecast]
+method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"
+train_days = 28
+ridge_alpha = 1.0
+origin_stride_periods = 12  # spacing of training forecast origins inside the training window
+pd_horizon_periods = 48     # ASSUMPTION: pre-dispatch covers this many periods after decision time
+
+[simulation]
+shortfall_penalty = 4500.0  # $/MWh of energy the battery could not deliver within SOC limits
+stochastic_deployment = false
+seed = 7
+
+# Canonical name -> column name in EMA's files. Edit when the dataset is released.
+# Either a single timestamp column, or a date column plus a trading-period column (1..48).
+[data]
+timestamp_col = "timestamp"
+date_col = ""
+period_col = ""
+timestamp_format = "yyyy-mm-ddTHH:MM:SS"
+
+[data.columns]
+price_energy = "price_energy"
+price_regulation = "price_regulation"
+price_primary = "price_primary"
+price_contingency = "price_contingency"
+pd_energy = "pd_energy"              # pre-dispatch forecasts (optional columns)
+pd_regulation = "pd_regulation"
+pd_primary = "pd_primary"
+pd_contingency = "pd_contingency"
+pd_demand = "pd_demand"
