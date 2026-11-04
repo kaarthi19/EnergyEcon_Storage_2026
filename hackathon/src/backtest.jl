@@ -37,7 +37,7 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         for τ in (start_row - L):(end_row - L)
             τ >= start_row && settle!(τ)
             t = τ + L
-            pending = [bids[k] for k in (τ + 1):(t - 1) if haskey(bids, k)]
+            pending = [get(bids, k, idle_bids(k, df.timestamp[k])) for k in (τ + 1):(t - 1)]
             bids[t] = rolling_bids(df, τ, soc, pending, cfg)
             if progress && (t - start_row) % cfg.market.periods_per_day == 0
                 @info "bidding" timestamp = df.timestamp[t] soc = round(soc; digits = 1) elapsed_s = round(time() - t0; digits = 1)
@@ -84,6 +84,7 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         penalty = [outcomes[t].revenue[:penalty] for t in rows],
         shortfall_mwh = [outcomes[t].shortfall_mwh for t in rows],
         sustain_violation = [outcomes[t].sustain_violation for t in rows],
+        sustain_violation_mwh = [outcomes[t].sustain_violation_mwh for t in rows],
         throughput_mwh = [outcomes[t].throughput_mwh for t in rows],
     )
     bl = [bids[t] for t in rows if haskey(bids, t)]
@@ -119,12 +120,12 @@ function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg:
         metric = ["days", "net_market_revenue", "revenue_energy", "revenue_regulation", "revenue_primary",
                   "revenue_contingency", "shortfall_penalty", "net_revenue_after_penalty",
                   "degradation_cost_internal", "equivalent_full_cycles", "cycles_per_day",
-                  "shortfall_mwh", "sustain_violation_periods", "soc_min_seen_mwh", "soc_max_seen_mwh",
+                  "shortfall_mwh", "sustain_violation_periods", "max_sustain_violation_mwh", "soc_min_seen_mwh", "soc_max_seen_mwh",
                   "perfect_foresight_revenue", "capture_ratio"],
         value = [days, market_rev, tot(:rev_energy), tot(:rev_regulation), tot(:rev_primary),
                  tot(:rev_contingency), tot(:penalty), market_rev + tot(:penalty),
                  cfg.battery.degradation_cost * tot(:throughput_mwh), cycles, cycles / days,
-                 tot(:shortfall_mwh), count(periods.sustain_violation),
+                 tot(:shortfall_mwh), count(periods.sustain_violation), maximum(periods.sustain_violation_mwh),
                  minimum(periods.soc_end_mwh), maximum(periods.soc_end_mwh),
                  pf, pf > 0 ? market_rev / pf : NaN],
     )

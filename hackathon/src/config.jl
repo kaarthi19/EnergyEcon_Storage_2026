@@ -23,8 +23,14 @@ Base.@kwdef struct MarketConfig
     periods_per_day::Int = 48
     price_floor::Float64 = -4500.0
     price_cap::Float64 = 4500.0
-    max_energy_tranches::Int = 10
+    max_energy_tranches::Int = 10      # tranches kept when building the curve (before RC383 conform)
+    max_charge_pairs::Int = 5          # RC383 §5.2B.2.4(a): pairs 1-5 charge
+    max_discharge_pairs::Int = 5       # RC383 §5.2B.2.4(b): pairs 6-10 discharge
     max_reserve_tranches::Int = 5
+    reserve_headroom::String = "per_class"   # RC383 D.17.2.4A: limit applies per reserve offer
+    offered_capacity_mw::Float64 = 0.0       # §5.2B.2.5 max combined transfer (0 = power rating)
+    ramp_up_mw_per_min::Float64 = 100.0      # §5.2B.2.6
+    ramp_down_mw_per_min::Float64 = 100.0
     deploy_reg_up::Float64 = 0.10
     deploy_reg_down::Float64 = 0.10
     deploy_primary::Float64 = 0.02
@@ -35,22 +41,28 @@ Base.@kwdef struct MarketConfig
     reserve_cap_mw::Dict{Symbol,Float64} = Dict(:regulation => 0.0, :primary => 0.0, :contingency => 0.0)
 end
 
-"Effective MW cap for a reserve product (0 in the config means the battery power rating)."
+"""
+Effective MW cap for a reserve product. 0 in the config means the battery power rating.
+RC383 §3.2.1 allows ESS reserve capability up to twice the rating when charging (subject to
+PSO-approved standing capability data), so caps up to 2P are accepted.
+"""
 reserve_cap(m::MarketConfig, b::BatteryConfig, p::Symbol) =
-    (c = get(m.reserve_cap_mw, p, 0.0); c > 0 ? min(c, b.power_mw) : b.power_mw)
+    (c = get(m.reserve_cap_mw, p, 0.0); c > 0 ? min(c, 2 * b.power_mw) : b.power_mw)
 
 Base.@kwdef struct StrategyConfig
     mode::String = "rolling"
     horizon_periods::Int = 96
-    lead_periods::Int = 1
+    lead_periods::Int = 3
     terminal_soc_frac::Float64 = 0.5
     terminal_value_mode::String = "soft"
     use_binary::Bool = false
     energy_grid_quantiles::Vector{Float64} = [0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]
     reserve_grid_quantiles::Vector{Float64} = [0.05, 0.25, 0.5, 0.75, 0.95]
     price_impact::Float64 = 0.0
-    soc_guard::String = "worst_case"
+    soc_guard::String = "quantile"
+    soc_guard_quantile::Float64 = 0.999
     soc_margin_mwh::Float64 = 5.0
+    soc_guard_buffer_mwh::Float64 = 0.5
 end
 
 Base.@kwdef struct ForecastConfig
@@ -117,7 +129,13 @@ function load_config(path::AbstractString)
         price_floor = Float64(_get(m, "price_floor", -4500.0)),
         price_cap = Float64(_get(m, "price_cap", 4500.0)),
         max_energy_tranches = Int(_get(m, "max_energy_tranches", 10)),
+        max_charge_pairs = Int(_get(m, "max_charge_pairs", 5)),
+        max_discharge_pairs = Int(_get(m, "max_discharge_pairs", 5)),
         max_reserve_tranches = Int(_get(m, "max_reserve_tranches", 5)),
+        reserve_headroom = String(_get(m, "reserve_headroom", "per_class")),
+        offered_capacity_mw = Float64(_get(m, "offered_capacity_mw", 0.0)),
+        ramp_up_mw_per_min = Float64(_get(m, "ramp_up_mw_per_min", 100.0)),
+        ramp_down_mw_per_min = Float64(_get(m, "ramp_down_mw_per_min", 100.0)),
         deploy_reg_up = Float64(_get(dep, "regulation_up", 0.10)),
         deploy_reg_down = Float64(_get(dep, "regulation_down", 0.10)),
         deploy_primary = Float64(_get(dep, "primary", 0.02)),
@@ -149,7 +167,10 @@ function validate(c::Config)
     m.price_floor < m.price_cap || error("price_floor must be below price_cap")
     s.mode in ("rolling", "day_ahead") || error("strategy.mode must be rolling or day_ahead")
     s.terminal_value_mode in ("soft", "hard") || error("terminal_value_mode must be soft or hard")
-    s.soc_guard in ("worst_case", "expected") || error("soc_guard must be worst_case or expected")
+    s.soc_guard in ("worst_case", "quantile", "expected") || error("soc_guard must be worst_case, quantile or expected")
+    0.5 <= s.soc_guard_quantile < 1 || error("soc_guard_quantile must be in [0.5, 1)")
+    m.reserve_headroom in ("per_class", "summed") || error("reserve_headroom must be per_class or summed")
+    1 <= m.max_charge_pairs <= 5 && 1 <= m.max_discharge_pairs <= 5 || error("RC383 allows at most 5 charging and 5 discharging pairs")
     s.horizon_periods >= 1 || error("horizon_periods must be >= 1")
     s.lead_periods >= 1 || error("lead_periods must be >= 1")
     c.forecast.method in ("ridge", "seasonal_naive", "predispatch") || error("unknown forecast method")

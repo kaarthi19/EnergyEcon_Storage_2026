@@ -53,9 +53,9 @@ The model is a linear program over the look-ahead window (default 96 periods = 4
 |---|---|
 | SOC dynamics with expected reserve deployment | `soc_j = soc_{j-1} + Δt(η c_j − d_j/η) + Σ_p δ_p r_p,j` |
 | SOC limits | `E_min ≤ soc_j ≤ E_max` |
-| Raise headroom | `d_j − c_j + r_reg + r_pri + r_con ≤ P` |
-| Lower headroom | `c_j − d_j + r_reg ≤ P` |
-| Raise energy sustainability | `soc_{j-1} − (d_j Δt + Σ_p r_p S_p)/η ≥ E_min` |
+| Raise headroom (RC383 D.17.2.4A, D.18.1.6) | `d_j − c_j + r_reg + r_k ≤ P` for each reserve class k ∈ {pri, con}. This is the default `reserve_headroom = "per_class"`, because the rule applies to each reserve offer separately. `"summed"` stacks primary and contingency instead. |
+| Lower headroom (RC383 D.18.1.7) | `c_j − d_j + r_reg ≤ P` |
+| Raise energy sustainability | `soc_{j-1} − (d_j Δt + r_reg S_reg + max(r_pri S_pri, r_con S_con))/η ≥ E_min`. Under `"summed"`, the max becomes a sum. |
 | Lower energy sustainability | `soc_{j-1} + η(c_j Δt + r_reg S_reg) ≤ E_max` |
 | Charge/discharge | `c_j + d_j ≤ P`. With `use_binary = true`, a binary forbids simultaneous charge and discharge (MILP), as in `bilevel_cvx.jl`. |
 | End of window | soft: stored energy valued at η × median forecast energy price; or hard: `soc_H ≥ target` |
@@ -80,7 +80,22 @@ A schedule says what to do at one price. An offer must say what to do at every p
 
 For an LP, x(λ) is non-decreasing in its own price (parametric LP monotonicity), so the result is a valid monotone supply curve. Each jump is then **bisected** until the switching price is known to about $1 (or 1 %). That switching price is the battery's **opportunity cost** for that MW, because it accounts for the whole look-ahead window. Small MILP inversions are repaired by isotonic correction. Tranches are merged down to the allowed maximum (`max_energy_tranches`, `max_reserve_tranches`).
 
-**Energy offer layout** (`offers_table`): one curve over net MW from the most-charging position to the most-discharging. The quantity cleared at price λ is `base + Σ tranches with price ≤ λ`. Rows with `mw_to ≤ 0` are charging (negative MW). Rows with `mw_from ≥ 0` are discharging (positive MW). A tranche that crosses 0 MW is split. This is the assumed reading of RC383 §3.1.2 and **must be checked against the paper** before submission (§8).
+**Energy storage offer (RC383).** The energy offer follows Market Rules Ch. 6 §5.2B, introduced by RC383 and effective 12 Aug 2025 (`storage_pairs`, `offers_table`):
+
+- **Pairs.** 1 to 10 price–quantity pairs in increasing price order. Pairs **1–5 charge** (quantity ≤ 0 MW) and **6–10 discharge** (quantity ≥ 0 MW). Every charging price is below every discharging price. Prices have 2 decimals and stay within the Appendix 6J limits.
+- **Clearing.** A charging pair clears when the clearing price is *below* its offer price. A discharging pair clears when the clearing price is *above* its offer price (§3.1.2 c–d).
+- **Mapping from the internal curve.** The internal net-MW curve maps one-to-one onto these pairs:
+  - each charging tranche (p, q) means "stop charging q MW once the price reaches p", i.e. the charging pair (p, −q);
+  - the part of the curve that always charges is a charging pair at the price cap;
+  - the part that always discharges is a discharging pair at the price floor;
+  - a tranche crossing 0 MW is split into a charging pair and a discharging pair, with the discharging price raised by $0.01;
+  - each side is merged to at most 5 pairs;
+  - an offer with no transfer is a single (slot 6, $0.00, 0 MW) pair (§5.2B.4).
+- **No rounding drift.** The algorithm converts the curve to pairs and back before submission, so the offer the simulator clears is exactly the offer exported.
+- **Tests.** A unit test replays RC383's worked example (3 charging and 2 discharging pairs, cleared at six prices) and gets the published schedules.
+- **Header fields.** The offered capacity (§5.2B.2.5, maximum combined transfer for energy, reserve and regulation) and the ramp rates (§5.2B.2.6) are repeated on each energy row.
+
+**Reserve and regulation offers.** Up to `max_reserve_tranches` incremental tranches, with any unconditional part priced at $0. RC383 does not change the reserve offer format, so this is still an assumption.
 
 ## 6. BESS operating limits and market rules
 
@@ -89,9 +104,14 @@ For an LP, x(λ) is non-decreasing in its own price (parametric LP monotonicity)
   2. then the planned quantities themselves.
 
   A unit test clears 1,400 random price draws against guarded offers from SOC = 5 … 95 MWh and finds no violation.
-- **Open offers.** When earlier offers are still unsettled (`lead_periods > 1`, or day-ahead mode), the starting SOC is an interval, and it is propagated through those offers.
-  - `soc_guard = "worst_case"` guarantees compliance but gives up revenue.
-  - `soc_guard = "expected"` uses the expected SOC path ± `soc_margin_mwh`. It earns more but can produce violations.
+- **Reserve capability while charging.** RC383 §3.2.1 lets an ESS offer reserves of up to twice its rating while charging, subject to PSO standing capability data. `[market.reserve_cap_mw]` accepts caps up to 2P. The default is P.
+- **Gate closure and open offers.** Offers close 65 minutes before the dispatch period (RC383, Table 2). When the offer for period t is fixed, periods t−2 and t−1 are still open, so the default is `lead_periods = 3`. The SOC at the start of t is therefore an interval, propagated through the open offers:
+  - `"worst_case"` covers every clearing outcome. It is guaranteed but very conservative.
+  - `"quantile"` (default, q = 0.999) clears each open offer at every combination of energy-price tails {1−q, mean, q} and reserve-price tails {1−q, q}. It needs several combinations because the market can trade charging against regulation-lower. Violations can only follow prices beyond these tails.
+  - `"expected"` uses the expected SOC path ± `soc_margin_mwh`.
+
+  A `soc_guard_buffer_mwh` (0.5 MWh) keeps offers just inside the 5 %/95 % limits.
+- **SOC in market clearing.** RC383 does not model SOC in the market clearing engine; RC386 addresses that separately. Feasibility against SOC is therefore the participant's responsibility, which is what this guard provides.
 - **Offer validation** (`validate_bids`) checks that:
   - prices are ascending and within the floor and cap;
   - the tranche count is within limits;
@@ -116,17 +136,29 @@ The summary reports:
 - the SOC range;
 - a **perfect-foresight** upper bound (the same LP with realised prices) and the **capture ratio** against it.
 
-## 8. Key assumptions to confirm when EMA releases the data
+## 8. Market rules: confirmed vs. assumed
+
+**Confirmed from RC383** (EMC/RCP/139/2024/RC383, effective 12 Aug 2025):
+- energy storage offer structure, sign convention, clearing rule and pair limits (§5.2B, §3.1.2);
+- the 0 MW → $0.00 rule;
+- the charge and discharge totals within the maximum limits;
+- offered capacity and ramp rates in the offer;
+- per-class joint capability for reserves (D.17.2.4A);
+- the regulation max/min envelope (D.18.1.6/7);
+- reserve capability up to 2× rating while charging (§3.2.1);
+- 65-minute gate closure (industry comments, Table 2).
+
+**Still assumed:**
 
 | Item | Current setting | Where |
 |---|---|---|
-| Energy offer layout and sign convention (RC383 §3.1.2) | single monotone curve, charging negative | `offers_table` |
-| Offer price floor / cap | −4,500 / 4,500 $/MWh | `[market]` |
-| Max tranches | 10 energy, 5 per reserve | `[market]` |
+| Offer price floor / cap (Appendix 6J) | −4,500 / 4,500 $/MWh | `[market]` |
+| Reserve/regulation offer tranche count | 5 | `[market]` |
 | Regulation product | symmetric raise/lower | `optimizer.jl` |
 | Reserve deployment energy | 10 % / 10 % / 2 % / 1 % | `[market.deployment]` |
 | Sustain duration | 0.5 h for all reserves | `[market.sustain_hours]` |
-| Gate closure / lead time | 1 period | `strategy.lead_periods` |
+| Ramp rates | 100 MW/min | `[market]` |
+| How EMA's simulator applies gate closure | 3-period lead | `strategy.lead_periods` |
 | Pre-dispatch horizon | 48 periods | `forecast.pd_horizon_periods` |
 | Initial SOC | 50 % | `battery.initial_soc_frac` |
 | Data schema | canonical names | `[data]`, `[data.columns]` |

@@ -14,10 +14,21 @@ degradation_cost = 5.0      # $/MWh of throughput (charge + discharge); strategy
 [market]
 period_hours = 0.5          # SWEM half-hourly trading periods
 periods_per_day = 48
-price_floor = -4500.0       # ASSUMPTION: offer price floor, $/MWh
-price_cap = 4500.0          # ASSUMPTION: offer price cap, $/MWh
-max_energy_tranches = 10    # ASSUMPTION: verify against RC383 / Market Rules
-max_reserve_tranches = 5    # ASSUMPTION
+price_floor = -4500.0       # ASSUMPTION: lower price limit of Market Rules Appendix 6J, $/MWh
+price_cap = 4500.0          # ASSUMPTION: upper price limit of Appendix 6J, $/MWh
+# Energy storage offers (RC383, Market Rules Ch.6 §5.2B): 1-10 price-quantity pairs in
+# increasing price order; pairs 1-5 charge (<= 0 MW), pairs 6-10 discharge (>= 0 MW).
+max_charge_pairs = 5
+max_discharge_pairs = 5
+max_energy_tranches = 10    # curve resolution before conforming to the 5 + 5 pair structure
+max_reserve_tranches = 5    # ASSUMPTION: reserve/regulation offer format is not in RC383
+# RC383 Appendix 6D D.17.2.4A: transfer + reserve + regulation <= max capacity, applied to
+# each reserve offer separately ("per_class": primary and contingency share headroom).
+# "summed" stacks primary and contingency (conservative).
+reserve_headroom = "per_class"
+offered_capacity_mw = 0.0   # §5.2B.2.5 maximum combined transfer limit (0 = power rating)
+ramp_up_mw_per_min = 100.0  # §5.2B.2.6 ASSUMPTION: BESS can ramp full range within a minute
+ramp_down_mw_per_min = 100.0
 
 # Expected energy deployed per MW of reserve award per hour (MWh/MW/h). ASSUMPTION.
 # Regulation is modelled as a symmetric raise/lower product.
@@ -33,7 +44,8 @@ regulation = 0.5
 primary = 0.5
 contingency = 0.5
 
-# Optional per-product MW caps on reserve offers (0 = use battery power rating).
+# Optional per-product MW caps on reserve offers (0 = use battery power rating). RC383 §3.2.1
+# lets ESS offer up to 2x rating when charging if PSO standing capability data allows it.
 [market.reserve_cap_mw]
 regulation = 0.0
 primary = 0.0
@@ -42,9 +54,9 @@ contingency = 0.0
 [strategy]
 mode = "rolling"            # "rolling" (re-bid each period from actual SOC) | "day_ahead"
 horizon_periods = 96        # look-ahead window of the co-optimisation (2 days)
-lead_periods = 1            # periods between decision time and the trading period bid for.
-                            # ASSUMPTION: set to the gate-closure lead EMA specifies. Values > 1
-                            # cost revenue because open offers must stay SOC-feasible (soc_guard).
+lead_periods = 3            # periods between decision time and the trading period bid for.
+                            # Gate closure is 65 min before the dispatch period (RC383 Table 2),
+                            # so offers for period t are fixed while t-2 and t-1 are still open.
 terminal_soc_frac = 0.50    # SOC target / reference at the end of the look-ahead window
 terminal_value_mode = "soft" # "soft" (value stored energy at forecast price) | "hard" (SOC >= target)
 use_binary = false          # true: binary forbids simultaneous charge/discharge (MILP, ~400x slower).
@@ -54,13 +66,16 @@ reserve_grid_quantiles = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Linear price impact of the BESS's own net energy ($/MWh per MW). 0 = price taker.
 # > 0 enables the price-maker extension adapted from the repo's bilevel model (QP, no binaries).
 price_impact = 0.0
-# How the SOC at the start of a bid period is bounded when earlier offers are still open
+# How the SOC at the start of a bid period is bounded while earlier offers are still open
 # (rolling mode with lead_periods > 1, and every period after the first in day_ahead mode).
-# "worst_case": feasible for every clearing outcome of the open offers (no violations, but
-#               conservative). "expected": expected SOC path +/- soc_margin_mwh (more revenue,
-#               violations possible when prices deviate strongly from forecast).
-soc_guard = "worst_case"
+# "worst_case": feasible for every clearing outcome of open offers (no violations, but very
+#               conservative). "quantile": open offers cleared at the soc_guard_quantile tails
+#               of the price forecast (violations only beyond those tails). "expected":
+#               expected SOC path +/- soc_margin_mwh.
+soc_guard = "quantile"
+soc_guard_quantile = 0.999
 soc_margin_mwh = 5.0
+soc_guard_buffer_mwh = 0.5  # offers keep this many MWh away from the 5% / 95% SOC limits
 
 [forecast]
 method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"

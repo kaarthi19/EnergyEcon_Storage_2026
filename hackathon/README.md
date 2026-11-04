@@ -3,7 +3,7 @@
 This is a bidding algorithm for the [EMA BESS Bidding Algorithm Hackathon](https://www.ema.gov.sg/content/dam/corporate/our-energy-story/energy-grid/EMA-Our-Energy-Story-Energy-Grid-BESS-Bidding-Algorithm-Hackathon.pdf.coredownload.pdf). It bids a 100 MW / 100 MWh battery (5–95 % SOC, 85 % round-trip efficiency) into the Singapore Wholesale Electricity Market.
 
 For every half-hourly trading period it produces price–quantity offers for:
-- **Energy**: charging is negative MW, discharging is positive MW;
+- **Energy**: an RC383 *energy storage offer* (Market Rules Ch. 6 §5.2B). Pairs 1–5 charge (≤ 0 MW) and pairs 6–10 discharge (≥ 0 MW);
 - **Regulation**
 - **Primary Reserve**
 - **Contingency Reserve**
@@ -60,7 +60,7 @@ julia --project=hackathon hackathon/scripts/generate_bids.jl --data hackathon/da
 
 The backtest writes three files:
 - `periods.csv`: dispatch, awards, SOC and revenue for each period;
-- `bids.csv`: every offer tranche;
+- `bids.csv`: every offer pair. Energy rows are RC383 slots 1–10, with the offered capacity and ramp rates;
 - `summary.csv`: revenue by product, penalties, violations, cycles, and the perfect-foresight bound with the capture ratio.
 
 ### From Julia
@@ -78,15 +78,14 @@ write_bids("bids.csv", bids, cfg)
 ## When EMA releases the data (13 Nov 2026)
 
 1. Map EMA's column names in `[data]` / `[data.columns]` of the config. The loader accepts either a timestamp column or date plus trading-period columns. It accepts one CSV or a folder of CSVs joined on time.
-2. Check every `ASSUMPTION` in `configs/default.toml` against EMA's notes, the SWEM Market Rules and **RC383 §3.1.2**:
-   - offer layout and sign convention;
-   - price limits and tranche counts;
-   - regulation definition;
+2. Check the remaining `ASSUMPTION`s in `configs/default.toml` against EMA's notes and the SWEM Market Rules. RC383 already fixes the energy storage offer format, per-class reserve headroom and 65-minute gate closure. These are still open:
+   - the Appendix 6J price limits;
+   - the reserve and regulation offer format;
    - reserve deployment and sustain duration;
-   - gate-closure lead time;
+   - ramp rates;
+   - how EMA's simulator applies gate closure (`lead_periods`);
    - the initial SOC.
 
-   If the layout differs, adapt `offers_table` in `src/bids.jl`.
 3. Backtest on EMA's data up to the cut-off. Tune these parameters:
    - `forecast.method`;
    - `battery.degradation_cost`;

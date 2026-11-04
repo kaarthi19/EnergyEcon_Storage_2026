@@ -30,6 +30,7 @@ export Config, BatteryConfig, MarketConfig, StrategyConfig, ForecastConfig, Simu
        forecast_prices, PriceForecast,
        build_coopt, set_price!, solve!, coopt_schedule,
        Offer, PeriodBids, cleared_mw, max_mw, min_mw, offer_from_grid, guard_soc, validate_bids, offers_table,
+       storage_pairs, from_storage_pairs, conform_storage_offer, raise_mw, raise_energy,
        clear_period, settle_period,
        rolling_bids, day_ahead_bids, generate_bids,
        run_backtest, perfect_foresight, BacktestResult,

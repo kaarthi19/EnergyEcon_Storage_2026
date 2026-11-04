@@ -72,14 +72,39 @@ function soc_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, cfg::Config)
     b, m = cfg.battery, cfg.market
     η, dt, P = eta_one_way(b), m.period_hours, b.power_mw
     dep = deployment_energy_coef(cfg)
-    rsum = sum(max_mw(pb.offers[p]) for p in RESERVES)
-    up_mw = min(P, max(max_mw(pb.offers[:energy]), 0.0) + rsum)
+    rmax = Dict(p => max_mw(pb.offers[p]) for p in RESERVES)
+    up_mw = min(P, max(max_mw(pb.offers[:energy]), 0.0) + raise_mw(rmax, m))
     dn_mw = min(P, max(-min_mw(pb.offers[:energy]), 0.0) + max_mw(pb.offers[:regulation]))
     worst_dep_dn = sum(min(0.0, dep[p]) * max_mw(pb.offers[p]) for p in RESERVES)
     worst_dep_up = sum(max(0.0, dep[p]) * max_mw(pb.offers[p]) for p in RESERVES)
     lo2 = lo - dt * up_mw / η + min(0.0, worst_dep_dn)
     hi2 = hi + η * dt * dn_mw + worst_dep_up
     return clamp(lo2, soc_min(b), soc_max(b)), clamp(hi2, soc_min(b), soc_max(b))
+end
+
+"""
+    soc_quantile_bounds_after(pb, lo, hi, f, j, q, cfg) -> (lo, hi)
+
+SOC interval after an open offer. The offer is cleared at every combination of energy price
+in {1-q tail, mean, q tail} and reserve prices in {1-q tail, q tail} of the forecast; the
+interval spans the lowest SOC reached from `lo` and the highest reached from `hi`. The
+market can trade energy against regulation, so no single combination is always the extreme.
+"""
+function soc_quantile_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, f::PriceForecast,
+                                   j::Int, q::Float64, cfg::Config)
+    qq(p, x) = forecast_quantiles(f, p, j, [x])[1]
+    e_opts = (qq(:energy, 1 - q), f.mean[:energy][j], qq(:energy, q))
+    r_opts = (1 - q, q)
+    lo2, hi2 = Inf, -Inf
+    for λe in e_opts, rq in r_opts
+        pr = Dict{Symbol,Float64}(:energy => λe)
+        for p in RESERVES
+            pr[p] = max(0.0, qq(p, rq))
+        end
+        lo2 = min(lo2, soc_expected_after(pb, lo, pr, cfg))
+        hi2 = max(hi2, soc_expected_after(pb, hi, pr, cfg))
+    end
+    return min(lo2, hi2), max(lo2, hi2)
 end
 
 "Expected SOC after a period: clear offers at forecast prices."
@@ -109,7 +134,9 @@ function rolling_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::Vector{
     for (i, pb) in enumerate(pending)
         pr = Dict(p => f.mean[p][i] for p in PRODUCTS)
         soc_exp = soc_expected_after(pb, soc_exp, pr, cfg)
-        lo, hi = soc_bounds_after(pb, lo, hi, cfg)
+        lo, hi = s.soc_guard == "quantile" ?
+            soc_quantile_bounds_after(pb, lo, hi, f, i, s.soc_guard_quantile, cfg) :
+            soc_bounds_after(pb, lo, hi, cfg)
     end
     if s.soc_guard == "expected" && !isempty(pending)
         lo = max(soc_min(cfg.battery), soc_exp - s.soc_margin_mwh)
@@ -148,6 +175,9 @@ function day_ahead_bids(df::DataFrame, τ::Int, soc_now::Float64, rows::UnitRang
         if s.soc_guard == "worst_case"
             pb = guard_soc(pb, lo, hi, cfg)
             lo, hi = soc_bounds_after(pb, lo, hi, cfg)
+        elseif s.soc_guard == "quantile"
+            pb = guard_soc(pb, lo, hi, cfg)
+            lo, hi = soc_quantile_bounds_after(pb, lo, hi, f, j0 + k - 1, s.soc_guard_quantile, cfg)
         else
             pb = guard_soc(pb, max(soc_min(cfg.battery), soc_exp - margin),
                            min(soc_max(cfg.battery), soc_exp + margin), cfg)

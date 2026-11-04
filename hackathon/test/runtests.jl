@@ -12,7 +12,9 @@ df = synthetic_market_data(days = 10, seed = 3, cfg = cfg)
     @test cfg.battery.power_mw == 100 && cfg.battery.energy_mwh == 100
     @test B.soc_min(cfg.battery) ≈ 5 && B.soc_max(cfg.battery) ≈ 95
     @test B.eta_one_way(cfg.battery)^2 ≈ 0.85
-    @test cfg.strategy.lead_periods == 1
+    @test cfg.strategy.lead_periods == 3          # 65-min gate closure
+    @test cfg.market.reserve_headroom == "per_class"
+    @test cfg.market.max_charge_pairs == 5 && cfg.market.max_discharge_pairs == 5
     c2 = with_strategy(cfg; lead_periods = 3)
     @test c2.strategy.lead_periods == 3 && c2.battery === cfg.battery
 end
@@ -66,7 +68,7 @@ end
     @test all(s.soc_mwh .>= 5 - 1e-6) && all(s.soc_mwh .<= 95 + 1e-6)
     @test all(s.charge_mw .+ s.discharge_mw .<= 100 + 1e-6)
     net = s.discharge_mw .- s.charge_mw
-    @test all(net .+ s.regulation_mw .+ s.primary_mw .+ s.contingency_mw .<= 100 + 1e-6)
+    @test all(net .+ s.regulation_mw .+ max.(s.primary_mw, s.contingency_mw) .<= 100 + 1e-6)
     @test all(-net .+ s.regulation_mw .<= 100 + 1e-6)
     # Higher own price never reduces the first-period discharge (parametric monotonicity).
     xs = Float64[]
@@ -95,6 +97,41 @@ end
     # non-monotone raw responses are repaired
     o2 = offer_from_grid(:regulation, [0.0, 10.0, 20.0, 30.0], [0.0, 50.0, 40.0, 60.0], 5)
     @test max_mw(o2) == 60 && all(>(0), o2.sizes)
+end
+
+@testset "RC383 energy storage offers" begin
+    # Worked example of RC383 §3.1.2: 3 charging and 2 discharging pairs.
+    pairs = [(slot = 1, price = -200.0, mw = -1.0), (slot = 2, price = 0.0, mw = -1.0),
+             (slot = 3, price = 200.0, mw = -1.0), (slot = 6, price = 400.0, mw = 1.0),
+             (slot = 7, price = 600.0, mw = 1.0)]
+    o = from_storage_pairs(pairs)
+    for (λ, want) in ((-300, -3), (-100, -2), (100, -1), (300, 0), (500, 1), (800, 2))
+        @test cleared_mw(o, λ) ≈ want
+    end
+    # and back to identical pairs
+    back = storage_pairs(o, cfg)
+    @test [(x.slot, x.price, x.mw) for x in back] == [(x.slot, x.price, x.mw) for x in pairs]
+    # A curve with many steps is reduced to <= 5 + 5 pairs, preserving its range.
+    big = Offer(:energy, -100.0, collect(10.0:10.0:200.0), fill(10.0, 20))
+    pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => conform_storage_offer(big, cfg),
+                      :regulation => Offer(:regulation, 0.0, Float64[], Float64[]),
+                      :primary => Offer(:primary, 0.0, Float64[], Float64[]),
+                      :contingency => Offer(:contingency, 0.0, Float64[], Float64[])))
+    sp = storage_pairs(pb.offers[:energy], cfg)
+    @test count(x -> x.slot <= 5, sp) <= 5 && count(x -> x.slot >= 6, sp) <= 5
+    @test min_mw(pb.offers[:energy]) ≈ -100 && max_mw(pb.offers[:energy]) ≈ 100
+    @test isempty(validate_bids(pb, cfg))
+    # always-charging and always-discharging curves, and the empty offer (§5.2B.4)
+    @test storage_pairs(Offer(:energy, -40.0, Float64[], Float64[]), cfg) == [(slot = 1, price = 4500.0, mw = -40.0)]
+    @test storage_pairs(Offer(:energy, 30.0, Float64[], Float64[]), cfg) == [(slot = 6, price = -4500.0, mw = 30.0)]
+    @test storage_pairs(Offer(:energy, 0.0, Float64[], Float64[]), cfg) == [(slot = 6, price = 0.0, mw = 0.0)]
+    # a tranche crossing 0 MW: charging price strictly below discharging price
+    sp2 = storage_pairs(Offer(:energy, -20.0, [150.0], [50.0]), cfg)
+    @test [x.mw for x in sp2] == [-20.0, 30.0] && sp2[1].price < sp2[2].price
+    # per-class headroom: primary and contingency share the same headroom (D.17.2.4A)
+    @test raise_mw(Dict(:regulation => 10.0, :primary => 50.0, :contingency => 60.0), cfg.market) == 70
+    cs = B.Config(cfg.battery, B.MarketConfig(reserve_headroom = "summed"), cfg.strategy, cfg.forecast, cfg.simulation, cfg.data)
+    @test raise_mw(Dict(:regulation => 10.0, :primary => 50.0, :contingency => 60.0), cs.market) == 120
 end
 
 @testset "SOC guard makes every clearing feasible" begin
@@ -130,21 +167,31 @@ end
     # joint capability: discharging 50 MW leaves 50 MW for regulation
     net, res = clear_period(pb, Dict(:energy => 250.0, :regulation => 20.0, :primary => 0.0, :contingency => 0.0), cfg)
     @test net + res[:regulation] <= 100 + 1e-6
+    # charging at 100 MW leaves up to 200 MW of raise capability (RC383 §3.2.1) if caps allow
+    pb2 = B.PeriodBids(1, DateTime(2026), Dict(
+        :energy => Offer(:energy, -100.0, Float64[], Float64[]),
+        :regulation => Offer(:regulation, 0.0, Float64[], Float64[]),
+        :primary => Offer(:primary, 0.0, Float64[], Float64[]),
+        :contingency => Offer(:contingency, 0.0, [1.0], [180.0])))
+    net, res = clear_period(pb2, Dict(:energy => 50.0, :regulation => 0.0, :primary => 0.0, :contingency => 20.0), cfg)
+    @test net ≈ -100 && res[:contingency] ≈ 180
 end
 
 @testset "bid generation and export" begin
     τ = 3 * 48
     bl = generate_bids(df, τ, 50.0, cfg)
-    @test length(bl) == 1 && bl[1].row == τ + 1
+    @test length(bl) == 1 && bl[1].row == τ + cfg.strategy.lead_periods
     @test isempty(validate_bids(bl[1], cfg))
     # works when the table ends at the decision time
     bl2 = generate_bids(df[1:τ, :], τ, 50.0, cfg)
-    @test bl2[1].timestamp == df.timestamp[τ + 1]
+    @test bl2[1].timestamp == df.timestamp[τ + cfg.strategy.lead_periods]
     tab = offers_table(bl, cfg)
     @test Set(tab.product) ⊆ Set(["energy", "regulation", "primary", "contingency"])
     e = tab[tab.product .== "energy", :]
-    @test all(e.mw_to .> e.mw_from)
-    @test all((e.direction .== "charge") .== (e.mw_to .<= 0))
+    @test all((e.direction .== "charge") .== (e.slot .<= 5))
+    @test all(e.quantity_mw[e.slot .<= 5] .<= 0) && all(e.quantity_mw[e.slot .>= 6] .>= 0)
+    @test issorted(e.price) && nrow(e) <= 10
+    @test all(e.offered_capacity_mw .== 100)
     da = generate_bids(df, τ - 10, 50.0, with_strategy(cfg; mode = "day_ahead"))
     @test length(da) == 48 && df.period[da[1].row] == 1
     @test all(isempty(validate_bids(pb, cfg)) for pb in da)

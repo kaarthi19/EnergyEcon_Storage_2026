@@ -15,6 +15,7 @@ struct PeriodOutcome
     revenue::Dict{Symbol,Float64}   # $ by product
     shortfall_mwh::Float64
     sustain_violation::Bool
+    sustain_violation_mwh::Float64   # how far awards exceeded the sustainable energy
     throughput_mwh::Float64
 end
 
@@ -32,8 +33,16 @@ function clear_period(pb::PeriodBids, prices::Dict{Symbol,Float64}, cfg::Config)
     end
     x = @expression(model, e.base_mw + sum(qe; init = 0.0))
     rtot(p) = base[p] + sum(q[p]; init = 0.0)
-    @constraint(model, x + sum(rtot(p) for p in RESERVES) <= P)
-    @constraint(model, -x + rtot(:regulation) <= P)
+    # Joint capability (RC383 D.17.2.4A, D.18.1.6/7), limited by the offered capacity.
+    Pc = min(P, offered_capacity(cfg))
+    if cfg.market.reserve_headroom == "per_class"
+        @constraint(model, x + rtot(:regulation) + rtot(:primary) <= Pc)
+        @constraint(model, x + rtot(:regulation) + rtot(:contingency) <= Pc)
+        @constraint(model, x + rtot(:regulation) <= Pc)
+    else
+        @constraint(model, x + sum(rtot(p) for p in RESERVES) <= Pc)
+    end
+    @constraint(model, -x + rtot(:regulation) <= Pc)
     eps = 1e-6   # tie-break: prefer clearing at-the-money tranches
     @objective(model, Max,
         sum((prices[:energy] - e.prices[k] + eps) * qe[k] for k in eachindex(e.prices); init = 0.0) +
@@ -62,9 +71,10 @@ function settle_period(net::Float64, res::Dict{Symbol,Float64}, soc::Float64,
     # Sustainability check of awards at the start of the period (compliance metric).
     # Raise reserves deployed while charging first reduce the charge, so only the part above
     # the charging rate drains stored energy (and symmetrically for regulation-lower).
-    need_up = max(0.0, net * dt + sum(res[p] * sustain_hours(m, p) for p in RESERVES)) / η
+    need_up = max(0.0, net * dt + raise_energy(res, m)) / η
     need_dn = η * max(0.0, -net * dt + res[:regulation] * sustain_hours(m, :regulation))
-    viol = (soc - need_up < Emin - 1e-6) || (soc + need_dn > Emax + 1e-6)
+    viol_mwh = max(0.0, Emin - (soc - need_up), (soc + need_dn) - Emax)
+    viol = viol_mwh > 1e-6
 
     dep = deployment_energy_coef(cfg)
     deploy = sum(dep[p] * res[p] for p in RESERVES)
@@ -86,7 +96,7 @@ function settle_period(net::Float64, res::Dict{Symbol,Float64}, soc::Float64,
         rev[p] = prices[p] * res[p] * dt
     end
     rev[:penalty] = -sim.shortfall_penalty * shortfall
-    return PeriodOutcome(net, res, soc, soc_new, rev, shortfall, viol, (ch + dis) * dt)
+    return PeriodOutcome(net, res, soc, soc_new, rev, shortfall, viol, viol_mwh, (ch + dis) * dt)
 end
 
 realised_prices(df::DataFrame, t::Int) = Dict(p => df[t, PRICE_COLS[p]] for p in PRODUCTS)

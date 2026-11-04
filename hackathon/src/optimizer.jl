@@ -74,11 +74,26 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
     for j in 1:H
         @constraint(model, soc[j] == prev(j) + dt * (η * c[j] - d[j] / η) +
                                      sum(dep[p] * r[p][j] for p in RESERVES))
-        # Power headroom: raise reserves on top of net export, lower regulation on top of import.
-        @constraint(model, d[j] - c[j] + sum(r[p][j] for p in RESERVES) <= P)
+        # Power headroom (RC383 D.17.2.4A, D.18.1.6/7): transfer + reserve + regulation <= P,
+        # per reserve class ("per_class") or with primary and contingency stacked ("summed");
+        # transfer - regulation >= -P.
+        if m.reserve_headroom == "per_class"
+            @constraint(model, d[j] - c[j] + r[:regulation][j] + r[:primary][j] <= P)
+            @constraint(model, d[j] - c[j] + r[:regulation][j] + r[:contingency][j] <= P)
+            @constraint(model, d[j] - c[j] + r[:regulation][j] <= P)
+        else
+            @constraint(model, d[j] - c[j] + sum(r[p][j] for p in RESERVES) <= P)
+        end
         @constraint(model, c[j] - d[j] + r[:regulation][j] <= P)
-        # Energy needed to sustain awarded raise reserves / regulation-lower.
-        @constraint(model, prev(j) - (d[j] * dt + sum(r[p][j] * sustain_hours(m, p) for p in RESERVES)) / η >= Emin)
+        # Energy needed to sustain awarded raise reserves / regulation-lower (see raise_energy).
+        if m.reserve_headroom == "per_class"
+            zj = @variable(model, lower_bound = 0)
+            @constraint(model, zj >= r[:primary][j] * m.sustain_primary)
+            @constraint(model, zj >= r[:contingency][j] * m.sustain_contingency)
+            @constraint(model, prev(j) - (d[j] * dt + r[:regulation][j] * m.sustain_regulation + zj) / η >= Emin)
+        else
+            @constraint(model, prev(j) - (d[j] * dt + sum(r[p][j] * sustain_hours(m, p) for p in RESERVES)) / η >= Emin)
+        end
         @constraint(model, prev(j) + η * (c[j] * dt + r[:regulation][j] * sustain_hours(m, :regulation)) <= Emax)
     end
     if binary
