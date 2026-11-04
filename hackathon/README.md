@@ -119,21 +119,25 @@ hackathon/
 
 ## Results on synthetic data
 
-The backtest ran over 14 synthetic days in rolling mode (lead = 1, ridge forecast), with the default config and `scripts/backtest.jl`:
+The backtests ran over 14 synthetic days in rolling mode with the ridge forecast, using `scripts/backtest.jl`. Offers follow the RC383 format and per-class reserve headroom.
 
-| Metric | Value |
-|---|---|
-| Net market revenue | $953k (energy 168k, regulation 619k, primary 0.2k, contingency 165k) |
-| Perfect-foresight bound | $1,042k, so the capture ratio is **91.5 %** |
-| SOC or sustainability violations | **0** (SOC stayed within 5.0–95.0 MWh) |
-| Cycling | 0.56 equivalent full cycles per day |
-| Runtime | 83 s in total, about 6 s per simulated day |
+| | Default: 3-period lead (65-min gate closure), 0.999 quantile guard | 1-period lead |
+|---|---|---|
+| Net market revenue | **$726k** (E 168k / Reg 431k / Pri 12k / Con 114k) | $941k (E 162k / Reg 598k / Pri 13k / Con 169k) |
+| Share of perfect foresight ($1,047k) | **69 %** | 90 % |
+| SOC / sustainability violations | **0** (SOC 5.5–94.5 MWh) | 0 |
+| Cycles per day | 0.61 | 0.54 |
 
-Two settings cost a lot of revenue on five synthetic days:
-- `lead_periods = 2` with the worst-case guard: capture falls to 44 %.
-- Day-ahead mode with the worst-case guard: capture falls to about 1 %. The guaranteed-feasible offers compound over 48 periods.
+The difference between the two columns is the cost of gate closure. The bid for each period is fixed while the two periods before it are still open, so the offers must stay SOC-feasible over those uncertain outcomes. If EMA's simulator lets offers be revised later, set `strategy.lead_periods` to match.
 
-With `soc_guard = "expected"` these two settings recover 73–79 % of perfect foresight, but they then produce SOC violations. Confirm EMA's gate-closure rules before choosing between them.
+Other guard settings, 5 synthetic days, 3-period lead:
+
+| `soc_guard` | Share of perfect foresight | Violations |
+|---|---|---|
+| `worst_case` | 34 % | 0 |
+| `quantile`, q = 0.999 | 56 % | 0 |
+| `quantile`, q = 0.99 | 55 % | 3 |
+| `expected` | 67 % | 29 |
 
 Synthetic prices are illustrative only. Expect different numbers on EMA's data.
 
