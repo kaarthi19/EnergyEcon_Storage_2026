@@ -63,6 +63,8 @@ Base.@kwdef struct StrategyConfig
     soc_guard_quantile::Float64 = 0.999
     soc_margin_mwh::Float64 = 5.0
     soc_guard_buffer_mwh::Float64 = 0.5
+    energy_flex_mw::Float64 = 0.0      # max MW the energy offer may deviate from plan (0 = off)
+    energy_flex_to_zero::Bool = true   # the capped offer can always back off to 0 MW
 end
 
 Base.@kwdef struct ForecastConfig
@@ -71,6 +73,8 @@ Base.@kwdef struct ForecastConfig
     ridge_alpha::Float64 = 1.0
     origin_stride_periods::Int = 12
     pd_horizon_periods::Int = 48
+    conditional_errors::Bool = true     # error bands by period of day and lead time
+    error_period_window::Int = 2        # ± trading periods pooled for the period-of-day scale
 end
 
 Base.@kwdef struct SimulationConfig
@@ -168,6 +172,7 @@ function validate(c::Config)
     s.mode in ("rolling", "day_ahead") || error("strategy.mode must be rolling or day_ahead")
     s.terminal_value_mode in ("soft", "hard") || error("terminal_value_mode must be soft or hard")
     s.soc_guard in ("worst_case", "quantile", "expected") || error("soc_guard must be worst_case, quantile or expected")
+    s.energy_flex_mw >= 0 || error("energy_flex_mw must be >= 0")
     0.5 <= s.soc_guard_quantile < 1 || error("soc_guard_quantile must be in [0.5, 1)")
     m.reserve_headroom in ("per_class", "summed") || error("reserve_headroom must be per_class or summed")
     1 <= m.max_charge_pairs <= 5 && 1 <= m.max_discharge_pairs <= 5 || error("RC383 allows at most 5 charging and 5 discharging pairs")

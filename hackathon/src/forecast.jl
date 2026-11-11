@@ -4,16 +4,81 @@
 # pre-dispatch values for target rows t with t - τ <= pd_horizon_periods. Nothing after the
 # origin is read, so the forecaster respects EMA's data cut-off by construction.
 
+"""
+Training forecast errors with the trading period of day and the lead time (periods after
+the forecast origin) of each error.
+"""
+struct Residuals
+    r::Vector{Float64}
+    period::Vector{Int}
+    lead::Vector{Int}
+end
+Residuals() = Residuals(Float64[], Int[], Int[])
+Base.isempty(x::Residuals) = isempty(x.r)
+
+"""
+Heteroscedastic error model: error = scale(period, lead) × z, where `z` is drawn from the
+pooled standardised errors. scale = robust spread (MAD) of errors within ±`period_window`
+trading periods of the target's period of day, times a lead-time factor (MAD in the
+target's lead bucket relative to the overall MAD). Quiet overnight periods and short leads
+get narrow bands; spike-prone evening periods and long leads get wide ones.
+"""
+struct ErrorModel
+    period_scale::Vector{Float64}   # per trading period of day
+    lead_edges::Vector{Int}         # upper lead of each bucket
+    lead_factor::Vector{Float64}
+    z::Vector{Float64}              # pooled standardised errors
+end
+
 struct PriceForecast
     targets::UnitRange{Int}
     mean::Dict{Symbol,Vector{Float64}}        # point forecast per product over `targets`
-    residuals::Dict{Symbol,Vector{Float64}}   # empirical residual sample (actual - forecast)
+    residuals::Dict{Symbol,Vector{Float64}}   # pooled residual sample (actual - forecast)
+    errors::Dict{Symbol,Union{ErrorModel,Nothing}}  # conditional error model (or nothing)
+    periods::Vector{Int}                      # trading period of day of each target
+    leads::Vector{Int}                        # lead (periods after origin) of each target
 end
 
-"Quantiles of the forecast distribution for product `p` at target position `j`."
+_mad(x) = isempty(x) ? 0.0 : 1.4826 * median(abs.(x .- median(x)))
+_spread(x) = (m = _mad(x); m > 1e-9 ? m : (isempty(x) ? 0.0 : std(x; corrected = false)))
+
+const LEAD_EDGES = [1, 2, 4, 8, 16, 48, typemax(Int)]
+
+function fit_error_model(res::Residuals, ppd::Int, window::Int; min_n::Int = 30)
+    length(res.r) < max(min_n, 50) && return nothing
+    overall = _spread(res.r)
+    overall <= 1e-9 && return nothing
+    ps = zeros(ppd)
+    for k in 1:ppd
+        d = mod.(res.period .- k .+ ppd ÷ 2, ppd) .- ppd ÷ 2      # circular distance
+        sel = abs.(d) .<= window
+        ps[k] = count(sel) >= min_n ? max(_spread(res.r[sel]), 0.05 * overall) : overall
+    end
+    lf = ones(length(LEAD_EDGES))
+    lo = 0
+    for (b, hi) in enumerate(LEAD_EDGES)
+        sel = (res.lead .> lo) .& (res.lead .<= hi)
+        lf[b] = count(sel) >= min_n ? max(_spread(res.r[sel]) / overall, 0.05) : 1.0
+        lo = hi
+    end
+    scale = [ps[res.period[i]] * lf[_lead_bucket(res.lead[i])] for i in eachindex(res.r)]
+    return ErrorModel(ps, LEAD_EDGES, lf, res.r ./ scale)
+end
+
+_lead_bucket(h::Int) = something(findfirst(>=(h), LEAD_EDGES), length(LEAD_EDGES))
+
+"""
+Quantiles of the forecast distribution for product `p` at target position `j`. Uses the
+conditional error model when available, else the pooled residuals.
+"""
 function forecast_quantiles(f::PriceForecast, p::Symbol, j::Int, qs::AbstractVector{<:Real})
-    r = f.residuals[p]
     base = f.mean[p][j]
+    em = f.errors[p]
+    if em !== nothing
+        sc = em.period_scale[f.periods[j]] * em.lead_factor[_lead_bucket(f.leads[j])]
+        return base .+ sc .* quantile(em.z, qs)
+    end
+    r = f.residuals[p]
     isempty(r) && return fill(base, length(qs))
     return base .+ quantile(r, qs)
 end
@@ -75,12 +140,13 @@ end
 function _method_residuals(fn, df, p, τ, H, cfg)
     fc = cfg.forecast
     lo = max(fc_min_origin(cfg), τ - fc.train_days * cfg.market.periods_per_day)
-    res = Float64[]
+    res = Residuals()
     price = df[!, PRICE_COLS[p]]
     for o in lo:fc.origin_stride_periods:(τ - 1)
         tg = (o + 1):min(o + H, τ)
         isempty(tg) && continue
-        append!(res, price[tg] .- fn(df, p, tg, o, cfg))
+        append!(res.r, price[tg] .- fn(df, p, tg, o, cfg))
+        append!(res.period, df.period[tg]); append!(res.lead, tg .- o)
     end
     return res
 end
@@ -99,23 +165,28 @@ function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::C
     H = length(targets) + (first(targets) - τ - 1)
     means = Dict{Symbol,Vector{Float64}}()
     resid = Dict{Symbol,Vector{Float64}}()
+    errs = Dict{Symbol,Union{ErrorModel,Nothing}}()
+    fc = cfg.forecast
     for p in PRODUCTS
-        method = cfg.forecast.method
+        method = fc.method
         if method == "seasonal_naive"
             means[p] = _seasonal_naive(df, p, targets, τ, cfg)
-            resid[p] = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+            res = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
         elseif method == "predispatch"
             means[p] = _predispatch(df, p, targets, τ, cfg)
-            resid[p] = _method_residuals(_predispatch, df, p, τ, H, cfg)
+            res = _method_residuals(_predispatch, df, p, τ, H, cfg)
         else
-            means[p], resid[p] = _ridge(df, p, τ, targets, H, cfg)
+            means[p], res = _ridge(df, p, τ, targets, H, cfg)
         end
+        resid[p] = res.r
+        errs[p] = fc.conditional_errors ?
+            fit_error_model(res, cfg.market.periods_per_day, fc.error_period_window) : nothing
         if p != :energy
             means[p] = max.(means[p], 0.0)   # reserve prices are non-negative
         end
         means[p] = clamp.(means[p], cfg.market.price_floor, cfg.market.price_cap)
     end
-    return PriceForecast(targets, means, resid)
+    return PriceForecast(targets, means, resid, errs, df.period[targets], collect(targets) .- τ)
 end
 
 function _ridge(df, p, τ, targets, H, cfg)
@@ -124,9 +195,11 @@ function _ridge(df, p, τ, targets, H, cfg)
     lo = max(fc_min_origin(cfg), τ - fc.train_days * cfg.market.periods_per_day)
     rows = Vector{Vector{Float64}}()
     ys = Float64[]
+    pers, leads = Int[], Int[]
     for o in lo:fc.origin_stride_periods:(τ - 1)
         for t in (o + 1):min(o + H, τ)          # labels must be known at τ
             push!(rows, _features(df, p, t, o, cfg)); push!(ys, price[t])
+            push!(pers, df.period[t]); push!(leads, t - o)
         end
     end
     if length(ys) < 50
@@ -143,5 +216,5 @@ function _ridge(df, p, τ, targets, H, cfg)
     resid = ys .- Z * β
     Xt = reduce(vcat, permutedims.([_features(df, p, t, τ, cfg) for t in targets]))
     pred = ((Xt .- μ') ./ σ') * β
-    return pred, resid
+    return pred, Residuals(resid, pers, leads)
 end

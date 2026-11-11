@@ -64,6 +64,19 @@ function bids_from_model!(cm::CoOptModel, f::PriceForecast, j_model::Int, j_fc::
         ntr = p == :energy ? m.max_energy_tranches : m.max_reserve_tranches
         offers[p] = offer_from_grid(p, g, xs, ntr)
     end
+    # Limit how far the energy offer can move from the plan. Offers become "open" for the
+    # SOC guard of later periods (gate closure), and every MW of price response widens the
+    # SOC interval those periods must cover, which costs reserve capability.
+    flex = s.energy_flex_mw
+    if flex > 0
+        P = cfg.battery.power_mw
+        x0 = planned[:energy]
+        # With energy_flex_to_zero the offer can always back off to 0 MW (stop charging in a
+        # price spike, stop discharging in a price crash), priced at its opportunity cost.
+        lo = s.energy_flex_to_zero ? min(x0, 0.0) - flex : x0 - flex
+        hi = s.energy_flex_to_zero ? max(x0, 0.0) + flex : x0 + flex
+        offers[:energy] = clip_offer(offers[:energy], max(-P, lo), min(P, hi))
+    end
     return PeriodBids(row, ts, offers, planned)
 end
 

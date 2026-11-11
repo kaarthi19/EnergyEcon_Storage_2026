@@ -76,6 +76,10 @@ soc_guard = "quantile"
 soc_guard_quantile = 0.999
 soc_margin_mwh = 5.0
 soc_guard_buffer_mwh = 0.5  # offers keep this many MWh away from the 5% / 95% SOC limits
+# Max MW the energy offer may deviate from the forecast-optimal plan (0 = no limit). Price
+# response in offers that are still open at gate closure widens the SOC interval later
+# periods must cover; limiting it keeps reserve capability.
+energy_flex_mw = 0.0
 
 [forecast]
 method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"
@@ -83,6 +87,11 @@ train_days = 28
 ridge_alpha = 1.0
 origin_stride_periods = 12  # spacing of training forecast origins inside the training window
 pd_horizon_periods = 48     # ASSUMPTION: pre-dispatch covers this many periods after decision time
+# Forecast error bands (used for offer price grids and the SOC guard). true: the spread
+# depends on trading period of day (±error_period_window periods) and lead time; false: one
+# pooled error distribution for all periods and leads.
+conditional_errors = true
+error_period_window = 2
 
 [simulation]
 shortfall_penalty = 4500.0  # $/MWh of energy the battery could not deliver within SOC limits
