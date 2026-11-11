@@ -1,0 +1,29 @@
+date,type,description,source_url,date_basis
+2022-01-26,rule,RC375 market rule changes to enable electricity imports trial effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2022-03-04,rule,RC378 Measures to secure and stabilise the power system and market (Chap 3 s3.11A) effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2022-05-23,rule,RC379 gate closure exemption for electricity imports effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2023-01-01,rule,RC381 Demand Side Management Sandbox effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2023-07-01,rule,RC382 Temporary Price Cap mechanism effective (caps energy and also primary/contingency reserve and regulation prices; parameters reset half-monthly),https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2023-07-01,rule,RC384 New Vesting Regime framework effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2024-02-21,rule,RC371 solar generation forecasts incorporated in Market Clearing Engine effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/Proposals-Considered-by-RCP,effective date on EMC page (via load-more API page)
+2024-02-01,rule,RC385 performance bonds regime effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2025-08-12,rule,RC383 modelling of ESS + RC386 state-of-charge in MCE + RC387 fallback mechanisms + RC390 market clearing and offers for ESS all effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/Proposals-Considered-by-RCP,effective date on EMC page
+2025-11-27,rule,RC394 exemption from AFPS for deviating GRFs on free governor control effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/Proposals-Considered-by-RCP,effective date on EMC page
+2026-02-06,rule,RC396 BESS allowed to participate in Demand Response / Interruptible Load programmes effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2026-03-11,rule,RC395 Residual Vesting Scheme framework effective,https://www.home.emcsg.com/about-the-market/rules/Rule-Changes/EMA-Directed-Rule-Changes,effective date on EMC page
+2026-06-23,rule,RC391 publication of TPC information (uncapped reserve/regulation/nodal reference prices) implemented,https://www.home.emcsg.com/about-emc/media-news-annoucements/Announcements/Update-on-Service-Enhancement-in-the-NEMS-June-2026,EMC announcement
+2024-01..2024-04,capacity,YTL PowerSeraya Stage 1 steam units SER G1-G3 (3x250 MW) leave registered facility list,https://www.nems.emcsg.com/nems-prices,diff of quarterly Capacity for Registered Facilities snapshots (2024-01-01 vs 2024-04-01)
+2024-07..2024-10,capacity,Senoko CCP S1 SNKCCP1 (425 MW) leaves list; Senoko GT11/GT12 (~130 MW each) appear (last change 10-Sep-2024),https://www.nems.emcsg.com/nems-prices,snapshot diff
+2024-09-25,import,IMPORT KEPPEL LTMS2 (200 MW) appears in registered facilities (last change date),https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2024-12-13,import,IMPORT SEMBCORP ENEGEM1 (50 MW) appears (last change date),https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2024-10..2025-01,capacity,PowerSeraya Jurong GT1/GT2 (2x90 MW) leave list,https://www.nems.emcsg.com/nems-prices,snapshot diff
+2025-02-20,capacity,Meranti Power OCGT MERPGT10/20 (2x341 MW) registered; reserve capability added 15-May-2025 / 01-Jul-2025,https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2025-05-09,capacity,PacificLight PACLBLK3 GT (100 MW) registered,https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2025-09-19,capacity,Battery facilities reclassified BATTERY->ESS (Sembcorp SBBA U1 / SBSA U1 100 MW each),https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2025-11-07,capacity,Keppel Sakra Cogen KSCBLK1 600 MW CCGT registered; reserve/regulation capability 29-May-2026; commercial operation late May 2026 (press),https://www.power-technology.com/projects/keppel-sakra-cogeneration-plant-singapore/,LAST CHANGE DATE field + press
+2026-06-25,capacity,Sembcorp Banyan SEMBCCP4 600 MW CCGT registered; reserve capability 23-Oct-2026,https://www.nems.emcsg.com/nems-prices,LAST CHANGE DATE field
+2024-02,reserve_req,Monthly avg regulation requirement 117 MW (Jan 2024) -> 113 MW (Feb 2024),https://www.nems.emcsg.com/NEMS-Market-Trading-Reports/NEMS-Market-Trading-Reports-Monthly,Public Monthly Trading Report Dec-2024 Figure 12
+2025-02,reserve_req,Monthly avg regulation requirement 113 -> 108 MW,https://www.nems.emcsg.com/NEMS-Market-Trading-Reports/NEMS-Market-Trading-Reports-Monthly,Public Monthly Trading Report Dec-2025
+2026-02,reserve_req,Monthly avg regulation requirement 108 -> 99 MW,https://www.nems.emcsg.com/NEMS-Market-Trading-Reports/NEMS-Market-Trading-Reports-Monthly,Public Monthly Trading Report Sep-2026
+2026-04..2026-07,reserve_req,Monthly avg contingency reserve requirement rises ~415-444 MW (Jan-Mar 2026) to 534 (Apr) 563 (Jun) 590 (Jul); primary 187->338 MW; consistent with 600 MW CCGTs becoming risk-setting (inference),https://www.nems.emcsg.com/NEMS-Market-Trading-Reports/NEMS-Market-Trading-Reports-Monthly,Public Monthly Trading Report Sep-2026
+2026-10-24,gas,Indonesia cuts pipeline gas to Singapore by 31 mmscfd (Natuna 15 + Sumatra 16) for 18 days (start date inferred from 'Saturday' in 26-Oct-2026 article),https://www.oedigital.com/amp/news/543888-indonesia-cuts-singapore-pipeline-gas-flows-by-9-to-meet-domestic-demand,press
