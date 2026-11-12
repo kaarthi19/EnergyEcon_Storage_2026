@@ -6,8 +6,8 @@
 # data cut-off by construction.
 
 """
-Training forecast errors with the trading period of day and the lead time (periods after
-the forecast origin) of each error.
+Forecast errors over the training window, with the trading period of day and the lead time
+(periods after the forecast origin) of each error.
 """
 struct Residuals
     r::Vector{Float64}
@@ -38,6 +38,14 @@ struct PriceForecast
     errors::Dict{Symbol,Union{ErrorModel,Nothing}}  # conditional error model (or nothing)
     periods::Vector{Int}                      # trading period of day of each target
     leads::Vector{Int}                        # lead (periods after origin) of each target
+    # The SOC guard's error sample and model: out of sample (for ridge the two above are the
+    # fit's own residuals, which set the offer price grids).
+    guard_residuals::Dict{Symbol,Vector{Float64}}
+    guard_errors::Dict{Symbol,Union{ErrorModel,Nothing}}
+    # out-of-sample errors at lead h (index) from EVERY origin of the training window, for the
+    # short leads of the offers still open at gate closure (`guard_leads`)
+    lead_residuals::Dict{Symbol,Vector{Vector{Float64}}}
+    profile::Dict{Symbol,Vector{Float64}}     # mean of the last 7 days' same-period prices
 end
 
 _mad(x) = isempty(x) ? 0.0 : 1.4826 * median(abs.(x .- median(x)))
@@ -72,22 +80,34 @@ _lead_bucket(h::Int) = something(findfirst(>=(h), LEAD_EDGES), length(LEAD_EDGES
     forecast_quantiles(f, p, j, qs; conservative=false)
 
 Quantiles of the forecast distribution for product `p` at target position `j`. Uses the
-conditional error model when available, else the pooled residuals. `conservative = true`
-takes on each side the wider of the conditional and the pooled quantile (lower tail for
-q <= 0.5, upper tail above): the SOC guard uses it, because a narrow conditional band in a
-quiet period must not let through offers whose clearing the pooled errors say is possible.
+conditional error model when available, else the pooled residuals (`residuals`/`errors`:
+the offer price grids use these). `conservative = true` is for the SOC guard: it takes on
+each side (lower tail for q <= 0.5, upper tail above) the widest of the conditional and the
+pooled quantile of both error samples (`residuals`/`errors` and the out-of-sample
+`guard_residuals`/`guard_errors`) and, at the short leads of `guard_leads`, of that lead's
+out-of-sample errors from every origin. A narrow conditional band in a quiet period must not
+let through offers whose clearing the pooled errors say is possible, in-sample errors
+understate the error of a forecast, and errors at the open offers' leads after a rare origin
+(e.g. a one-period price dip) are missed by origins `origin_stride_periods` apart.
 """
 function forecast_quantiles(f::PriceForecast, p::Symbol, j::Int, qs::AbstractVector{<:Real};
                             conservative::Bool = false)
     base = f.mean[p][j]
-    r = f.residuals[p]
-    pooled = isempty(r) ? fill(base, length(qs)) : base .+ quantile(r, qs)
-    em = f.errors[p]
-    em === nothing && return pooled
-    sc = em.period_scale[f.periods[j]] * em.lead_factor[_lead_bucket(f.leads[j])]
-    cond = base .+ sc .* quantile(em.z, qs)
+    function band(r, em)
+        pooled = isempty(r) ? fill(base, length(qs)) : base .+ quantile(r, qs)
+        cond = em === nothing ? pooled :
+            base .+ em.period_scale[f.periods[j]] * em.lead_factor[_lead_bucket(f.leads[j])] .* quantile(em.z, qs)
+        return cond, pooled
+    end
+    cond, pooled = band(f.residuals[p], f.errors[p])
     conservative || return cond
-    return [q <= 0.5 ? min(c, pl) : max(c, pl) for (q, c, pl) in zip(qs, cond, pooled)]
+    widest(a, b) = [q <= 0.5 ? min(x, y) : max(x, y) for (q, x, y) in zip(qs, a, b)]
+    out = widest(cond, pooled)
+    out = widest(out, widest(band(f.guard_residuals[p], f.guard_errors[p])...))
+    lr = f.lead_residuals[p]
+    h = f.leads[j]
+    (h <= length(lr) && !isempty(lr[h])) && (out = widest(out, base .+ quantile(lr[h], qs)))
+    return out
 end
 
 # Most recent realised value for the same trading period of day, known at origin τ.
@@ -163,13 +183,14 @@ function _predispatch(df, p, targets, τ, cfg, hpd::Int)
     return out
 end
 
-# Backtest residuals of a simple method over the training window (for scenario quantiles).
-function _method_residuals(fn, df, p, τ, H, cfg)
+# Backtest residuals of a simple method over the training window (for scenario quantiles);
+# the method fits nothing, so they are out of sample.
+function _method_residuals(fn, df, p, τ, H, cfg; stride::Int = cfg.forecast.origin_stride_periods)
     fc = cfg.forecast
     lo = max(fc_min_origin(cfg), τ - fc.train_days * cfg.market.periods_per_day)
     res = Residuals()
     price = df[!, PRICE_COLS[p]]
-    for o in lo:fc.origin_stride_periods:(τ - 1)
+    for o in lo:stride:(τ - 1)
         tg = (o + 1):min(o + H, τ)
         isempty(tg) && continue
         r = price[tg] .- fn(df, p, tg, o, cfg)
@@ -182,6 +203,16 @@ end
 
 "Earliest origin at which a forecast can be produced (one day of history)."
 fc_min_origin(cfg::Config) = cfg.market.periods_per_day
+
+"""
+Leads (periods after the forecast origin) of the offers still open when a rolling-mode
+offer is made: 1 .. lead_periods - 1, shifted by `info_lag_periods`. The SOC guard clears
+those offers over the forecast band, so their errors are sampled from every origin.
+"""
+guard_leads(cfg::Config) = cfg.strategy.lead_periods - 1 + cfg.strategy.info_lag_periods
+
+"Residuals split by lead 1..n (one vector per lead)."
+_by_lead(res::Residuals, n::Int) = [res.r[res.lead .== h] for h in 1:n]
 
 """
     forecast_prices(df, τ, targets, cfg) -> PriceForecast
@@ -199,6 +230,11 @@ function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::C
     means = Dict{Symbol,Vector{Float64}}()
     resid = Dict{Symbol,Vector{Float64}}()
     errs = Dict{Symbol,Union{ErrorModel,Nothing}}()
+    gresid = Dict{Symbol,Vector{Float64}}()
+    gerrs = Dict{Symbol,Union{ErrorModel,Nothing}}()
+    lres = Dict{Symbol,Vector{Vector{Float64}}}()
+    prof = Dict{Symbol,Vector{Float64}}()
+    nl = guard_leads(cfg)
     fc = cfg.forecast
     for p in PRODUCTS
         method = fc.method
@@ -206,44 +242,64 @@ function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::C
         pdfn = (d, q, tg, o, c) -> _predispatch(d, q, tg, o, c, hpd)
         if method == "seasonal_naive"
             means[p] = _seasonal_naive(df, p, targets, τ, cfg)
-            res = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+            res = oos = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)    # fits nothing
+            lr = _method_residuals(_seasonal_naive, df, p, τ, nl, cfg; stride = 1)
         elseif method == "predispatch"
             means[p] = pdfn(df, p, targets, τ, cfg)
-            res = _method_residuals(pdfn, df, p, τ, H, cfg)
+            res = oos = _method_residuals(pdfn, df, p, τ, H, cfg)
+            lr = _method_residuals(pdfn, df, p, τ, nl, cfg; stride = 1)
         else
-            means[p], res = _ridge(df, p, τ, targets, H, cfg, hpd)
+            means[p], res, oos, lr = _ridge(df, p, τ, targets, H, cfg, hpd, nl)
         end
         if !all(isfinite, means[p])
             @warn "non-finite $p forecast at origin row $τ; using seasonal naive" maxlog = 10
             means[p] = _seasonal_naive(df, p, targets, τ, cfg)
-            res = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+            res = oos = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+            lr = _method_residuals(_seasonal_naive, df, p, τ, nl, cfg; stride = 1)
         end
-        resid[p] = res.r
-        errs[p] = fc.conditional_errors ?
-            fit_error_model(res, cfg.market.periods_per_day, fc.error_period_window) : nothing
+        errmodel(x) = fc.conditional_errors ? fit_error_model(x, cfg.market.periods_per_day, fc.error_period_window) : nothing
+        resid[p], errs[p] = res.r, errmodel(res)
+        gresid[p], gerrs[p] = oos === res ? (resid[p], errs[p]) : (oos.r, errmodel(oos))
+        lres[p] = _by_lead(lr, nl)
+        prof[p] = [_profile(df[!, PRICE_COLS[p]], t, τ, cfg.market.periods_per_day) for t in targets]
         if p != :energy
             means[p] = max.(means[p], 0.0)   # reserve prices are non-negative
         end
         means[p] = clamp.(means[p], cfg.market.price_floor, cfg.market.price_cap)
     end
-    return PriceForecast(targets, means, resid, errs, df.period[targets], collect(targets) .- τ)
+    return PriceForecast(targets, means, resid, errs, df.period[targets], collect(targets) .- τ,
+                         gresid, gerrs, lres, prof)
 end
 
-function _ridge(df, p, τ, targets, H, cfg, hpd::Int)
+"""
+    _ridge(df, p, τ, targets, H, cfg, hpd, nl) -> (forecast, fit_residuals, oos_residuals, lead_residuals)
+
+Ridge regression on features of (origin, target) pairs from the training window (origins
+`origin_stride_periods` apart, labels known at τ). `fit_residuals` are the fit's own
+(in-sample) errors. `oos_residuals` are out of sample: the window's origins are split into
+`CV_FOLDS` contiguous blocks, and each block's errors come from a fit on the other blocks
+without the origins whose label windows overlap the block's (purged; if that leaves fewer
+rows than half the other blocks', only the block is left out). `lead_residuals` are such
+errors at leads 1..nl from every origin of the window. In-sample errors understate the
+error of a forecast: the SOC guard uses the out-of-sample ones.
+"""
+function _ridge(df, p, τ, targets, H, cfg, hpd::Int, nl::Int)
     fc = cfg.forecast
     price = df[!, PRICE_COLS[p]]
     lo = max(fc_min_origin(cfg), τ - fc.train_days * cfg.market.periods_per_day)
     rows = Vector{Vector{Float64}}()
     ys = Float64[]
-    pers, leads = Int[], Int[]
+    pers, leads, origs = Int[], Int[], Int[]
     for o in lo:fc.origin_stride_periods:(τ - 1)
         for t in (o + 1):min(o + H, τ)          # labels must be known at τ
             push!(rows, _features(df, p, t, o, cfg, hpd)); push!(ys, price[t])
-            push!(pers, df.period[t]); push!(leads, t - o)
+            push!(pers, df.period[t]); push!(leads, t - o); push!(origs, o)
         end
     end
     if length(ys) < 50
-        return _seasonal_naive(df, p, targets, τ, cfg), _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+        sn = _seasonal_naive(df, p, targets, τ, cfg)
+        r = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
+        return sn, r, r, _method_residuals(_seasonal_naive, df, p, τ, nl, cfg; stride = 1)
     end
     X = reduce(vcat, permutedims.(rows))
     # Standardise non-intercept columns for a well-conditioned ridge.
@@ -252,9 +308,38 @@ function _ridge(df, p, τ, targets, H, cfg, hpd::Int)
     σ[σ .< 1e-9] .= 1.0
     Z = (X .- μ') ./ σ'
     Λ = fc.ridge_alpha * Matrix{Float64}(I, size(Z, 2), size(Z, 2)); Λ[1, 1] = 0.0
-    β = (Z' * Z + Λ) \ (Z' * ys)
-    resid = ys .- Z * β
+    fit(sel) = (Zs = Z[sel, :]; (Zs' * Zs + Λ) \ (Zs' * ys[sel]))
+    β = fit(trues(length(ys)))
     Xt = reduce(vcat, permutedims.([_features(df, p, t, τ, cfg, hpd) for t in targets]))
     pred = ((Xt .- μ') ./ σ') * β
-    return pred, Residuals(resid, pers, leads)
+
+    # Out-of-sample errors by blocks of origins (time-contiguous, so a block is forecast by a
+    # model that has not seen its labels).
+    K = CV_FOLDS
+    edges = [lo + round(Int, k * (τ - lo) / K) for k in 0:K]    # block k: origins in [edges[k], edges[k+1])
+    resid = fill(NaN, length(ys))
+    lr = Residuals()
+    for k in 1:K
+        a, z = edges[k], edges[k + 1] - 1
+        a > z && continue
+        held = (origs .>= a) .& (origs .<= z)
+        purged = (origs .<= a - H) .| (origs .>= z + H)
+        others = .!held
+        train = count(purged) >= max(50, count(others) ÷ 2) ? purged : others
+        count(train) >= 50 || (train = trues(length(ys)))   # too little history: in sample
+        βk = fit(train)
+        any(held) && (resid[held] = ys[held] .- Z[held, :] * βk)
+        # every origin of the block at the open offers' leads
+        for o in a:z, h in 1:nl
+            t = o + h
+            t <= τ || continue
+            zt = (_features(df, p, t, o, cfg, hpd) .- μ) ./ σ
+            push!(lr.r, price[t] - dot(zt, βk)); push!(lr.period, df.period[t]); push!(lr.lead, h)
+        end
+    end
+    ok = isfinite.(resid)
+    return pred, Residuals(ys .- Z * β, pers, leads), Residuals(resid[ok], pers[ok], leads[ok]), lr
 end
+
+"Blocks of training origins for the out-of-sample forecast errors (`_ridge`)."
+const CV_FOLDS = 5

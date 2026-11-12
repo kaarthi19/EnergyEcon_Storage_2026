@@ -69,6 +69,12 @@ end
     @test f1.mean[:energy] == f2.mean[:energy]
     @test f1.mean[:regulation] == f2.mean[:regulation]
     @test all(>=(0), f1.mean[:contingency])
+    # out-of-sample errors (pooled and at the open offers' leads from every origin) too
+    @test f1.residuals == f2.residuals && f1.lead_residuals == f2.lead_residuals
+    nl = B.guard_leads(cfg)
+    @test nl == cfg.strategy.lead_periods - 1
+    @test all(length(f1.lead_residuals[p]) == nl && [length(v) for v in f1.lead_residuals[p]] == [τ - 48 - h + 1 for h in 1:nl]
+              for p in PRODUCTS)
     for m in ("seasonal_naive", "predispatch")
         g1 = forecast_prices(df, τ, (τ + 1):(τ + 48), with_forecast(cfg; method = m))
         g2 = forecast_prices(df2, τ, (τ + 1):(τ + 48), with_forecast(cfg; method = m))
@@ -726,9 +732,11 @@ end
         qs = [0.001, 0.2, 0.5, 0.8, 0.999]
         cons = B.forecast_quantiles(f, p, j, qs; conservative = true)
         cond = B.forecast_quantiles(f, p, j, qs)
-        pooled = f.mean[p][j] .+ B.quantile(f.residuals[p], qs)
-        @test all(cons[1:2] .<= min.(cond[1:2], pooled[1:2]) .+ 1e-12)
-        @test all(cons[4:5] .>= max.(cond[4:5], pooled[4:5]) .- 1e-12)
+        for r in (f.residuals[p], f.guard_residuals[p])     # in-sample and out-of-sample
+            pooled = f.mean[p][j] .+ B.quantile(r, qs)
+            @test all(cons[1:2] .<= min.(cond[1:2], pooled[1:2]) .+ 1e-12)
+            @test all(cons[4:5] .>= max.(cond[4:5], pooled[4:5]) .- 1e-12)
+        end
     end
 end
 
@@ -741,6 +749,105 @@ end
     r = run_backtest(d21, cfg; start_row = row - 10, end_row = row + 2, progress = false)
     sm = Dict(r.summary.metric .=> r.summary.value)
     @test sm["sustain_violation_periods"] == 0 && sm["shortfall_mwh"] == 0
+end
+
+@testset "quantile guard: sound SOC bound over the whole price box" begin
+    # Every outcome clear_period produces for any prices inside the box ends inside
+    # soc_quantile_bounds_after's interval (box_clearing_range + worst_case_needs).
+    rng = MersenneTwister(383)
+    function roffer(p, total)
+        n = rand(rng, 0:4)
+        w = rand(rng, n + 1); w .*= total * rand(rng) / sum(w)
+        Offer(p, w[1], sort(round.(80 .* rand(rng, n); digits = 2)), w[2:end] .+ 1e-3)
+    end
+    bound(pb, lo, hi, plo, phi, c) = begin
+        xl, xu, R = B.box_clearing_range(pb.offers[:energy], Tuple(pb.offers[p] for p in RESERVES), plo, phi, c)
+        w = worst_case_needs(xl, xu, R, c)
+        clamp(lo - w.drain, 5.0, 95.0), clamp(hi + w.fill, 5.0, 95.0)
+    end
+    nbad, nsamp = 0, 0
+    for _ in 1:90
+        c = rand(rng) < 0.3 ? mkcfg(cfg; market = mkmarket(cfg.market; reserve_headroom = "summed")) : cfg
+        ch = rand(rng) < 0.7 ? 100 * rand(rng) : 0.0
+        n = rand(rng, 0:5)
+        span = ch + (rand(rng) < 0.7 ? 100 * rand(rng) : 0.0)
+        w = n == 0 ? Float64[] : (x = rand(rng, n); x .* span ./ sum(x))
+        e = B.clip_offer(Offer(:energy, -ch, sort(round.(500 .* rand(rng, n) .- 100; digits = 2)), w .+ 1e-3), -100.0, 100.0)
+        pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => e,
+                          (p => rand(rng) < 0.15 ? noff(p) : roffer(p, 100 * rand(rng)) for p in RESERVES)...))
+        le, lr = 450 * rand(rng) - 150, 40 .* rand(rng, 3)
+        plo, phi = (le, lr...), (le + 300 * rand(rng)^2, (lr .+ 50 .* rand(rng, 3) .^ 2)...)
+        lo = 5 + 90 * rand(rng); hi = min(95.0, lo + 20 * rand(rng))
+        blo, bhi = bound(pb, lo, hi, plo, phi, c)
+        for k in 1:20
+            u = k <= 16 ? [((k - 1) >> i) & 1 for i in 0:3] : rand(rng, 4)      # corners, then inside
+            pr = Dict(p => plo[i] + u[i] * (phi[i] - plo[i]) for (i, p) in enumerate(PRODUCTS))
+            net, res = clear_period(pb, pr, c)
+            for soc in (lo, hi)
+                e1 = settle_period(net, res, soc, pr, c).soc_end
+                nsamp += 1
+                nbad += !(blo - 1e-6 <= e1 <= bhi + 1e-6)
+            end
+        end
+    end
+    @test nbad == 0 && nsamp == 90 * 40
+    # The joint clearing leaves an in-the-money discharge uncleared to fit regulation, and
+    # clears an out-of-the-money stop-charging tranche to make room for regulation-lower.
+    pr0 = Dict(:energy => 55.0, :regulation => 100.0, :primary => 0.0, :contingency => 0.0)
+    pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => Offer(:energy, 0.0, [10.0], [100.0]),
+                      :regulation => Offer(:regulation, 100.0, Float64[], Float64[]), :primary => noff(:primary),
+                      :contingency => noff(:contingency)))
+    @test clear_period(pb, pr0, cfg)[1] ≈ 0 atol = 1e-6
+    xl, xu, R = B.box_clearing_range(pb.offers[:energy], Tuple(pb.offers[p] for p in RESERVES), (50.0, 100.0, 0.0, 0.0), (60.0, 110.0, 0.0, 0.0), cfg)
+    @test xl <= 0 && xu == 100 && R == (100.0, 0.0, 0.0)
+    pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => Offer(:energy, -100.0, [200.0], [100.0]),
+                      :regulation => Offer(:regulation, 100.0, Float64[], Float64[]), :primary => noff(:primary),
+                      :contingency => noff(:contingency)))
+    @test clear_period(pb, Dict(:energy => 150.0, :regulation => 80.0, :primary => 0.0, :contingency => 0.0), cfg)[1] ≈ 0 atol = 1e-6
+    xl, xu, R = B.box_clearing_range(pb.offers[:energy], Tuple(pb.offers[p] for p in RESERVES), (100.0, 70.0, 0.0, 0.0), (150.0, 80.0, 0.0, 0.0), cfg)
+    @test xl == -100 && xu >= 0
+    # a tranche worth more than any reserve it could make room for always clears
+    pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => Offer(:energy, 0.0, [10.0], [100.0]),
+                      :regulation => Offer(:regulation, 100.0, Float64[], Float64[]), :primary => noff(:primary),
+                      :contingency => noff(:contingency)))
+    xl, xu, _ = B.box_clearing_range(pb.offers[:energy], Tuple(pb.offers[p] for p in RESERVES), (200.0, 100.0, 0.0, 0.0), (300.0, 120.0, 0.0, 0.0), cfg)
+    @test xl == xu == 100
+end
+
+@testset "quantile guard on a table truncated at the origin (no pre-dispatch)" begin
+    # e2e verifier's closed loop (README data, table cut at each origin): at origin row 343
+    # the energy price had dipped to -46 \$/MWh, the forecast for the open periods 344-345
+    # followed it, the realised prices (112, 95) lay above the guard's band, the open offer
+    # stopped charging, and the SOC at the start of 346 (51.86 MWh) was below the interval
+    # [53.71, 54.47]: a 0.41 MWh sustain violation. The price box now also covers the 7-day
+    # same-period mean (and the bound covers every price inside the box).
+    d21 = synthetic_market_data(days = 21, seed = 1, cfg = cfg)
+    τ, soc = 343, 53.24474274608399
+    pend = [PeriodBids(344, d21.timestamp[344], Dict(:energy => Offer(:energy, -4.163, [110.47], [4.163]),
+                :regulation => Offer(:regulation, 0.0, [12.53, 16.6, 22.43, 24.51], [74.558, 1.23, 8.862, 0.397]),
+                :primary => Offer(:primary, 0.0, [2.84, 4.16], [2.522, 0.412]),
+                :contingency => Offer(:contingency, 0.0, [8.34, 12.59], [2.391, 0.543]))),
+            PeriodBids(345, d21.timestamp[345], Dict(:energy => noff(:energy),
+                :regulation => Offer(:regulation, 0.0, [11.87], [85.101]), :primary => Offer(:primary, 0.0, [2.38], [1.524]),
+                :contingency => Offer(:contingency, 0.0, [1.59], [1.524])))]
+    s = soc
+    for pb in pend
+        pr = B.realised_prices(d21, pb.row); net, res = clear_period(pb, pr, cfg)
+        s = settle_period(net, res, s, pr, cfg).soc_end
+    end
+    @test s ≈ 51.8556 atol = 1e-3
+    h = B.extend_rows(B.sanitize_history(d21[1:τ, :], τ, cfg), τ + 98, cfg)
+    f, τf = B.forecast_at(h, τ, τ + 98, cfg)
+    _, lo, hi = B.soc_after_open_offers(pend, τ, soc, f, τf, cfg)
+    @test lo <= s <= hi
+    for k in 344:345
+        plo, phi = B.price_box(f, k - τf, cfg.strategy.soc_guard_quantile, cfg)
+        @test all(plo[i] <= B.realised_prices(d21, k)[p] <= phi[i] for (i, p) in enumerate(PRODUCTS))
+    end
+    pb = generate_bids(d21[1:τ, :], τ, soc, cfg; pending = pend)[1]
+    pr = B.realised_prices(d21, 346); net, res = clear_period(pb, pr, cfg)
+    out = settle_period(net, res, s, pr, cfg)
+    @test !out.sustain_violation && out.shortfall_mwh == 0
 end
 
 @testset "settlement: delivered energy, withheld reserve, deployment energy" begin
@@ -952,7 +1059,15 @@ end
     for p in PRODUCTS
         @test f1.errors[p] === nothing && f1.mean[p] == f0.mean[p]
         pooled = f1.mean[p][5] .+ B.quantile(f1.residuals[p], qs)
-        @test B.forecast_quantiles(f1, p, 5, qs) == pooled == B.forecast_quantiles(f1, p, 5, qs; conservative = true)
+        @test B.forecast_quantiles(f1, p, 5, qs) == pooled
+        # the guard: lead 5 is beyond the open offers' leads, so its band is the wider of the
+        # two pooled ones; at lead 1 it is also never narrower than that lead's errors
+        @test f1.guard_errors[p] === nothing
+        g = f1.mean[p][5] .+ B.quantile(f1.guard_residuals[p], qs)
+        @test B.forecast_quantiles(f1, p, 5, qs; conservative = true) == [q <= 0.5 ? min(a, b) : max(a, b) for (q, a, b) in zip(qs, pooled, g)]
+        lead1 = f1.mean[p][1] .+ B.quantile(f1.lead_residuals[p][1], qs)
+        cons = B.forecast_quantiles(f1, p, 1, qs; conservative = true)
+        @test cons[1] <= lead1[1] && cons[end] >= lead1[end]
     end
     pend = [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):(τ + 2)]
     pb = rolling_bids(df, τ, 50.0, pend, c)

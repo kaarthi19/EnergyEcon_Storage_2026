@@ -249,3 +249,63 @@ function worst_case_needs(xl::Real, xu::Real, R::NTuple{3,<:Real}, cfg::Config)
     end
     return (raise = maximum(branches), raise_branches = branches, lower = lower, drain = drain, fill = fill)
 end
+
+# ---------------------------------------------------------------------------------------
+# What can clear when the prices lie in a box
+# ---------------------------------------------------------------------------------------
+
+"""
+    box_clearing_range(e, r, lo, hi, cfg) -> (xl, xu, R)
+
+Energy range [xl, xu] and reserve maxima R = (reg, pri, con) that contain every outcome the
+simulator's clearing (`clear_period`) can produce from one period's offers (energy offer `e`,
+reserve offers `r` = (regulation, primary, contingency), as `Offer`s) for ANY prices with
+lo[i] <= price_i <= hi[i], i over (energy, regulation, primary, contingency).
+`worst_case_needs(xl, xu, R, cfg)` over the result then bounds the end SOC over the whole box.
+
+Why it is sound. `clear_period` maximises Σ (λ - p_k + ε) q_k over tranches subject to
+  raise rows: x + reg + pri <= Pc, x + reg + con <= Pc, x + reg <= Pc (per_class; summed:
+              x + reg + pri + con <= Pc),     lower row: -x + reg <= Pc,
+and every reserve tranche only uses capacity, so:
+  * reserve: a tranche priced above hi + ε has negative value and frees nothing, so it is
+    never cleared: r_i <= R_i = cleared_mw(r_i, hi_i + tol);
+  * energy, merit order: energy tranches share one constraint column, so a dearer tranche
+    never clears while a cheaper one has room.
+  * energy below x*(lo) = xe(lo_e - tol), xe(λ) = cleared_mw(e, λ): some tranche of positive
+    value has room, so a raise row binds (else clearing more pays): x >= Pc - raise_mw(R)
+    (the joint clearing can leave an in-the-money tranche uncleared to fit reserve).
+    Moreover a tranche worth more than G_up, the most reserve value a move restoring the
+    raise rows loses per MW (cut regulation, or cut primary and contingency):
+    max(v_reg, v_pri + v_con) per_class, the max of the three summed, with v_i = hi_i minus
+    the lowest price of offer i (or 0) for an offered reserve and 0 otherwise, is always
+    fully cleared: clearing δ more of it and cutting δ of reserve would pay. So
+    x >= xe(lo_e - G_up - tol).
+  * energy above x*(hi) = xe(hi_e + tol): a tranche of negative value is cleared, which only
+    pays if it frees the lower row for regulation, so that row binds: x = reg - Pc <=
+    R_reg - Pc (an out-of-the-money tranche can clear to make room for regulation). A
+    tranche dearer than hi_e + v_reg never clears that way: x <= xe(hi_e + G_dn + tol).
+The clearing outcome thus lies in the polytope {x in [xl, xu], 0 <= r <= R, joint capability},
+which `clearing_worst` maximises over exactly. `tol` (1e-3 \$/MWh) covers the ε tie-break and
+the solver's tolerances. Not covered: `clear_period`'s fallback for an offer that cannot clear
+(energy base beyond the transfer limit), which guarded offers never are.
+"""
+function box_clearing_range(e, r::NTuple{3,Any}, lo::NTuple{4,<:Real}, hi::NTuple{4,<:Real}, cfg::Config)
+    m = cfg.market
+    Pc = transfer_cap(cfg)
+    tol = 1e-3
+    # as clear_period bounds the variables: a negative base or size offers nothing
+    R = ntuple(3) do i
+        o = r[i]
+        max(o.base_mw, 0.0) + sum((max(o.sizes[k], 0.0) for k in eachindex(o.prices) if o.prices[k] <= hi[i + 1] + tol); init = 0.0)
+    end
+    # most value per MW a cleared reserve tranche can have (the base is priced at 0)
+    v = ntuple(i -> R[i] > 0 ? max(0.0, hi[i + 1] - min(0.0, minimum(r[i].prices; init = 0.0))) : 0.0, 3)
+    g_up = max(v[1], m.reserve_headroom == "per_class" ? v[2] + v[3] : max(v[2], v[3]))
+    g_dn = v[1]
+    xe(λ) = cleared_mw(e, λ)
+    xl = max(xe(lo[1] - g_up - tol), min(xe(lo[1] - tol), Pc - raise_mw(R..., m)))
+    xu = min(xe(hi[1] + g_dn + tol), max(xe(hi[1] + tol), R[1] - Pc))
+    xl = clamp(max(xl, min_mw(e)), -Pc, Pc)
+    xu = clamp(min(xu, max_mw(e)), -Pc, Pc)
+    return min(xl, xu), max(xl, xu), R
+end

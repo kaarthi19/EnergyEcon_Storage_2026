@@ -77,8 +77,9 @@ price_impact = 0.0
 # How the SOC at the start of a bid period is bounded while earlier offers are still open
 # (rolling mode with lead_periods > 1, and every period after the first in day_ahead mode).
 # "worst_case": feasible for every clearing outcome of open offers (no violations, but very
-#               conservative). "quantile": open offers cleared at the soc_guard_quantile tails
-#               of the price forecast (violations only beyond those tails). "expected":
+#               conservative). "quantile": feasible for every clearing outcome of open offers
+#               at any prices inside the [1 - soc_guard_quantile, soc_guard_quantile] tails of
+#               the price forecast (violations only beyond those tails). "expected":
 #               expected SOC path +/- soc_margin_mwh.
 soc_guard = "quantile"
 soc_guard_quantile = 0.999

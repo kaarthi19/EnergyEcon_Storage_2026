@@ -93,30 +93,47 @@ function soc_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, cfg::Config)
 end
 
 """
+    price_box(f, j, q, cfg) -> (lo, hi)
+
+Box of prices (energy, regulation, primary, contingency) the quantile guard covers at target
+position `j` of forecast `f`: the [1-q, q] conservative forecast tails of each product
+(`forecast_quantiles`), widened to contain the point forecast and the 7-day same-period
+mean, within the price limits (reserve prices >= 0). The mean matters after a price spike:
+the regression carries the spike into the next periods, the price can fall back within one
+period, and errors from ordinary origins do not show that (in a 3-day truncated-table run
+the SOC guard missed it and the battery ran 52 MWh short).
+"""
+function price_box(f::PriceForecast, j::Int, q::Float64, cfg::Config)
+    m = cfg.market
+    lo, hi = zeros(4), zeros(4)
+    for (i, p) in enumerate(PRODUCTS)
+        a, z = forecast_quantiles(f, p, j, [1 - q, q]; conservative = true)
+        μ, π = f.mean[p][j], f.profile[p][j]
+        floor_p = p == :energy ? m.price_floor : 0.0
+        lo[i] = clamp(min(a, μ, π), floor_p, m.price_cap)
+        hi[i] = clamp(max(z, μ, π), floor_p, m.price_cap)
+    end
+    return Tuple(lo), Tuple(hi)
+end
+
+"""
     soc_quantile_bounds_after(pb, lo, hi, f, j, q, cfg) -> (lo, hi)
 
-SOC interval after an open offer. The offer is cleared at every combination of energy price
-in {1-q tail, mean, q tail} and reserve prices in {1-q tail, q tail} of the forecast (each
-tail the wider of the conditional and pooled error quantile); the
-interval spans the lowest SOC reached from `lo` and the highest reached from `hi`. The
-market can trade energy against regulation, so no single combination is always the extreme.
+SOC interval after an open offer, starting from [lo, hi]: the lowest and highest end SOC
+under expected deployment over every outcome the market can clear from the offer for ANY
+prices inside the guard's price box (`price_box`: the [1-q, q] forecast tails of all four
+products). The outcomes are bounded by `box_clearing_range` (which allows for the joint
+clearing trading energy against reserve) and the extremes over them are exact
+(`worst_case_needs`), so the interval is guaranteed whenever the realised prices of the open
+period lie in the box.
 """
 function soc_quantile_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, f::PriceForecast,
                                    j::Int, q::Float64, cfg::Config)
-    # Conservative tails: never narrower than the pooled residuals (see forecast_quantiles).
-    qq(p, x) = forecast_quantiles(f, p, j, [x]; conservative = true)[1]
-    e_opts = (qq(:energy, 1 - q), f.mean[:energy][j], qq(:energy, q))
-    r_opts = (1 - q, q)
-    lo2, hi2 = Inf, -Inf
-    for λe in e_opts, rq in r_opts
-        pr = Dict{Symbol,Float64}(:energy => λe)
-        for p in RESERVES
-            pr[p] = max(0.0, qq(p, rq))
-        end
-        lo2 = min(lo2, soc_expected_after(pb, lo, pr, cfg))
-        hi2 = max(hi2, soc_expected_after(pb, hi, pr, cfg))
-    end
-    return min(lo2, hi2), max(lo2, hi2)
+    b = cfg.battery
+    plo, phi = price_box(f, j, q, cfg)
+    xl, xu, R = box_clearing_range(pb.offers[:energy], Tuple(pb.offers[p] for p in RESERVES), plo, phi, cfg)
+    w = worst_case_needs(xl, xu, R, cfg)
+    return clamp(lo - w.drain, soc_min(b), soc_max(b)), clamp(hi + w.fill, soc_min(b), soc_max(b))
 end
 
 "Expected SOC after a period: clear offers at forecast prices."
