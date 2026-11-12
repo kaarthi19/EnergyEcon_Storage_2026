@@ -58,8 +58,11 @@ Base.@kwdef struct StrategyConfig
     soc_guard_quantile::Float64 = 0.999
     soc_margin_mwh::Float64 = 5.0
     soc_guard_buffer_mwh::Float64 = 0.5
-    energy_flex_mw::Float64 = 0.0      # max MW the energy offer may deviate from plan (0 = off)
-    energy_flex_to_zero::Bool = true   # the capped offer can always back off to 0 MW
+    energy_offer::String = "curve"     # "curve" (price sweep) | "plan" (forecast-optimal MW, fixed)
+    energy_flex_mw::Float64 = 0.0      # curve: max MW the energy offer may deviate from plan (0 = off)
+    energy_backoff_quantile::Float64 = 0.0   # plan: back off to 0 MW beyond this forecast tail (0 = off)
+    reserve_plan_price::String = "opportunity"   # "opportunity" | "zero": planned reserve MW at 0 $/MWh
+    plan_within_guard::Bool = false    # plan the bid period under the SOC interval the guard enforces
     sustain_charge_credit::Bool = false # plan's sustainability credits planned charging (net transfer)
     info_lag_periods::Int = 0          # forecast uses realised prices only up to origin - this
     require_pending::Bool = false      # generate_bids: error (not a warning) when an open offer is missing
@@ -79,6 +82,9 @@ Base.@kwdef struct SimulationConfig
     shortfall_penalty::Float64 = 4500.0
     stochastic_deployment::Bool = false
     seed::Int = 7
+    # Most MW of each reserve the simulator awards the battery in a period (0 = no cap): market
+    # depth, since the battery is not the only provider.
+    award_cap_mw::Dict{Symbol,Float64} = Dict(:regulation => 0.0, :primary => 0.0, :contingency => 0.0)
 end
 
 Base.@kwdef struct DataConfig
@@ -107,9 +113,18 @@ end
 
 _get(d, k, default) = haskey(d, k) ? d[k] : default
 
+# Keys that existed once: say what replaced them instead of only "unknown key".
+const _REMOVED_KEYS = Dict(
+    "strategy.energy_flex_to_zero" => "it was removed: letting a capped offer back off to 0 MW " *
+        "reopened the SOC swing the cap is meant to remove. Use energy_flex_mw alone (the offer stays " *
+        "within plan ± energy_flex_mw), or energy_offer = \"plan\" with energy_backoff_quantile for a " *
+        "back-off only in the price tails")
+
 # Unknown keys are an error: a misspelt key would otherwise silently run the default.
 function _check_keys(d::AbstractDict, valid, where::AbstractString)
     for k in keys(d)
+        r = get(_REMOVED_KEYS, "$where.$k", nothing)
+        r === nothing || error("config key \"$k\" in [$where]: $r")
         k in valid || error("unknown config key \"$k\" in [$where]; valid keys: $(join(sort(collect(valid)), ", "))")
     end
 end
@@ -159,13 +174,26 @@ function _load_market(m::AbstractDict)
             haskey(d, k) && (kw[f] = _convert_field(Float64, d[k], k, "market.$sub"))
         end
     end
-    caps = _get(m, "reserve_cap_mw", Dict())
-    _check_keys(caps, String.(RESERVES), "market.reserve_cap_mw")
-    kw[:reserve_cap_mw] = Dict{Symbol,Float64}(p => 0.0 for p in RESERVES)
-    for (k, v) in caps
-        kw[:reserve_cap_mw][Symbol(k)] = _convert_field(Float64, v, k, "market.reserve_cap_mw")
-    end
+    kw[:reserve_cap_mw] = _reserve_dict(_get(m, "reserve_cap_mw", Dict()), "market.reserve_cap_mw")
     return MarketConfig(; kw...)
+end
+
+# A sub-table with one number per reserve product (missing products = 0).
+function _reserve_dict(d::AbstractDict, where::AbstractString)
+    _check_keys(d, String.(RESERVES), where)
+    out = Dict{Symbol,Float64}(p => 0.0 for p in RESERVES)
+    for (k, v) in d
+        out[Symbol(k)] = _convert_field(Float64, v, k, where)
+    end
+    return out
+end
+
+function _load_simulation(d::AbstractDict)
+    sim = _fill(SimulationConfig, Dict(k => v for (k, v) in d if k != "award_cap_mw"), "simulation";
+                skip = ("award_cap_mw",))
+    caps = _reserve_dict(_get(d, "award_cap_mw", Dict()), "simulation.award_cap_mw")
+    return SimulationConfig(; (f => getfield(sim, f) for f in fieldnames(SimulationConfig) if f != :award_cap_mw)...,
+                            award_cap_mw = caps)
 end
 
 """
@@ -181,7 +209,7 @@ function load_config(path::AbstractString)
     market = _load_market(_get(raw, "market", Dict()))
     strategy = _fill(StrategyConfig, _get(raw, "strategy", Dict()), "strategy")
     forecast = _fill(ForecastConfig, _get(raw, "forecast", Dict()), "forecast")
-    simulation = _fill(SimulationConfig, _get(raw, "simulation", Dict()), "simulation")
+    simulation = _load_simulation(_get(raw, "simulation", Dict()))
     d = _get(raw, "data", Dict())
     cols = _get(d, "columns", Dict())
     _check_keys(cols, _DATA_COLUMN_KEYS, "data.columns")
@@ -201,6 +229,14 @@ function validate(c::Config)
     s.terminal_value_mode in ("soft", "hard") || error("terminal_value_mode must be soft or hard")
     s.soc_guard in ("worst_case", "quantile", "expected") || error("soc_guard must be worst_case, quantile or expected")
     s.energy_flex_mw >= 0 || error("energy_flex_mw must be >= 0")
+    s.energy_offer in ("curve", "plan") || error("strategy.energy_offer must be curve or plan")
+    s.energy_offer == "plan" && s.energy_flex_mw > 0 &&
+        error("strategy.energy_flex_mw limits the curve offer; with energy_offer = \"plan\" set it to 0")
+    s.energy_backoff_quantile == 0 || 0.5 <= s.energy_backoff_quantile < 1 ||
+        error("strategy.energy_backoff_quantile must be 0 (off) or in [0.5, 1)")
+    s.energy_backoff_quantile == 0 || s.energy_offer == "plan" ||
+        error("strategy.energy_backoff_quantile applies to energy_offer = \"plan\" only")
+    s.reserve_plan_price in ("opportunity", "zero") || error("strategy.reserve_plan_price must be opportunity or zero")
     0.5 <= s.soc_guard_quantile < 1 || error("soc_guard_quantile must be in [0.5, 1)")
     m.reserve_headroom in ("per_class", "summed") || error("reserve_headroom must be per_class or summed")
     m.offered_capacity_mw >= 0 || error("offered_capacity_mw must be >= 0 (0 = power rating)")
@@ -234,6 +270,9 @@ function validate(c::Config)
     f.pd_horizon_periods >= 0 || error("forecast.pd_horizon_periods must be >= 0")
     f.error_period_window >= 0 || error("forecast.error_period_window must be >= 0")
     c.simulation.shortfall_penalty >= 0 || error("simulation.shortfall_penalty must be >= 0")
+    all(p -> get(c.simulation.award_cap_mw, p, 0.0) >= 0, RESERVES) &&
+        all(in(RESERVES), keys(c.simulation.award_cap_mw)) ||
+        error("simulation.award_cap_mw must give MW >= 0 for regulation, primary and contingency only")
     d = c.data
     isempty(d.date_col) == isempty(d.period_col) || error("data.date_col and data.period_col must be set together")
     !isempty(d.date_col) || !isempty(d.timestamp_col) || error("data.timestamp_col (or date_col + period_col) must be set")

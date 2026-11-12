@@ -85,11 +85,28 @@ soc_guard = "quantile"
 soc_guard_quantile = 0.999
 soc_margin_mwh = 5.0
 soc_guard_buffer_mwh = 0.5  # offers keep this many MWh away from the 5% / 95% SOC limits
-# Max MW the energy offer may deviate from the forecast-optimal plan (0 = no limit). Price
-# response in offers that are still open at gate closure widens the SOC interval later
-# periods must cover; limiting it keeps reserve capability.
+# Energy offer. "curve": the price-responsive curve from the parametric price sweep. "plan": the
+# forecast-optimal net MW as a fixed quantity (one always-charge pair at the price cap, one
+# always-discharge pair at the price floor, or the zero offer); no energy sweep. Price response
+# in offers still open at gate closure widens the SOC interval later periods must cover, so the
+# guard then cuts reserves; "plan" is the limit of energy_flex_mw -> 0.
+energy_offer = "curve"
+# "curve" only: max MW the energy offer may deviate from the plan (0 = no limit); the offer stays
+# within plan ± energy_flex_mw.
 energy_flex_mw = 0.0
-energy_flex_to_zero = true  # with energy_flex_mw > 0: the capped offer can still back off to 0 MW
+# "plan" only (0 = off): a planned charge backs off to 0 MW above the upper q tail of the energy
+# price forecast, a planned discharge below the lower 1 - q tail (the edges of the box
+# strategy.soc_guard = "quantile" uses, at this q). The guard covers the back-off for every price
+# inside its own box; at q > soc_guard_quantile the back-off lies outside that box and is not
+# covered, so a price beyond the box can then cause a sustain violation.
+energy_backoff_quantile = 0.0
+# "opportunity": every reserve tranche is priced at its opportunity cost from the price sweep.
+# "zero": the planned MW of each reserve is offered at 0 $/MWh (always clears; safe only for a
+# price taker), the sweep's prices are kept for tranches above the plan.
+reserve_plan_price = "opportunity"
+# true: the bid period of the plan is solved under the SOC interval and buffer the SOC guard will
+# enforce (instead of the guard trimming the plan afterwards).
+plan_within_guard = false
 # Plan's sustainability constraints. true: count the net transfer, as settlement does (reserve
 # backed by curtailing a planned charge). false: count only planned discharge (raise side) and
 # planned charge (lower side); the offer curve may not clear the planned charge, and the SOC
@@ -123,6 +140,15 @@ shortfall_penalty = 4500.0  # $/MWh of energy the battery could not deliver with
 stochastic_deployment = false  # true: each deployment fraction (regulation up and down separately,
                                # primary, contingency) drawn uniformly in [0, 2 x expected] per period
 seed = 7
+
+# Most MW of each reserve the simulator awards the battery per period (0 = no cap), for market
+# depth: other providers compete for small requirements (Singapore's regulation requirement is
+# about 99 MW in total). Applied in clearing and settlement, and by the perfect-foresight bound.
+# Tell the strategy with market.reserve_cap_mw.
+[simulation.award_cap_mw]
+regulation = 0.0
+primary = 0.0
+contingency = 0.0
 
 # Canonical name -> column name in EMA's files. Edit when the dataset is released.
 # Either a single timestamp column, or a date column plus a trading-period column (1..48).

@@ -5,7 +5,8 @@
 #     Σ_k (λ - p_k) q_k   over energy and reserve tranches
 # subject to the joint capability constraints the market enforces:
 #     net export + Σ raise reserves <= Pc,   import + regulation <= Pc,
-# where Pc = transfer_cap(cfg), the power rating capped by the offered capacity.
+# where Pc = transfer_cap(cfg), the power rating capped by the offered capacity, and each
+# reserve award <= `award_cap` (simulation.award_cap_mw, market depth).
 # A tranche priced at or below the market price clears (energy sells, charging buys).
 
 struct PeriodOutcome
@@ -52,6 +53,9 @@ function clear_period(pb::PeriodBids, prices::Dict{Symbol,Float64}, cfg::Config)
     end
     x = @expression(model, e.base_mw + sum(qe; init = 0.0))
     rtot(p) = base[p] + sum(q[p]; init = 0.0)
+    for p in RESERVES   # market depth: other providers take the rest of the requirement
+        isfinite(award_cap(cfg, p)) && @constraint(model, rtot(p) <= award_cap(cfg, p))
+    end
     # Joint capability (RC383 D.17.2.4A, D.18.1.6/7), limited by the offered capacity.
     if cfg.market.reserve_headroom == "per_class"
         @constraint(model, x + rtot(:regulation) + rtot(:primary) <= Pc)
@@ -76,7 +80,7 @@ end
 
 Apply awards physically: move SOC, deploy reserves (expected, or random with
 `simulation.stochastic_deployment` and an `rng`), clamp at SOC limits and record any
-shortfall and sustainability breach.
+shortfall and sustainability breach. Awards above `award_cap` are cut to it.
 
 Settlement: energy is paid on the delivered quantity (scheduled MWh minus what the SOC
 clamp kept from being delivered or absorbed), reserves on the award; the shortfall penalty
@@ -90,6 +94,8 @@ function settle_period(net::Float64, res::Dict{Symbol,Float64}, soc::Float64,
     b, m, sim = cfg.battery, cfg.market, cfg.simulation
     η, dt = eta_one_way(b), m.period_hours
     Emin, Emax = soc_min(b), soc_max(b)
+    # awards beyond the market depth are not settled (clear_period never awards them)
+    res = Dict{Symbol,Float64}(p => min(res[p], award_cap(cfg, p)) for p in RESERVES)
     reg, pri, con = res[:regulation], res[:primary], res[:contingency]
 
     # Sustainability check of awards at the start of the period (compliance metric), the

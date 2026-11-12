@@ -44,7 +44,9 @@ end
 
 Sweep the price of each product in window position `j_model` over a grid of forecast
 quantiles, re-solving the co-optimisation each time, and turn the responses into offers.
-`j_fc` is the matching position in the forecast `f`.
+`j_fc` is the matching position in the forecast `f`. With `strategy.energy_offer = "plan"`
+the energy offer is the planned net MW instead (`plan_energy_offer`, no energy sweep); with
+`strategy.reserve_plan_price = "zero"` the planned MW of each reserve is offered at 0 \$/MWh.
 """
 function bids_from_model!(cm::CoOptModel, f::PriceForecast, j_model::Int, j_fc::Int,
                           row::Int, ts::DateTime, cfg::Config)
@@ -55,7 +57,9 @@ function bids_from_model!(cm::CoOptModel, f::PriceForecast, j_model::Int, j_fc::
     for p in RESERVES
         planned[p] = base.reserve_mw[p]
     end
+    plan = s.energy_offer == "plan"
     for p in PRODUCTS
+        plan && p == :energy && continue
         qs = p == :energy ? s.energy_grid_quantiles : s.reserve_grid_quantiles
         g = _grid(f, p, j_fc, qs, cfg)
         orig = cm.prices[p][j_model]
@@ -63,21 +67,51 @@ function bids_from_model!(cm::CoOptModel, f::PriceForecast, j_model::Int, j_fc::
         set_price!(cm, p, j_model, orig)
         ntr = p == :energy ? m.max_energy_tranches : m.max_reserve_tranches
         offers[p] = offer_from_grid(p, g, xs, ntr)
+        if p != :energy && s.reserve_plan_price == "zero"
+            # Once the energy schedule is fixed, the planned reserve MW has almost no opportunity
+            # cost, and a sweep price above the realised price would leave it unawarded.
+            x0 = max(planned[p], 0.0)
+            offers[p] = clip_offer(offers[p], x0, max(max_mw(offers[p]), x0))
+        end
     end
-    # Limit how far the energy offer can move from the plan. Offers become "open" for the
-    # SOC guard of later periods (gate closure), and every MW of price response widens the
-    # SOC interval those periods must cover, which costs reserve capability.
-    flex = s.energy_flex_mw
-    if flex > 0
-        Pc = transfer_cap(cfg)
-        x0 = planned[:energy]
-        # With energy_flex_to_zero the offer can always back off to 0 MW (stop charging in a
-        # price spike, stop discharging in a price crash), priced at its opportunity cost.
-        lo = s.energy_flex_to_zero ? min(x0, 0.0) - flex : x0 - flex
-        hi = s.energy_flex_to_zero ? max(x0, 0.0) + flex : x0 + flex
-        offers[:energy] = clip_offer(offers[:energy], max(-Pc, lo), min(Pc, hi))
+    if plan
+        offers[:energy] = plan_energy_offer(planned[:energy], f, j_fc, cfg)
+    elseif s.energy_flex_mw > 0
+        # Limit how far the energy offer can move from the plan. Offers become "open" for the
+        # SOC guard of later periods (gate closure), and every MW of price response widens the
+        # SOC interval those periods must cover, which costs reserve capability.
+        Pc, x0, flex = transfer_cap(cfg), planned[:energy], s.energy_flex_mw
+        offers[:energy] = clip_offer(offers[:energy], max(-Pc, x0 - flex), min(Pc, x0 + flex))
     end
     return PeriodBids(row, ts, offers, planned)
+end
+
+"""
+    plan_energy_offer(x0, f, j, cfg) -> Offer
+
+Energy offer for `strategy.energy_offer = "plan"`: the planned net MW `x0` at any price (as RC383
+pairs, one always-charge pair at the price cap or one always-discharge pair at the price floor;
+below 0.001 MW the zero offer). With `strategy.energy_backoff_quantile = q > 0` a charge stops
+(0 MW) once the price reaches the upper edge of `price_box(f, j, q)` and a discharge is offered
+only from its lower edge up, which protects against unforecast spikes (collapses).
+
+How the quantile guard treats the back-off: it bounds the offer's clearing over the price box
+of `strategy.soc_guard_quantile`, so a back-off priced inside that box (q <= soc_guard_quantile,
+including q equal to it: the box edges are inside) widens the SOC interval of later periods by
+up to |x0| MW for the period and is covered. A back-off priced outside it (q above the guard's
+quantile) does not widen the interval and is not covered: a sustain violation is then possible
+only when the realised price leaves the guard's box and the back-off clears.
+"""
+function plan_energy_offer(x0::Float64, f::PriceForecast, j::Int, cfg::Config)
+    q = cfg.strategy.energy_backoff_quantile
+    round_mw(abs(x0)) == 0 && return Offer(:energy, 0.0, Float64[], Float64[])
+    q == 0 && return Offer(:energy, x0, Float64[], Float64[])
+    lo, hi = price_box(f, j, q, cfg)
+    # whole cents, rounded into the box, so q = soc_guard_quantile stays covered
+    if x0 < 0
+        return Offer(:energy, x0, [floor(hi[1] * 100) / 100], [-x0])    # stop charging from here
+    end
+    return Offer(:energy, 0.0, [ceil(lo[1] * 100) / 100], [x0])          # discharge only from here
 end
 
 """
@@ -231,7 +265,7 @@ function rolling_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::Abstrac
     soc_exp, lo, hi = soc_after_open_offers(pending, τ, soc_now, f, τf, cfg)
     j0 = t - τf
     n = last_row - t + 1
-    cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n))
+    cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n); guard = s.plan_within_guard ? (lo, hi) : nothing)
     pb = bids_from_model!(cm, f, 1, j0, t, df.timestamp[t], cfg)
     return guard_soc(pb, lo, hi, cfg)
 end
@@ -261,7 +295,9 @@ function day_ahead_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::Abstr
     j0 = first(rows) - τf
     n = last_row - first(rows) + 1
     soc_exp, lo, hi = soc_after_open_offers(pending, τ, soc_now, f, τf, cfg)
-    cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n))
+    # plan_within_guard: only the first day period has its guard interval at build time
+    cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n);
+                     guard = s.plan_within_guard && s.soc_guard != "expected" ? (lo, hi) : nothing)
     out = PeriodBids[]
     margin = s.soc_margin_mwh
     for (k, t) in enumerate(rows)

@@ -27,6 +27,12 @@ PSO-approved standing capability data), so caps up to 2x the transfer limit are 
 reserve_cap(m::MarketConfig, b::BatteryConfig, p::Symbol) =
     (Pc = transfer_cap(m, b); c = get(m.reserve_cap_mw, p, 0.0); c > 0 ? min(c, 2 * Pc) : Pc)
 
+"""
+Most MW of reserve `p` the simulator awards in a period (`simulation.award_cap_mw`, market
+depth; Inf when not set). Clearing, settlement and the perfect-foresight bound apply it.
+"""
+award_cap(cfg::Config, p::Symbol) = (c = get(cfg.simulation.award_cap_mw, p, 0.0); c > 0 ? c : Inf)
+
 sustain_hours(m::MarketConfig, p::Symbol) =
     p == :regulation ? m.sustain_regulation : p == :primary ? m.sustain_primary : m.sustain_contingency
 

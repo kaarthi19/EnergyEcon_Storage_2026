@@ -112,7 +112,7 @@ end
     perfect_foresight(df, rows, cfg; end_soc_ge_start=false) -> (revenue, schedule)
 
 Perfect-foresight benchmark: co-optimise the whole window with the realised prices (LP)
-from the initial SOC, with no degradation cost and the simulator's rules (joint capability,
+from the initial SOC, with no degradation cost and the simulator's rules (joint capability, award caps,
 expected deployment, and the net-transfer sustainability rule `settle_period` checks, i.e.
 `sustain_charge_credit = true`); `revenue` is the market revenue of that schedule, as
 settled (deployment energy included when `market.pay_deployment_energy`).
@@ -133,7 +133,13 @@ function perfect_foresight(df::DataFrame, rows::UnitRange{Int}, cfg::Config; end
     st = with_strategy(cfg; use_binary = false, price_impact = 0.0, terminal_value_mode = "hard",
                        terminal_soc_frac = end_soc_ge_start ? b.initial_soc_frac : b.soc_min_frac,
                        sustain_charge_credit = true).strategy
-    c2 = Config(bat, cfg.market, st, cfg.forecast, cfg.simulation, cfg.data)
+    # the simulator never awards more than award_cap: the benchmark's reserve bounds too
+    m = cfg.market
+    caps = Dict{Symbol,Float64}(p => (a = award_cap(cfg, p); isfinite(a) ? min(a, reserve_cap(m, b, p)) :
+                                      get(m.reserve_cap_mw, p, 0.0)) for p in RESERVES)
+    mk = MarketConfig(; (f => getfield(m, f) for f in fieldnames(MarketConfig) if f != :reserve_cap_mw)...,
+                      reserve_cap_mw = caps)
+    c2 = Config(bat, mk, st, cfg.forecast, cfg.simulation, cfg.data)
     prices = Dict(p => Vector{Float64}(df[rows, PRICE_COLS[p]]) for p in PRODUCTS)
     cm = build_coopt(c2, initial_soc(b), prices)
     _optimize_checked!(cm)

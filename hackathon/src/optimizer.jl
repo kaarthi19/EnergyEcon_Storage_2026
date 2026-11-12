@@ -38,12 +38,17 @@ _highs(attrs::Pair...) = optimizer_with_attributes(HiGHS.Optimizer, "output_flag
 _optimizer() = _highs("mip_rel_gap" => 1e-4, "time_limit" => 60.0)
 
 """
-    build_coopt(cfg, soc0, prices; reserves=true) -> CoOptModel
+    build_coopt(cfg, soc0, prices; reserves=true, guard=nothing) -> CoOptModel
 
 `prices[p]` is a vector over the look-ahead window for each product in PRODUCTS.
+`guard = (lo, hi)`: the SOC interval `guard_soc` will enforce at the start of the first
+period. Its rules (sustainability and end SOC from every start SOC in [lo, hi], keeping
+`soc_guard_buffer_mwh` from the limits) are then added to that period, so the plan is the
+best mix under the limits the guard enforces rather than one the guard trims afterwards
+(`strategy.plan_within_guard`).
 """
 function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Float64}};
-                     reserves::Bool = true)
+                     reserves::Bool = true, guard::Union{Nothing,Tuple{Float64,Float64}} = nothing)
     b, m, s = cfg.battery, cfg.market, cfg.strategy
     H = length(prices[:energy])
     η = eta_one_way(b)
@@ -90,6 +95,24 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
             @constraint(model, prev(j) - need / η >= Emin)
         end
         @constraint(model, prev(j) + η * lower_need(credit ? d[j] - c[j] : -1.0 * c[j], reg, m) <= Emax)
+        if j == 1 && guard !== nothing
+            # guard_soc's stores (rules met from the lowest / highest start SOC with its buffer);
+            # all-zero activity always meets them, so the model stays feasible
+            buf = s.soc_guard_buffer_mwh
+            up_store = max(0.0, guard[1] - Emin - buf)
+            dn_store = max(0.0, Emax - guard[2] - buf)
+            for need in raise_needs(credit ? d[j] - c[j] : 1.0 * d[j], reg, pri, con, m)
+                @constraint(model, need <= η * up_store)
+            end
+            @constraint(model, η * lower_need(credit ? d[j] - c[j] : -1.0 * c[j], reg, m) <= dn_store)
+            # end SOC: the guard lets the energy clear anywhere between 0 and the offer and each
+            # reserve between 0 and its offer, so the worst drain counts only the discharge and
+            # the reserves whose deployment drains, the worst fill only the charge and the rest
+            dep = deployment_energy_coef(cfg)
+            part(f) = Tuple(f(dep[p]) ? r[p][j] : 0.0 for p in RESERVES)
+            @constraint(model, -soc_change(0.0, d[j], part(<(0))..., cfg) <= up_store)
+            @constraint(model, soc_change(c[j], 0.0, part(>(0))..., cfg) <= dn_store)
+        end
     end
     if binary
         @variable(model, u[1:H], Bin)

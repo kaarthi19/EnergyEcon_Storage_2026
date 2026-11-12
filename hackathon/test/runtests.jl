@@ -563,16 +563,35 @@ end
         @test occursin("24", something(tryload(replace(base, "period_hours = 0.5" => "period_hours = 0.25")), ""))
         @test occursin("lead_periods", something(tryload(replace(base, "lead_periods = 3" => "lead_periods = 0")), ""))
         c = load_config(joinpath(@__DIR__, "..", "configs", "default.toml"))
-        write(joinpath(d, "c.toml"), replace(base, "regulation_up = 0.10" => "regulation_up = 0.30", "energy_flex_to_zero = true" => "energy_flex_to_zero = false"))
+        write(joinpath(d, "c.toml"), replace(base, "regulation_up = 0.10" => "regulation_up = 0.30", "energy_offer = \"curve\"" => "energy_offer = \"plan\""))
         c2 = load_config(joinpath(d, "c.toml"))
-        @test c2.market.deploy_reg_up == 0.30 && c2.strategy.energy_flex_to_zero == false
+        @test c2.market.deploy_reg_up == 0.30 && c2.strategy.energy_offer == "plan"
+        # strategy options and the removed energy_flex_to_zero key
+        e = something(tryload(replace(base, "energy_flex_mw = 0.0" => "energy_flex_mw = 10.0\nenergy_flex_to_zero = false")), "")
+        @test occursin("energy_flex_to_zero", e) && occursin("removed", e) && occursin("energy_flex_mw", e)
+        @test occursin("energy_offer", something(tryload(replace(base, "energy_offer = \"curve\"" => "energy_offer = \"fixed\"")), ""))
+        @test occursin("energy_flex_mw", something(tryload(replace(base, "energy_offer = \"curve\"" => "energy_offer = \"plan\"",
+                                                                         "energy_flex_mw = 0.0" => "energy_flex_mw = 5.0")), ""))
+        @test occursin("energy_backoff_quantile", something(tryload(replace(base, "energy_backoff_quantile = 0.0" => "energy_backoff_quantile = 0.99")), ""))
+        @test occursin("energy_backoff_quantile", something(tryload(replace(base, "energy_offer = \"curve\"" => "energy_offer = \"plan\"",
+                                                                                  "energy_backoff_quantile = 0.0" => "energy_backoff_quantile = 0.3")), ""))
+        @test occursin("reserve_plan_price", something(tryload(replace(base, "reserve_plan_price = \"opportunity\"" => "reserve_plan_price = \"free\"")), ""))
+        # award caps: a sub-table of [simulation], products checked
+        capped = replace(base, "[simulation.award_cap_mw]\nregulation = 0.0" => "[simulation.award_cap_mw]\nregulation = 30")
+        @test tryload(capped) === nothing
+        write(joinpath(d, "c.toml"), capped)
+        c3 = load_config(joinpath(d, "c.toml"))
+        @test c3.simulation.award_cap_mw[:regulation] == 30 && c3.simulation.award_cap_mw[:primary] == 0 && c3.simulation.seed == 7
+        @test B.award_cap(c3, :regulation) == 30 && B.award_cap(c3, :primary) == Inf
+        @test occursin("regulaton", something(tryload(replace(base, "[simulation.award_cap_mw]\nregulation = 0.0" => "[simulation.award_cap_mw]\nregulaton = 30")), ""))
+        @test occursin("award_cap_mw", something(tryload(replace(base, "[simulation.award_cap_mw]\nregulation = 0.0" => "[simulation.award_cap_mw]\nregulation = -1")), ""))
     end
     # Every struct field is documented in default.toml, with the same default.
     raw = B.TOML.parsefile(joinpath(@__DIR__, "..", "configs", "default.toml"))
     for (sec, T) in (("battery", B.BatteryConfig), ("strategy", B.StrategyConfig), ("forecast", B.ForecastConfig),
                      ("simulation", B.SimulationConfig), ("data", B.DataConfig))
         for f in fieldnames(T)
-            f == :columns && continue
+            f in (:columns, :award_cap_mw) && continue
             @test haskey(raw[sec], String(f))
             haskey(raw[sec], String(f)) && @test raw[sec][String(f)] == getfield(T(), f)
         end
@@ -584,6 +603,8 @@ end
         @test raw["market"][String(f)] == getfield(dm, f)
     end
     @test cfg.market.deploy_reg_up == dm.deploy_reg_up && cfg.market.sustain_primary == dm.sustain_primary
+    @test Dict(Symbol(k) => v for (k, v) in raw["simulation"]["award_cap_mw"]) == B.SimulationConfig().award_cap_mw
+    @test Dict(Symbol(k) => v for (k, v) in raw["market"]["reserve_cap_mw"]) == dm.reserve_cap_mw
 end
 
 @testset "loader: formats, split files, duplicates, gaps" begin
@@ -1140,6 +1161,129 @@ end
         write_backtest(r, d, cfg)
         @test isfile(joinpath(d, "periods.csv")) && isfile(joinpath(d, "bids.csv")) && isfile(joinpath(d, "summary.csv"))
     end
+end
+
+@testset "strategy options: plan energy offer, zero-priced plan, back-off, plan within guard" begin
+    τ = 7 * 48 + 10
+    t = τ + cfg.strategy.lead_periods
+    last_row = t + cfg.strategy.horizon_periods - 1
+    f, τf = B.forecast_at(df, τ, last_row, cfg)
+    j0 = t - τf
+    win = B._window_prices(f, j0, last_row - t + 1)
+    ts = df.timestamp[t]
+    mk(c; soc = 50.0, guard = nothing) = B.bids_from_model!(build_coopt(c, soc, deepcopy(win); guard), f, 1, j0, t, ts, c)
+    cur = mk(cfg)
+    cp = with_strategy(cfg; energy_offer = "plan")
+    pl = mk(cp)
+    @test all(isapprox(pl.planned[p], cur.planned[p]; atol = 1e-6) for p in PRODUCTS)
+    e = pl.offers[:energy]
+    @test min_mw(e) == max_mw(e) == pl.planned[:energy] && isempty(e.prices)
+    # fixed quantities as RC383 pairs: always charge at the cap, always discharge at the floor
+    for (x, price) in ((-60.0, cfg.market.price_cap), (60.0, cfg.market.price_floor))
+        pr = B.storage_pairs(B.plan_energy_offer(x, f, j0, cp), cp)
+        @test length(pr) == 1 && pr[1].price == price && pr[1].mw ≈ x
+    end
+    pr0 = B.storage_pairs(B.plan_energy_offer(0.0004, f, j0, cp), cp)
+    @test length(pr0) == 1 && pr0[1].mw == 0
+    g = guard_soc(pl, 40.0, 60.0, cp)
+    @test isempty(validate_bids(g, cp))
+    # zero-priced plan: the planned MW clears at any price, tranches above it keep their prices
+    cz = with_strategy(cp; reserve_plan_price = "zero")
+    zr = mk(cz)
+    for p in RESERVES, λ in (0.0, 5.0, 20.0, 60.0, 500.0, 4500.0)
+        x0 = max(zr.planned[p], 0.0)
+        @test cleared_mw(zr.offers[p], λ) ≈ max(cleared_mw(pl.offers[p], λ), x0) atol = 1e-9
+    end
+    @test any(zr.planned[p] > 1 for p in RESERVES)
+    # back-off at the edges of the q price box
+    cb = with_strategy(cz; energy_backoff_quantile = 0.99)
+    blo, bhi = B.price_box(f, j0, 0.99, cb)
+    ob = B.plan_energy_offer(-60.0, f, j0, cb)
+    @test cleared_mw(ob, bhi[1] - 0.01) ≈ -60 && cleared_mw(ob, bhi[1]) == 0 && ob.prices[1] <= bhi[1]
+    od = B.plan_energy_offer(60.0, f, j0, cb)
+    @test cleared_mw(od, blo[1] + 0.01) ≈ 60 && cleared_mw(od, blo[1] - 0.01) == 0 && blo[1] <= od.prices[1] <= bhi[1]
+    @test isempty(validate_bids(guard_soc(B.PeriodBids(t, ts, Dict(:energy => ob, (p => noff(p) for p in RESERVES)...),
+                                                       Dict(:energy => -60.0, (p => 0.0 for p in RESERVES)...)), 40.0, 60.0, cb), cb))
+    # how the quantile guard treats it: covered inside its box, not covered outside
+    qg = cfg.strategy.soc_guard_quantile
+    glo, ghi = B.price_box(f, j0, qg, cfg)
+    @test B.plan_energy_offer(-60.0, f, j0, with_strategy(cb; energy_backoff_quantile = 0.9999)).prices[1] >= ghi[1] - 0.01
+    open_pb(o) = B.PeriodBids(t, ts, Dict(:energy => o, (p => noff(p) for p in RESERVES)...))
+    ivl(o) = B.soc_quantile_bounds_after(open_pb(o), 50.0, 50.0, f, j0, qg, cfg)
+    fixed = ivl(Offer(:energy, -60.0, Float64[], Float64[]))
+    inside = ivl(ob)                                               # 0.99 <= the guard's 0.999
+    outside = ivl(Offer(:energy, -60.0, [ghi[1] + 1.0], [60.0]))
+    @test fixed[1] ≈ fixed[2] ≈ 50 + B.soc_change(60.0, 0.0, 0.0, 0.0, 0.0, cfg)
+    @test inside[1] ≈ 50 && inside[2] ≈ fixed[2]                   # the back-off may clear: covered
+    @test outside[1] ≈ fixed[1] && outside[2] ≈ fixed[2]           # priced outside the box: not covered
+    for (o, iv) in ((ob, inside), (Offer(:energy, -60.0, [ghi[1] + 1.0], [60.0]), outside)), λe in (glo[1], ghi[1])
+        prc = Dict(:energy => λe, :regulation => 0.0, :primary => 0.0, :contingency => 0.0)
+        net, res = clear_period(open_pb(o), prc, cfg)
+        @test iv[1] - 1e-6 <= settle_period(net, res, 50.0, prc, cfg).soc_end <= iv[2] + 1e-6
+    end
+    # beyond the box the uncovered back-off clears and the SOC leaves the interval (documented)
+    prc = Dict(:energy => ghi[1] + 2.0, :regulation => 0.0, :primary => 0.0, :contingency => 0.0)
+    net, res = clear_period(open_pb(Offer(:energy, -60.0, [ghi[1] + 1.0], [60.0])), prc, cfg)
+    @test net == 0 && settle_period(net, res, 50.0, prc, cfg).soc_end < outside[1] - 1
+    # plan within the guard: the guard keeps the plan it is given (a low, wide interval)
+    lo, hi = 10.0, 40.0
+    ca = with_strategy(cz; plan_within_guard = true)
+    pa = mk(ca; soc = 25.0, guard = (lo, hi))
+    ga = guard_soc(pa, lo, hi, ca)
+    @test all(max_mw(ga.offers[p]) >= max(pa.planned[p], 0.0) - 2e-3 for p in RESERVES)
+    @test min_mw(ga.offers[:energy]) >= min(pa.planned[:energy], 0.0) - 2e-3 &&
+          max_mw(ga.offers[:energy]) >= max(pa.planned[:energy], 0.0) - 2e-3
+    pn = mk(cz; soc = 25.0)
+    gn = guard_soc(pn, lo, hi, cz)
+    @test any(max_mw(gn.offers[p]) < pn.planned[p] - 0.5 for p in RESERVES)   # unaligned plan was trimmed
+    @test isempty(validate_bids(ga, ca))
+    bl = generate_bids(df, τ, 50.0, ca; pending = [B.idle_bids(τ + 1, df.timestamp[τ + 1]), B.idle_bids(τ + 2, df.timestamp[τ + 2])])
+    @test isempty(validate_bids(bl[1], ca))
+    # closed loop, one day: compliant, never above the benchmark
+    st = 7 * 48 + 1
+    for c in (cz, cb, ca)
+        r = run_backtest(df, c; start_row = st, end_row = st + 47, progress = false)
+        sm = Dict(r.summary.metric .=> r.summary.value)
+        @test sm["compliant"] == 1 && sm["net_market_revenue"] <= sm["perfect_foresight_bound"] + 1e-6
+    end
+end
+
+@testset "award caps: market depth in clearing, settlement and the benchmark" begin
+    capd = Dict(:regulation => 30.0, :primary => 0.0, :contingency => 0.0)
+    cc = B.Config(cfg.battery, cfg.market, cfg.strategy, cfg.forecast, B.SimulationConfig(award_cap_mw = capd), cfg.data)
+    pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => Offer(:energy, 0.0, Float64[], Float64[]),
+        :regulation => Offer(:regulation, 80.0, Float64[], Float64[]),
+        :primary => Offer(:primary, 0.0, [1.0], [50.0]), :contingency => noff(:contingency)))
+    prc = Dict(:energy => 100.0, :regulation => 20.0, :primary => 5.0, :contingency => 0.0)
+    _, res = clear_period(pb, prc, cc)
+    @test res[:regulation] ≈ 30 && res[:primary] ≈ 50
+    @test clear_period(pb, prc, cfg)[2][:regulation] ≈ 80
+    o = settle_period(0.0, Dict(:regulation => 80.0, :primary => 0.0, :contingency => 0.0), 50.0, prc, cc)
+    @test o.reserve_mw[:regulation] == 30 && o.revenue[:regulation] ≈ 20 * 30 * 0.5
+    rows = (7 * 48 + 1):(7 * 48 + 48)
+    pf, sch = perfect_foresight(df, rows, cfg)
+    pfc, schc = perfect_foresight(df, rows, cc)
+    @test maximum(schc.regulation_mw) <= 30 + 1e-6 && maximum(sch.regulation_mw) > 30 && pfc < pf
+    # the strategy told about the depth through market.reserve_cap_mw: compliant, under the bound
+    cs = B.Config(cfg.battery, mkmarket(cfg.market; reserve_cap_mw = capd), with_strategy(cfg; energy_offer = "plan").strategy,
+                  cfg.forecast, cc.simulation, cfg.data)
+    r = run_backtest(df, cs; start_row = first(rows), end_row = last(rows), progress = false)
+    sm = Dict(r.summary.metric .=> r.summary.value)
+    @test maximum(r.periods.regulation_mw) <= 30 + 1e-6
+    @test sm["compliant"] == 1 && sm["perfect_foresight_bound"] ≈ pfc && sm["net_market_revenue"] <= pfc + 1e-6
+end
+
+@testset "synthetic stress data: unannounced spikes" begin
+    a = synthetic_market_data(days = 10, seed = 5, cfg = cfg)
+    st = synthetic_market_data(days = 10, seed = 5, cfg = cfg, stress = true)
+    @test isequal(st, synthetic_market_data(days = 10, seed = 5, cfg = cfg, stress = true))
+    @test all(st[!, c] == a[!, c] for c in (:pd_energy, :pd_regulation, :pd_primary, :pd_contingency, :pd_demand))
+    jump = st.price_energy .- a.price_energy
+    hod = hour.(a.timestamp)
+    @test count(>(400), jump) >= 2 * count(>(500), a.price_energy) + 20
+    @test count(i -> jump[i] > 400 && (hod[i] < 7 || 10 <= hod[i] < 16), eachindex(jump)) >= 10
+    @test count(<(-50), st.price_energy) > count(<(-50), a.price_energy)
+    @test maximum(st.price_energy) <= cfg.market.price_cap && all(>=(0), st.price_regulation)
 end
 
 end # BESSBidding
