@@ -84,6 +84,7 @@ soc_guard_buffer_mwh = 0.5  # offers keep this many MWh away from the 5% / 95% S
 # response in offers that are still open at gate closure widens the SOC interval later
 # periods must cover; limiting it keeps reserve capability.
 energy_flex_mw = 0.0
+energy_flex_to_zero = true  # with energy_flex_mw > 0: the capped offer can still back off to 0 MW
 # Plan's sustainability constraints. true: count the net transfer, as settlement does (reserve
 # backed by curtailing a planned charge). false: count only planned discharge (raise side) and
 # planned charge (lower side); the offer curve may not clear the planned charge, and the SOC
@@ -109,11 +110,28 @@ seed = 7
 
 # Canonical name -> column name in EMA's files. Edit when the dataset is released.
 # Either a single timestamp column, or a date column plus a trading-period column (1..48).
+# A directory of CSVs is read as one table: files with the same columns are stacked (e.g. one
+# file per month), files with different columns are joined on time. Rows that repeat a
+# timestamp must agree on every value, otherwise loading stops with an error.
+# Unknown keys anywhere in this file are an error.
 [data]
 timestamp_col = "timestamp"
 date_col = ""
 period_col = ""
-timestamp_format = "yyyy-mm-ddTHH:MM:SS"
+timestamp_format = "yyyy-mm-ddTHH:MM:SS"   # Julia Dates format, e.g. "yyyy-mm-dd HH:MM", "dd/mm/yyyy HH:MM"
+date_format = "yyyy-mm-dd"         # date column in date + period mode, e.g. "dd/mm/yyyy", "dd-u-yyyy" (01-Jan-2026)
+timestamp_is_period_end = false    # true: the timestamp column marks the END of each trading period
+missing_strings = ["", "NA", "N/A", "-"]   # cell values read as missing
+thousands_separator = ","          # removed from numbers stored as text ("1,234.50"); "" = none
+max_missing_share = 0.05           # error if more than this share of a realised price column is
+                                   # missing after loading (smaller gaps are forward-filled)
+# Pre-dispatch vintages. ASSUMPTION: each row holds ONE pre-dispatch value per product, issued
+# early enough to be known at every decision that uses it (leads <= forecast.pd_horizon_periods).
+# A file of "latest run" values would leak. If the file has several runs per period and an
+# issue-time column (map it as data.columns.pd_issue_time), the loader keeps for each period the
+# latest run issued by the decision time of its offer (pd_min_lead_periods before the period
+# ends; 0 = strategy.lead_periods), and the forecaster then uses pre-dispatch only up to that lead.
+pd_min_lead_periods = 0
 
 [data.columns]
 price_energy = "price_energy"
@@ -125,3 +143,4 @@ pd_regulation = "pd_regulation"
 pd_primary = "pd_primary"
 pd_contingency = "pd_contingency"
 pd_demand = "pd_demand"
+# pd_issue_time = "RUN_TIME"         # optional: issue time of each pre-dispatch run (see above)

@@ -48,6 +48,9 @@ function synthetic_market_data(; days::Int = 42, start::DateTime = DateTime(2026
     pri = max.(0, 3 .+ 4 .* tight .+ 1.5 .* randn(rng, n))
     con = max.(0, 10 .+ 30 .* tight .+ 6 .* randn(rng, n) .+ 0.2 .* spikes)
 
+    # One pre-dispatch value per row with noise that does not depend on lead time: a table
+    # cannot hold several vintages, so a backtest on this data cannot show how pre-dispatch
+    # accuracy decays with lead. Treat its pre-dispatch value as optimistic at long leads.
     noisy(x, s) = x .+ s .* randn(rng, n) .* (1 .+ abs.(x) ./ 400)
     demand = 5500 .+ 1200 .* (shape .- 150) ./ 100 .+ 100 .* randn(rng, n)
 

@@ -459,6 +459,209 @@ end
     @test sustain_violation_mwh(with_credit.net_mw, res, 10.0, cfg) <= 1e-6
 end
 
+@testset "config: unknown keys are errors, validate catches bad values" begin
+    mktempdir() do d
+        base = read(joinpath(@__DIR__, "..", "configs", "default.toml"), String)
+        tryload(txt) = (f = joinpath(d, "c.toml"); write(f, txt); try load_config(f); nothing catch e; sprint(showerror, e) end)
+        @test tryload(base) === nothing
+        @test occursin("lead_period", something(tryload(replace(base, "lead_periods = 3" => "lead_period = 1")), ""))
+        @test occursin("valid keys", something(tryload(replace(base, "soc_guard = \"quantile\"" => "soc_gaurd = \"worst_case\"")), ""))
+        @test occursin("stratgy", something(tryload(base * "\n[stratgy]\nlead_periods = 1\n"), ""))
+        @test occursin("reg_up", something(tryload(replace(base, "regulation_up = 0.10" => "reg_up = 0.30")), ""))
+        @test occursin("reserve_headrom", something(tryload(replace(base, "reserve_headroom = \"per_class\"" => "reserve_headrom = \"summed\"")), ""))
+        @test occursin("USEP_X", something(tryload(replace(base, "pd_demand = \"pd_demand\"" => "USEP_X = \"a\"")), ""))
+        @test occursin("horizon", something(tryload(replace(base, "horizon_periods = 96" => "horizon_periods = 2")), ""))
+        @test occursin("error_period_window", something(tryload(replace(base, "error_period_window = 2" => "error_period_window = -1")), ""))
+        @test occursin("soc_guard_buffer", something(tryload(replace(base, "soc_guard_buffer_mwh = 0.5" => "soc_guard_buffer_mwh = 50")), ""))
+        @test occursin("24", something(tryload(replace(base, "period_hours = 0.5" => "period_hours = 0.25")), ""))
+        @test occursin("lead_periods", something(tryload(replace(base, "lead_periods = 3" => "lead_periods = 0")), ""))
+        c = load_config(joinpath(@__DIR__, "..", "configs", "default.toml"))
+        write(joinpath(d, "c.toml"), replace(base, "regulation_up = 0.10" => "regulation_up = 0.30", "energy_flex_to_zero = true" => "energy_flex_to_zero = false"))
+        c2 = load_config(joinpath(d, "c.toml"))
+        @test c2.market.deploy_reg_up == 0.30 && c2.strategy.energy_flex_to_zero == false
+    end
+    # Every struct field is documented in default.toml, with the same default.
+    raw = B.TOML.parsefile(joinpath(@__DIR__, "..", "configs", "default.toml"))
+    for (sec, T) in (("battery", B.BatteryConfig), ("strategy", B.StrategyConfig), ("forecast", B.ForecastConfig),
+                     ("simulation", B.SimulationConfig), ("data", B.DataConfig))
+        for f in fieldnames(T)
+            f == :columns && continue
+            @test haskey(raw[sec], String(f))
+            haskey(raw[sec], String(f)) && @test raw[sec][String(f)] == getfield(T(), f)
+        end
+    end
+    dm = B.MarketConfig()
+    for f in fieldnames(B.MarketConfig)
+        f in (:deploy_reg_up, :deploy_reg_down, :deploy_primary, :deploy_contingency,
+              :sustain_regulation, :sustain_primary, :sustain_contingency, :reserve_cap_mw) && continue
+        @test raw["market"][String(f)] == getfield(dm, f)
+    end
+    @test cfg.market.deploy_reg_up == dm.deploy_reg_up && cfg.market.sustain_primary == dm.sustain_primary
+end
+
+@testset "loader: formats, split files, duplicates, gaps" begin
+    n = 192
+    src = df[1:n, :]
+    mk(; kw...) = (dc = B.DataConfig(; columns = Dict("price_energy" => "USEP", "price_regulation" => "REG",
+                       "price_primary" => "PRI", "price_contingency" => "CON"), kw...);
+                   B.Config(cfg.battery, cfg.market, cfg.strategy, cfg.forecast, cfg.simulation, dc))
+    prices(rows) = DataFrame(USEP = src.price_energy[rows], REG = src.price_regulation[rows],
+                             PRI = src.price_primary[rows], CON = src.price_contingency[rows])
+    err(f) = try f(); "" catch e; sprint(showerror, e) end
+    mktempdir() do d
+        w(name, t) = (p = joinpath(d, name); B.CSV.write(p, t); p)
+        # dd/mm/yyyy and 01-Jan-2026 dates with a period column
+        t = hcat(DataFrame(DATE = Dates.format.(Date.(src.timestamp), "dd/mm/yyyy"), PERIOD = src.period), prices(1:n))
+        c = mk(date_col = "DATE", period_col = "PERIOD", date_format = "dd/mm/yyyy")
+        @test load_market_data(w("ddmm.csv", t), c).timestamp == src.timestamp
+        t.DATE = Dates.format.(Date.(src.timestamp), "dd-u-yyyy")
+        @test load_market_data(w("ddmon.csv", t), mk(date_col = "DATE", period_col = "PERIOD", date_format = "dd-u-yyyy")).price_energy == src.price_energy
+        # period out of range names file, column and value
+        t.PERIOD[10] = 49
+        e = err(() -> load_market_data(w("p49.csv", t), mk(date_col = "DATE", period_col = "PERIOD", date_format = "dd-u-yyyy")))
+        @test occursin("p49.csv", e) && occursin("PERIOD", e) && occursin("49", e)
+        # "1,234.50", "NA" and "-" values; a space-separated custom timestamp
+        lines = ["time,USEP,REG,PRI,CON"]
+        for i in 1:n
+            u = i == 3 ? "\"1,234.50\"" : i == 4 ? "NA" : i == 5 ? "-" : string(src.price_energy[i])
+            push!(lines, join([Dates.format(src.timestamp[i], "yyyy-mm-dd HH:MM"), u, src.price_regulation[i],
+                               src.price_primary[i], src.price_contingency[i]], ","))
+        end
+        p = joinpath(d, "fmt.csv"); write(p, join(lines, "\n"))
+        l = load_market_data(p, mk(timestamp_col = "time", timestamp_format = "yyyy-mm-dd HH:MM"))
+        @test l.timestamp == src.timestamp && l.price_energy[3] == 1234.5
+        @test l.price_energy[4] == l.price_energy[5] == 1234.5            # NA and - forward-filled
+        @test l.price_energy[6] == src.price_energy[6]
+        lines[8] = replace(lines[8], r",[^,]+$" => ",abc")
+        write(p, join(lines, "\n"))
+        e = err(() -> load_market_data(p, mk(timestamp_col = "time", timestamp_format = "yyyy-mm-dd HH:MM")))
+        @test occursin("fmt.csv", e) && occursin("CON", e) && occursin("abc", e)
+        e = err(() -> load_market_data(p, mk(timestamp_col = "time")))
+        @test occursin("time", e) && occursin("yyyy-mm-ddTHH:MM:SS", e)
+        # period-end timestamps
+        t = hcat(DataFrame(ts = src.timestamp .+ Minute(30)), prices(1:n))
+        @test load_market_data(w("end.csv", t), mk(timestamp_col = "ts", timestamp_is_period_end = true)).period == src.period
+        # time-split directory: stacked, not forward-filled copies of the first file
+        sd = mkpath(joinpath(d, "split"))
+        for (k, r) in enumerate((1:96, 97:n))
+            B.CSV.write(joinpath(sd, "part$k.csv"), hcat(DataFrame(timestamp = src.timestamp[r]), prices(r)))
+        end
+        l = load_market_data(sd, mk())
+        @test nrow(l) == n && l.price_energy == src.price_energy && l.price_contingency == src.price_contingency
+        # product-split directory: joined on time
+        pd_ = mkpath(joinpath(d, "prod"))
+        B.CSV.write(joinpath(pd_, "a.csv"), DataFrame(timestamp = src.timestamp, USEP = src.price_energy, REG = src.price_regulation))
+        B.CSV.write(joinpath(pd_, "b.csv"), DataFrame(timestamp = src.timestamp, PRI = src.price_primary, CON = src.price_contingency))
+        l = load_market_data(pd_, mk())
+        @test nrow(l) == n && l.price_primary == src.price_primary && l.price_energy == src.price_energy
+        # duplicates: identical rows merge, conflicting ones are an error
+        t = hcat(DataFrame(timestamp = src.timestamp), prices(1:n))
+        @test load_market_data(w("dup.csv", vcat(t, t[10:12, :])), mk()).price_energy == src.price_energy
+        t2 = t[10:10, :]; t2.USEP .= 9999.0
+        e = err(() -> load_market_data(w("dupc.csv", vcat(t, t2)), mk()))
+        @test occursin("conflicting", e) && occursin(string(src.timestamp[10]), e)
+        # too much missing is an error; leading missing rows are dropped, not back-filled
+        t3 = copy(t); t3.REG[50:70] .= NaN
+        @test occursin("max_missing_share", err(() -> load_market_data(w("gap.csv", t3), mk())))
+        t4 = copy(t); t4.REG[1:5] .= NaN
+        l = load_market_data(w("lead.csv", t4), mk())
+        @test nrow(l) == n - 5 && l.timestamp[1] == src.timestamp[6] && l.price_regulation == src.price_regulation[6:n]
+    end
+end
+
+@testset "pre-dispatch vintages from an issue-time column" begin
+    # Two runs per period: an early one (issued 4 periods ahead) and a late one (just before).
+    n = 96
+    ts = df.timestamp[1:n]
+    step = Minute(30)
+    early = DataFrame(timestamp = ts, price_energy = df.price_energy[1:n], price_regulation = df.price_regulation[1:n],
+                      price_primary = df.price_primary[1:n], price_contingency = df.price_contingency[1:n],
+                      pd_energy = fill(111.0, n), run = ts .- 4step)
+    late = copy(early); late.pd_energy .= 999.0; late.run = ts
+    dc = B.DataConfig(columns = Dict("pd_issue_time" => "run"))
+    c = B.Config(cfg.battery, cfg.market, cfg.strategy, cfg.forecast, cfg.simulation, dc)
+    mktempdir() do d
+        p = joinpath(d, "long.csv"); B.CSV.write(p, vcat(early, late))
+        l = load_market_data(p, c)
+        @test nrow(l) == n && all(==(111.0), l.pd_energy)       # late run would leak: dropped
+        @test B.pd_horizon_at(B.extend_rows(l, 200, c), :energy, 60, c) == cfg.strategy.lead_periods
+        # Without the issue-time mapping the conflicting runs are an error, not a silent pick.
+        @test_throws ErrorException load_market_data(p, cfg)
+    end
+end
+
+@testset "forecast: pre-dispatch horizon available at the origin" begin
+    τ = 6 * 48 + 11
+    targets = (τ + 1):(τ + 98)
+    short = B.extend_rows(df[1:τ, :], τ + 98, cfg)       # table ends at the decision time
+    nopd = copy(df)
+    for p in PRODUCTS
+        nopd[!, B.PD_COLS[p]] .= NaN
+    end
+    @test B.pd_horizon_at(short, :energy, τ, cfg) == 0
+    @test B.pd_horizon_at(df, :energy, τ, cfg) == cfg.forecast.pd_horizon_periods
+    for m in ("ridge", "predispatch")
+        c = with_forecast(cfg; method = m)
+        f1 = forecast_prices(short, τ, targets, c)
+        f2 = forecast_prices(nopd, τ, targets, c)
+        for p in PRODUCTS
+            @test f1.mean[p] == f2.mean[p] && all(isfinite, f1.mean[p])
+            @test f1.residuals[p] == f2.residuals[p]
+        end
+    end
+    # Partial horizon: pd known for 10 periods ahead is used up to lead 10 only.
+    part = copy(df); part[(τ + 11):end, B.PD_COLS[:energy]] .= NaN
+    @test B.pd_horizon_at(part, :energy, τ, cfg) == 10
+    f = forecast_prices(part, τ, targets, with_forecast(cfg; method = "predispatch"))
+    @test f.mean[:energy][1:10] == df.pd_energy[(τ + 1):(τ + 10)]
+end
+
+@testset "generate_bids survives gaps and missing in the caller's history" begin
+    τ = 6 * 48 + 11
+    soc = 50.0
+    base = generate_bids(df[1:τ, :], τ, soc, cfg)
+    for (name, mod!) in (("NaN at origin", d -> (d.price_energy[τ] = NaN)),
+                         ("NaN in history", d -> (d.price_regulation[τ - 100] = NaN)),
+                         ("missing values", d -> (d.price_primary = allowmissing(d.price_primary); d.price_primary[τ - 3] = missing)),
+                         ("leading NaN", d -> (d.price_contingency[1:5] .= NaN)))
+        d = df[1:τ, :]
+        mod!(d)
+        bl = @test_logs (:warn, r"filling") match_mode = :any generate_bids(d, τ, soc, cfg)
+        @test length(bl) == 1 && isempty(validate_bids(bl[1], cfg))
+        @test all(isfinite, bl[1].offers[:energy].prices)
+    end
+    d = df[1:τ, :]; d.price_energy .= NaN
+    @test_throws ErrorException generate_bids(d, τ, soc, cfg)
+    # forecast_prices on a raw table: finite, and it does not modify the caller's table
+    d = df[1:τ + 98, :]; d.price_energy[τ] = NaN
+    f = forecast_prices(d, τ, (τ + 1):(τ + 98), cfg)
+    @test all(isfinite, f.mean[:energy]) && isnan(d.price_energy[τ])
+end
+
+@testset "SOC guard tails are never narrower than the pooled errors" begin
+    τ = 6 * 48 + 11
+    f = forecast_prices(df, τ, (τ + 1):(τ + 96), cfg)
+    for p in PRODUCTS, j in (1, 10, 40)
+        qs = [0.001, 0.2, 0.5, 0.8, 0.999]
+        cons = B.forecast_quantiles(f, p, j, qs; conservative = true)
+        cond = B.forecast_quantiles(f, p, j, qs)
+        pooled = f.mean[p][j] .+ B.quantile(f.residuals[p], qs)
+        @test all(cons[1:2] .<= min.(cond[1:2], pooled[1:2]) .+ 1e-12)
+        @test all(cons[4:5] .>= max.(cond[4:5], pooled[4:5]) .- 1e-12)
+    end
+end
+
+@testset "quantile guard: no sustain violation where conditional bands were too narrow" begin
+    # README data (make_synthetic.jl --days 21). With the guard on conditional bands, the
+    # energy prices of the two open periods before 2026-01-10T05:00 lay above their 99.9%
+    # conditional quantile, the SOC fell below the guarded interval and reserves were short.
+    d21 = synthetic_market_data(days = 21, seed = 1, cfg = cfg)
+    row = findfirst(==(DateTime(2026, 1, 10, 5)), d21.timestamp)
+    r = run_backtest(d21, cfg; start_row = row - 10, end_row = row + 2, progress = false)
+    sm = Dict(r.summary.metric .=> r.summary.value)
+    @test sm["sustain_violation_periods"] == 0 && sm["shortfall_mwh"] == 0
+end
+
 @testset "backtest" begin
     st = 7 * 48 + 1
     r = run_backtest(df, cfg; start_row = st, end_row = st + 47, progress = false)

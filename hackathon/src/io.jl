@@ -17,7 +17,8 @@ write_bids(path::AbstractString, bl::Vector{PeriodBids}, cfg::Config) =
 
 Entry point for running the algorithm inside an external simulator (e.g. EMA's).
 Uses only data in rows 1:origin_row (plus pre-dispatch for later rows within the
-pre-dispatch horizon) and the battery's SOC at the end of `origin_row`.
+pre-dispatch horizon) and the battery's SOC at the end of `origin_row`. The table may end
+at `origin_row`; gaps in its realised prices are filled with a warning (`sanitize_history`).
 
 - rolling mode: returns the offer for trading period origin_row + lead_periods.
   `pending` are offers already submitted for the periods in between.
@@ -25,6 +26,7 @@ pre-dispatch horizon) and the battery's SOC at the end of `origin_row`.
 """
 function generate_bids(df::DataFrame, origin_row::Int, soc_now::Float64, cfg::Config;
                        pending::Vector{PeriodBids} = PeriodBids[], rows = nothing)
+    df = sanitize_history(df, origin_row, cfg)   # NaN/missing history must not reach the forecaster
     need = origin_row + cfg.strategy.lead_periods + max(cfg.strategy.horizon_periods, cfg.market.periods_per_day) - 1
     df = extend_rows(df, need, cfg)
     if cfg.strategy.mode == "rolling"
@@ -56,5 +58,9 @@ function extend_rows(df::DataFrame, n::Int, cfg::Config)
         c in ("timestamp", "period") && continue
         add[!, c] = fill(NaN, extra)
     end
-    return vcat(df, add[!, names(df)])
+    out = vcat(df, add[!, names(df)])
+    for k in metadatakeys(df)        # e.g. pd_max_lead from the loader
+        metadata!(out, k, metadata(df, k); style = :note)
+    end
+    return out
 end

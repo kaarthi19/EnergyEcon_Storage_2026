@@ -96,13 +96,15 @@ end
     soc_quantile_bounds_after(pb, lo, hi, f, j, q, cfg) -> (lo, hi)
 
 SOC interval after an open offer. The offer is cleared at every combination of energy price
-in {1-q tail, mean, q tail} and reserve prices in {1-q tail, q tail} of the forecast; the
+in {1-q tail, mean, q tail} and reserve prices in {1-q tail, q tail} of the forecast (each
+tail the wider of the conditional and pooled error quantile); the
 interval spans the lowest SOC reached from `lo` and the highest reached from `hi`. The
 market can trade energy against regulation, so no single combination is always the extreme.
 """
 function soc_quantile_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, f::PriceForecast,
                                    j::Int, q::Float64, cfg::Config)
-    qq(p, x) = forecast_quantiles(f, p, j, [x])[1]
+    # Conservative tails: never narrower than the pooled residuals (see forecast_quantiles).
+    qq(p, x) = forecast_quantiles(f, p, j, [x]; conservative = true)[1]
     e_opts = (qq(:energy, 1 - q), f.mean[:energy][j], qq(:energy, q))
     r_opts = (1 - q, q)
     lo2, hi2 = Inf, -Inf

@@ -1,8 +1,9 @@
 # Price forecasting with a strict information set.
 #
 # At decision origin `τ` (row index) the algorithm may use realised prices in rows 1:τ and
-# pre-dispatch values for target rows t with t - τ <= pd_horizon_periods. Nothing after the
-# origin is read, so the forecaster respects EMA's data cut-off by construction.
+# pre-dispatch values for target rows t with t - τ <= the pre-dispatch horizon available at τ
+# (see `pd_horizon_at`). Nothing after the origin is read, so the forecaster respects EMA's
+# data cut-off by construction.
 
 """
 Training forecast errors with the trading period of day and the lead time (periods after
@@ -68,19 +69,25 @@ end
 _lead_bucket(h::Int) = something(findfirst(>=(h), LEAD_EDGES), length(LEAD_EDGES))
 
 """
+    forecast_quantiles(f, p, j, qs; conservative=false)
+
 Quantiles of the forecast distribution for product `p` at target position `j`. Uses the
-conditional error model when available, else the pooled residuals.
+conditional error model when available, else the pooled residuals. `conservative = true`
+takes on each side the wider of the conditional and the pooled quantile (lower tail for
+q <= 0.5, upper tail above): the SOC guard uses it, because a narrow conditional band in a
+quiet period must not let through offers whose clearing the pooled errors say is possible.
 """
-function forecast_quantiles(f::PriceForecast, p::Symbol, j::Int, qs::AbstractVector{<:Real})
+function forecast_quantiles(f::PriceForecast, p::Symbol, j::Int, qs::AbstractVector{<:Real};
+                            conservative::Bool = false)
     base = f.mean[p][j]
-    em = f.errors[p]
-    if em !== nothing
-        sc = em.period_scale[f.periods[j]] * em.lead_factor[_lead_bucket(f.leads[j])]
-        return base .+ sc .* quantile(em.z, qs)
-    end
     r = f.residuals[p]
-    isempty(r) && return fill(base, length(qs))
-    return base .+ quantile(r, qs)
+    pooled = isempty(r) ? fill(base, length(qs)) : base .+ quantile(r, qs)
+    em = f.errors[p]
+    em === nothing && return pooled
+    sc = em.period_scale[f.periods[j]] * em.lead_factor[_lead_bucket(f.leads[j])]
+    cond = base .+ sc .* quantile(em.z, qs)
+    conservative || return cond
+    return [q <= 0.5 ? min(c, pl) : max(c, pl) for (q, c, pl) in zip(qs, cond, pooled)]
 end
 
 # Most recent realised value for the same trading period of day, known at origin τ.
@@ -101,14 +108,34 @@ function _profile(price::Vector{Float64}, t::Int, τ::Int, ppd::Int, ndays::Int 
     return c == 0 ? _last_same_period(price, t, τ, ppd) : s / c
 end
 
-function _features(df::DataFrame, p::Symbol, t::Int, τ::Int, cfg::Config)
+"""
+    pd_horizon_at(df, p, τ, cfg) -> Int
+
+Pre-dispatch horizon available at origin `τ`: the lead of the last target row within
+`pd_horizon_periods` that has a pre-dispatch value (0 if none, e.g. when the table ends at
+the decision time). Training features, serving features and the residual model all use
+this one cut-off, so the model is never served a pre-dispatch pattern it was not trained on.
+"""
+function pd_horizon_at(df::DataFrame, p::Symbol, τ::Int, cfg::Config)
+    hasproperty(df, PD_COLS[p]) || return 0
+    H = cfg.forecast.pd_horizon_periods
+    # Pre-dispatch vintages from an issue-time column are only valid up to their minimum lead.
+    "pd_max_lead" in metadatakeys(df) && (H = min(H, metadata(df, "pd_max_lead")))
+    col = df[!, PD_COLS[p]]
+    for t in min(nrow(df), τ + H):-1:(τ + 1)
+        isnan(col[t]) || return t - τ
+    end
+    return 0
+end
+
+function _features(df::DataFrame, p::Symbol, t::Int, τ::Int, cfg::Config, hpd::Int)
     ppd = cfg.market.periods_per_day
     price = df[!, PRICE_COLS[p]]
     h = t - τ
     last_same = _last_same_period(price, t, τ, ppd)
     prof = _profile(price, t, τ, ppd)
     pdv, pd_ok = NaN, 0.0
-    if hasproperty(df, PD_COLS[p]) && h <= cfg.forecast.pd_horizon_periods
+    if h <= hpd
         pdv = df[t, PD_COLS[p]]
         pd_ok = isnan(pdv) ? 0.0 : 1.0
     end
@@ -125,13 +152,13 @@ function _seasonal_naive(df, p, targets, τ, cfg)
     [_last_same_period(price, t, τ, cfg.market.periods_per_day) for t in targets]
 end
 
-function _predispatch(df, p, targets, τ, cfg)
+function _predispatch(df, p, targets, τ, cfg, hpd::Int)
     sn = _seasonal_naive(df, p, targets, τ, cfg)
-    hasproperty(df, PD_COLS[p]) || return sn
+    hpd > 0 || return sn
     out = copy(sn)
     for (j, t) in enumerate(targets)
         v = df[t, PD_COLS[p]]
-        (t - τ <= cfg.forecast.pd_horizon_periods && !isnan(v)) && (out[j] = v)
+        (t - τ <= hpd && !isnan(v)) && (out[j] = v)
     end
     return out
 end
@@ -145,8 +172,10 @@ function _method_residuals(fn, df, p, τ, H, cfg)
     for o in lo:fc.origin_stride_periods:(τ - 1)
         tg = (o + 1):min(o + H, τ)
         isempty(tg) && continue
-        append!(res.r, price[tg] .- fn(df, p, tg, o, cfg))
-        append!(res.period, df.period[tg]); append!(res.lead, tg .- o)
+        r = price[tg] .- fn(df, p, tg, o, cfg)
+        ok = isfinite.(r)
+        append!(res.r, r[ok])
+        append!(res.period, df.period[tg][ok]); append!(res.lead, (tg .- o)[ok])
     end
     return res
 end
@@ -158,10 +187,14 @@ fc_min_origin(cfg::Config) = cfg.market.periods_per_day
     forecast_prices(df, τ, targets, cfg) -> PriceForecast
 
 Forecast all four prices for rows `targets` using information available at row `τ`.
+Gaps in realised prices up to `τ` are filled first (`sanitize_history`), and a forecast
+that is not finite falls back to seasonal naive with a warning.
 """
 function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::Config)
     τ >= fc_min_origin(cfg) || error("need at least one day of history before the first decision")
     first(targets) > τ || error("targets must lie after the decision origin")
+    last(targets) <= nrow(df) || error("targets beyond the end of the table (use extend_rows)")
+    df = sanitize_history(df, τ, cfg)
     H = length(targets) + (first(targets) - τ - 1)
     means = Dict{Symbol,Vector{Float64}}()
     resid = Dict{Symbol,Vector{Float64}}()
@@ -169,14 +202,21 @@ function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::C
     fc = cfg.forecast
     for p in PRODUCTS
         method = fc.method
+        hpd = pd_horizon_at(df, p, τ, cfg)
+        pdfn = (d, q, tg, o, c) -> _predispatch(d, q, tg, o, c, hpd)
         if method == "seasonal_naive"
             means[p] = _seasonal_naive(df, p, targets, τ, cfg)
             res = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
         elseif method == "predispatch"
-            means[p] = _predispatch(df, p, targets, τ, cfg)
-            res = _method_residuals(_predispatch, df, p, τ, H, cfg)
+            means[p] = pdfn(df, p, targets, τ, cfg)
+            res = _method_residuals(pdfn, df, p, τ, H, cfg)
         else
-            means[p], res = _ridge(df, p, τ, targets, H, cfg)
+            means[p], res = _ridge(df, p, τ, targets, H, cfg, hpd)
+        end
+        if !all(isfinite, means[p])
+            @warn "non-finite $p forecast at origin row $τ; using seasonal naive" maxlog = 10
+            means[p] = _seasonal_naive(df, p, targets, τ, cfg)
+            res = _method_residuals(_seasonal_naive, df, p, τ, H, cfg)
         end
         resid[p] = res.r
         errs[p] = fc.conditional_errors ?
@@ -189,7 +229,7 @@ function forecast_prices(df::DataFrame, τ::Int, targets::UnitRange{Int}, cfg::C
     return PriceForecast(targets, means, resid, errs, df.period[targets], collect(targets) .- τ)
 end
 
-function _ridge(df, p, τ, targets, H, cfg)
+function _ridge(df, p, τ, targets, H, cfg, hpd::Int)
     fc = cfg.forecast
     price = df[!, PRICE_COLS[p]]
     lo = max(fc_min_origin(cfg), τ - fc.train_days * cfg.market.periods_per_day)
@@ -198,7 +238,7 @@ function _ridge(df, p, τ, targets, H, cfg)
     pers, leads = Int[], Int[]
     for o in lo:fc.origin_stride_periods:(τ - 1)
         for t in (o + 1):min(o + H, τ)          # labels must be known at τ
-            push!(rows, _features(df, p, t, o, cfg)); push!(ys, price[t])
+            push!(rows, _features(df, p, t, o, cfg, hpd)); push!(ys, price[t])
             push!(pers, df.period[t]); push!(leads, t - o)
         end
     end
@@ -214,7 +254,7 @@ function _ridge(df, p, τ, targets, H, cfg)
     Λ = fc.ridge_alpha * Matrix{Float64}(I, size(Z, 2), size(Z, 2)); Λ[1, 1] = 0.0
     β = (Z' * Z + Λ) \ (Z' * ys)
     resid = ys .- Z * β
-    Xt = reduce(vcat, permutedims.([_features(df, p, t, τ, cfg) for t in targets]))
+    Xt = reduce(vcat, permutedims.([_features(df, p, t, τ, cfg, hpd) for t in targets]))
     pred = ((Xt .- μ') ./ σ') * β
     return pred, Residuals(resid, pers, leads)
 end
