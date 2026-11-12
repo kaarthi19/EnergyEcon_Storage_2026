@@ -14,6 +14,7 @@ module BESSBidding
 using CSV, DataFrames, Dates, HiGHS, JuMP, LinearAlgebra, Printf, Random, Statistics, TOML
 
 include("config.jl")
+include("rules.jl")
 include("data.jl")
 include("synthetic.jl")
 include("forecast.jl")
@@ -31,6 +32,7 @@ export Config, BatteryConfig, MarketConfig, StrategyConfig, ForecastConfig, Simu
        build_coopt, set_price!, solve!, coopt_schedule,
        Offer, PeriodBids, cleared_mw, max_mw, min_mw, offer_from_grid, guard_soc, validate_bids, offers_table,
        storage_pairs, from_storage_pairs, conform_storage_offer, raise_mw, raise_energy,
+       transfer_cap, raise_needs, lower_need, soc_change, sustain_violation_mwh, worst_case_needs,
        clear_period, settle_period,
        rolling_bids, day_ahead_bids, generate_bids,
        run_backtest, perfect_foresight, BacktestResult,

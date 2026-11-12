@@ -21,13 +21,16 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
     rng = MersenneTwister(cfg.simulation.seed)
     bids = Dict{Int,PeriodBids}()
     outcomes = Dict{Int,PeriodOutcome}()
+    fellback = Dict{Int,Bool}()          # clearing fell back to the energy base (malformed offer)
     soc = initial_soc(cfg.battery)
     t0 = time()
 
     settle!(t) = begin
         pb = get(bids, t, idle_bids(t, df.timestamp[t]))
         pr = realised_prices(df, t)
+        n0 = CLEAR_FALLBACKS[]
         net, res = clear_period(pb, pr, cfg)
+        fellback[t] = CLEAR_FALLBACKS[] > n0
         out = settle_period(net, res, soc, pr, cfg; rng = rng)
         outcomes[t] = out
         soc = out.soc_end
@@ -86,6 +89,7 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         sustain_violation = [outcomes[t].sustain_violation for t in rows],
         sustain_violation_mwh = [outcomes[t].sustain_violation_mwh for t in rows],
         throughput_mwh = [outcomes[t].throughput_mwh for t in rows],
+        clearing_fallback = [fellback[t] for t in rows],
     )
     bl = [bids[t] for t in rows if haskey(bids, t)]
     return BacktestResult(periods, bl, summarize(periods, df, rows, cfg))
@@ -121,12 +125,12 @@ function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg:
                   "revenue_contingency", "shortfall_penalty", "net_revenue_after_penalty",
                   "degradation_cost_internal", "equivalent_full_cycles", "cycles_per_day",
                   "shortfall_mwh", "sustain_violation_periods", "max_sustain_violation_mwh", "soc_min_seen_mwh", "soc_max_seen_mwh",
-                  "perfect_foresight_revenue", "capture_ratio"],
+                  "perfect_foresight_revenue", "capture_ratio", "clearing_fallback_periods"],
         value = [days, market_rev, tot(:rev_energy), tot(:rev_regulation), tot(:rev_primary),
                  tot(:rev_contingency), tot(:penalty), market_rev + tot(:penalty),
                  cfg.battery.degradation_cost * tot(:throughput_mwh), cycles, cycles / days,
                  tot(:shortfall_mwh), count(periods.sustain_violation), maximum(periods.sustain_violation_mwh),
                  minimum(periods.soc_end_mwh), maximum(periods.soc_end_mwh),
-                 pf, pf > 0 ? market_rev / pf : NaN],
+                 pf, pf > 0 ? market_rev / pf : NaN, count(periods.clearing_fallback)],
     )
 end

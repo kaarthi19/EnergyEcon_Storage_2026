@@ -25,24 +25,10 @@ struct PeriodSolution
     objective::Float64
 end
 
-"Expected change of SOC (MWh) per MW of reserve award over one period."
-function deployment_energy_coef(cfg::Config)
-    m, η, dt = cfg.market, eta_one_way(cfg.battery), cfg.market.period_hours
-    return Dict(
-        :regulation => dt * (η * m.deploy_reg_down - m.deploy_reg_up / η),
-        :primary => -dt * m.deploy_primary / η,
-        :contingency => -dt * m.deploy_contingency / η,
-    )
-end
-
-sustain_hours(m::MarketConfig, p::Symbol) =
-    p == :regulation ? m.sustain_regulation : p == :primary ? m.sustain_primary : m.sustain_contingency
-
-function _optimizer()
-    opt = optimizer_with_attributes(HiGHS.Optimizer, "output_flag" => false,
-                                    "mip_rel_gap" => 1e-4, "time_limit" => 60.0)
-    return opt
-end
+# One thread and a fixed seed so the same inputs always give the same offers.
+_highs(attrs::Pair...) = optimizer_with_attributes(HiGHS.Optimizer, "output_flag" => false,
+                                                   "threads" => 1, "random_seed" => 1234, attrs...)
+_optimizer() = _highs("mip_rel_gap" => 1e-4, "time_limit" => 60.0)
 
 """
     build_coopt(cfg, soc0, prices; reserves=true) -> CoOptModel
@@ -53,55 +39,57 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
                      reserves::Bool = true)
     b, m, s = cfg.battery, cfg.market, cfg.strategy
     H = length(prices[:energy])
-    η, dt, P = eta_one_way(b), m.period_hours, b.power_mw
+    η = eta_one_way(b)
+    Pc = transfer_cap(cfg)      # combined transfer limit (rating capped by offered capacity)
     Emin, Emax = soc_min(b), soc_max(b)
     soc0 = clamp(soc0, Emin, Emax)
     k = s.price_impact
     binary = s.use_binary && k == 0.0
 
     model = Model(_optimizer())
-    @variable(model, 0 <= c[1:H] <= P)
-    @variable(model, 0 <= d[1:H] <= P)
+    @variable(model, 0 <= c[1:H] <= Pc)
+    @variable(model, 0 <= d[1:H] <= Pc)
     @variable(model, Emin <= soc[1:H] <= Emax)
     r = Dict{Symbol,Vector{VariableRef}}()
     for p in RESERVES
         cap = reserves ? reserve_cap(m, b, p) : 0.0
         r[p] = @variable(model, [1:H], lower_bound = 0, upper_bound = cap, base_name = String(p))
     end
-    dep = deployment_energy_coef(cfg)
     prev(j) = j == 1 ? soc0 : soc[j-1]
 
     for j in 1:H
-        @constraint(model, soc[j] == prev(j) + dt * (η * c[j] - d[j] / η) +
-                                     sum(dep[p] * r[p][j] for p in RESERVES))
-        # Power headroom (RC383 D.17.2.4A, D.18.1.6/7): transfer + reserve + regulation <= P,
-        # per reserve class ("per_class") or with primary and contingency stacked ("summed");
-        # transfer - regulation >= -P.
+        reg, pri, con = r[:regulation][j], r[:primary][j], r[:contingency][j]
+        @constraint(model, soc[j] == prev(j) + soc_change(c[j], d[j], reg, pri, con, cfg))
+        # Power headroom (RC383 D.17.2.4A, D.18.1.6/7), the same joint capability the market
+        # clears against: transfer + reserve + regulation <= Pc, per reserve class
+        # ("per_class") or with primary and contingency stacked ("summed"); transfer -
+        # regulation >= -Pc.
         if m.reserve_headroom == "per_class"
-            @constraint(model, d[j] - c[j] + r[:regulation][j] + r[:primary][j] <= P)
-            @constraint(model, d[j] - c[j] + r[:regulation][j] + r[:contingency][j] <= P)
-            @constraint(model, d[j] - c[j] + r[:regulation][j] <= P)
+            @constraint(model, d[j] - c[j] + reg + pri <= Pc)
+            @constraint(model, d[j] - c[j] + reg + con <= Pc)
+            @constraint(model, d[j] - c[j] + reg <= Pc)
         else
-            @constraint(model, d[j] - c[j] + sum(r[p][j] for p in RESERVES) <= P)
+            @constraint(model, d[j] - c[j] + reg + pri + con <= Pc)
         end
-        @constraint(model, c[j] - d[j] + r[:regulation][j] <= P)
-        # Energy needed to sustain awarded raise reserves / regulation-lower (see raise_energy).
-        if m.reserve_headroom == "per_class"
-            zj = @variable(model, lower_bound = 0)
-            @constraint(model, zj >= r[:primary][j] * m.sustain_primary)
-            @constraint(model, zj >= r[:contingency][j] * m.sustain_contingency)
-            @constraint(model, prev(j) - (d[j] * dt + r[:regulation][j] * m.sustain_regulation + zj) / η >= Emin)
-        else
-            @constraint(model, prev(j) - (d[j] * dt + sum(r[p][j] * sustain_hours(m, p) for p in RESERVES)) / η >= Emin)
+        @constraint(model, c[j] - d[j] + reg <= Pc)
+        # Sustainability, the rule settle_period and guard_soc use (rules.jl): the transfer
+        # plus the raise awards must be deliverable above Emin, charging plus regulation-lower
+        # must fit below Emax. With sustain_charge_credit the transfer counts net (reserve
+        # backed by curtailing a planned charge, as settled); without it only the planned
+        # discharge (charge) counts on the raise (lower) side, because the energy offer can
+        # clear at any point of its curve and the guard then cuts reserve that relied on it.
+        credit = s.sustain_charge_credit
+        for need in raise_needs(credit ? d[j] - c[j] : 1.0 * d[j], reg, pri, con, m)
+            @constraint(model, prev(j) - need / η >= Emin)
         end
-        @constraint(model, prev(j) + η * (c[j] * dt + r[:regulation][j] * sustain_hours(m, :regulation)) <= Emax)
+        @constraint(model, prev(j) + η * lower_need(credit ? d[j] - c[j] : -1.0 * c[j], reg, m) <= Emax)
     end
     if binary
         @variable(model, u[1:H], Bin)
-        @constraint(model, [j in 1:H], c[j] <= P * u[j])
-        @constraint(model, [j in 1:H], d[j] <= P * (1 - u[j]))
+        @constraint(model, [j in 1:H], c[j] <= Pc * u[j])
+        @constraint(model, [j in 1:H], d[j] <= Pc * (1 - u[j]))
     else
-        @constraint(model, [j in 1:H], c[j] + d[j] <= P)
+        @constraint(model, [j in 1:H], c[j] + d[j] <= Pc)
     end
 
     target = s.terminal_soc_frac * b.energy_mwh
@@ -113,6 +101,7 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
         tv = max(0.0, median(prices[:energy])) * η
     end
 
+    dt = m.period_hours
     obj = @expression(model, sum(dt * (prices[:energy][j] * (d[j] - c[j]) - b.degradation_cost * (c[j] + d[j]))
                                   for j in 1:H) +
                              sum(dt * prices[p][j] * r[p][j] for p in RESERVES for j in 1:H) +
@@ -139,15 +128,44 @@ function set_price!(cm::CoOptModel, p::Symbol, j::Int, λ::Float64)
     return cm
 end
 
-function solve!(cm::CoOptModel; j::Int = 1)
+function _optimize_checked!(cm::CoOptModel)
     optimize!(cm.model)
     st = termination_status(cm.model)
-    if !(st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) || (st == MOI.TIME_LIMIT && has_values(cm.model)))
+    if st == MOI.TIME_LIMIT && has_values(cm.model)
+        @warn "co-optimisation stopped at the time limit; using the best solution found" maxlog = 5
+    elseif !(st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED))
         error("co-optimisation failed: $st")
     end
-    ch, dis = value(cm.c[j]), value(cm.d[j])
-    return PeriodSolution(dis - ch, ch, dis, Dict(p => value(cm.r[p][j]) for p in RESERVES),
-                          objective_value(cm.model))
+    return cm
+end
+
+_period_solution(cm::CoOptModel, j::Int) =
+    (ch = value(cm.c[j]); dis = value(cm.d[j]);
+     PeriodSolution(dis - ch, ch, dis, Dict(p => value(cm.r[p][j]) for p in RESERVES), objective_value(cm.model)))
+
+"""
+    solve!(cm; j=1) -> PeriodSolution
+
+Solve and return the solution for window position `j`. Without the binary the LP can charge
+and discharge at once (it burns energy at strongly negative prices), which a net-MW offer
+cannot do. If that happens in period `j`, re-solve with charge and with discharge fixed to
+0 in turn and keep the better one: exactly the MILP's branch for that period, at the cost of
+two LPs and only when it occurs.
+"""
+function solve!(cm::CoOptModel; j::Int = 1)
+    _optimize_checked!(cm)
+    sol = _period_solution(cm, j)
+    min(sol.charge_mw, sol.discharge_mw) <= 1e-6 && return sol
+    best = nothing
+    for v in (cm.c[j], cm.d[j])
+        ub = upper_bound(v)
+        set_upper_bound(v, 0.0)
+        _optimize_checked!(cm)
+        s2 = _period_solution(cm, j)
+        set_upper_bound(v, ub)
+        (best === nothing || s2.objective > best.objective) && (best = s2)
+    end
+    return best
 end
 
 "Full schedule of the current solution (for diagnostics and perfect-foresight benchmarks)."

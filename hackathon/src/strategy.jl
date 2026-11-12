@@ -69,30 +69,27 @@ function bids_from_model!(cm::CoOptModel, f::PriceForecast, j_model::Int, j_fc::
     # SOC interval those periods must cover, which costs reserve capability.
     flex = s.energy_flex_mw
     if flex > 0
-        P = cfg.battery.power_mw
+        Pc = transfer_cap(cfg)
         x0 = planned[:energy]
         # With energy_flex_to_zero the offer can always back off to 0 MW (stop charging in a
         # price spike, stop discharging in a price crash), priced at its opportunity cost.
         lo = s.energy_flex_to_zero ? min(x0, 0.0) - flex : x0 - flex
         hi = s.energy_flex_to_zero ? max(x0, 0.0) + flex : x0 + flex
-        offers[:energy] = clip_offer(offers[:energy], max(-P, lo), min(P, hi))
+        offers[:energy] = clip_offer(offers[:energy], max(-Pc, lo), min(Pc, hi))
     end
     return PeriodBids(row, ts, offers, planned)
 end
 
-"Worst-case SOC interval after a period with the given offers, starting from [lo, hi]."
+"""
+Worst-case SOC interval after a period with the given offers, starting from [lo, hi]: the
+lowest and highest end SOC under expected deployment over every outcome the market can
+clear from the offers (exact, see `worst_case_needs`).
+"""
 function soc_bounds_after(pb::PeriodBids, lo::Float64, hi::Float64, cfg::Config)
-    b, m = cfg.battery, cfg.market
-    η, dt, P = eta_one_way(b), m.period_hours, b.power_mw
-    dep = deployment_energy_coef(cfg)
-    rmax = Dict(p => max_mw(pb.offers[p]) for p in RESERVES)
-    up_mw = min(P, max(max_mw(pb.offers[:energy]), 0.0) + raise_mw(rmax, m))
-    dn_mw = min(P, max(-min_mw(pb.offers[:energy]), 0.0) + max_mw(pb.offers[:regulation]))
-    worst_dep_dn = sum(min(0.0, dep[p]) * max_mw(pb.offers[p]) for p in RESERVES)
-    worst_dep_up = sum(max(0.0, dep[p]) * max_mw(pb.offers[p]) for p in RESERVES)
-    lo2 = lo - dt * up_mw / η + min(0.0, worst_dep_dn)
-    hi2 = hi + η * dt * dn_mw + worst_dep_up
-    return clamp(lo2, soc_min(b), soc_max(b)), clamp(hi2, soc_min(b), soc_max(b))
+    b = cfg.battery
+    e = pb.offers[:energy]
+    w = worst_case_needs(min_mw(e), max_mw(e), Tuple(max_mw(pb.offers[p]) for p in RESERVES), cfg)
+    return clamp(lo - w.drain, soc_min(b), soc_max(b)), clamp(hi + w.fill, soc_min(b), soc_max(b))
 end
 
 """

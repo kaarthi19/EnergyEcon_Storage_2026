@@ -39,15 +39,9 @@ Base.@kwdef struct MarketConfig
     sustain_primary::Float64 = 0.5
     sustain_contingency::Float64 = 0.5
     reserve_cap_mw::Dict{Symbol,Float64} = Dict(:regulation => 0.0, :primary => 0.0, :contingency => 0.0)
+    facility_id::String = "BESS1"            # §5.2B.2.1 identity of the energy storage facility
+    offer_type::String = "variation"         # §5.2B.2.2 "standing" offer or offer "variation"
 end
-
-"""
-Effective MW cap for a reserve product. 0 in the config means the battery power rating.
-RC383 §3.2.1 allows ESS reserve capability up to twice the rating when charging (subject to
-PSO-approved standing capability data), so caps up to 2P are accepted.
-"""
-reserve_cap(m::MarketConfig, b::BatteryConfig, p::Symbol) =
-    (c = get(m.reserve_cap_mw, p, 0.0); c > 0 ? min(c, 2 * b.power_mw) : b.power_mw)
 
 Base.@kwdef struct StrategyConfig
     mode::String = "rolling"
@@ -65,6 +59,7 @@ Base.@kwdef struct StrategyConfig
     soc_guard_buffer_mwh::Float64 = 0.5
     energy_flex_mw::Float64 = 0.0      # max MW the energy offer may deviate from plan (0 = off)
     energy_flex_to_zero::Bool = true   # the capped offer can always back off to 0 MW
+    sustain_charge_credit::Bool = false # plan's sustainability credits planned charging (net transfer)
 end
 
 Base.@kwdef struct ForecastConfig
@@ -148,6 +143,8 @@ function load_config(path::AbstractString)
         sustain_primary = Float64(_get(sus, "primary", 0.5)),
         sustain_contingency = Float64(_get(sus, "contingency", 0.5)),
         reserve_cap_mw = Dict(Symbol(k) => Float64(v) for (k, v) in caps),
+        facility_id = String(_get(m, "facility_id", "BESS1")),
+        offer_type = String(_get(m, "offer_type", "variation")),
     )
     strategy = _fill(StrategyConfig, _get(raw, "strategy", Dict()))
     forecast = _fill(ForecastConfig, _get(raw, "forecast", Dict()))
@@ -175,6 +172,12 @@ function validate(c::Config)
     s.energy_flex_mw >= 0 || error("energy_flex_mw must be >= 0")
     0.5 <= s.soc_guard_quantile < 1 || error("soc_guard_quantile must be in [0.5, 1)")
     m.reserve_headroom in ("per_class", "summed") || error("reserve_headroom must be per_class or summed")
+    m.offered_capacity_mw >= 0 || error("offered_capacity_mw must be >= 0 (0 = power rating)")
+    all(>=(0), (m.deploy_reg_up, m.deploy_reg_down, m.deploy_primary, m.deploy_contingency)) ||
+        error("deployment fractions must be >= 0")
+    all(>=(0), (m.sustain_regulation, m.sustain_primary, m.sustain_contingency)) || error("sustain hours must be >= 0")
+    m.offer_type in ("standing", "variation") || error("market.offer_type must be standing or variation")
+    !isempty(m.facility_id) || error("market.facility_id must not be empty")
     1 <= m.max_charge_pairs <= 5 && 1 <= m.max_discharge_pairs <= 5 || error("RC383 allows at most 5 charging and 5 discharging pairs")
     s.horizon_periods >= 1 || error("horizon_periods must be >= 1")
     s.lead_periods >= 1 || error("lead_periods must be >= 1")

@@ -26,9 +26,12 @@ max_reserve_tranches = 5    # ASSUMPTION: reserve/regulation offer format is not
 # each reserve offer separately ("per_class": primary and contingency share headroom).
 # "summed" stacks primary and contingency (conservative).
 reserve_headroom = "per_class"
-offered_capacity_mw = 0.0   # §5.2B.2.5 maximum combined transfer limit (0 = power rating)
+offered_capacity_mw = 0.0   # §5.2B.2.5 maximum combined transfer limit (0 = power rating). The
+                            # plan, the SOC guard, validation and clearing all use min(rating, this).
 ramp_up_mw_per_min = 100.0  # §5.2B.2.6 ASSUMPTION: BESS can ramp full range within a minute
 ramp_down_mw_per_min = 100.0
+facility_id = "BESS1"       # §5.2B.2.1 identity of the energy storage facility, written to bids.csv. ASSUMPTION
+offer_type = "variation"    # §5.2B.2.2 "standing" offer or offer "variation", written to bids.csv
 
 # Expected energy deployed per MW of reserve award per hour (MWh/MW/h). ASSUMPTION.
 # Regulation is modelled as a symmetric raise/lower product.
@@ -44,8 +47,9 @@ regulation = 0.5
 primary = 0.5
 contingency = 0.5
 
-# Optional per-product MW caps on reserve offers (0 = use battery power rating). RC383 §3.2.1
-# lets ESS offer up to 2x rating when charging if PSO standing capability data allows it.
+# Optional per-product MW caps on reserve offers (0 = the transfer limit, i.e. the power rating
+# unless offered_capacity_mw is lower). RC383 §3.2.1 lets ESS offer up to 2x rating when
+# charging if PSO standing capability data allows it.
 [market.reserve_cap_mw]
 regulation = 0.0
 primary = 0.0
@@ -80,6 +84,11 @@ soc_guard_buffer_mwh = 0.5  # offers keep this many MWh away from the 5% / 95% S
 # response in offers that are still open at gate closure widens the SOC interval later
 # periods must cover; limiting it keeps reserve capability.
 energy_flex_mw = 0.0
+# Plan's sustainability constraints. true: count the net transfer, as settlement does (reserve
+# backed by curtailing a planned charge). false: count only planned discharge (raise side) and
+# planned charge (lower side); the offer curve may not clear the planned charge, and the SOC
+# guard then cuts the reserve that relied on it (true: -10% revenue in a 3-day default backtest).
+sustain_charge_credit = false
 
 [forecast]
 method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"
