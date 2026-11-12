@@ -32,6 +32,10 @@ ramp_up_mw_per_min = 100.0  # §5.2B.2.6 ASSUMPTION: BESS can ramp full range wi
 ramp_down_mw_per_min = 100.0
 facility_id = "BESS1"       # §5.2B.2.1 identity of the energy storage facility, written to bids.csv. ASSUMPTION
 offer_type = "variation"    # §5.2B.2.2 "standing" offer or offer "variation", written to bids.csv
+# Pay the energy delivered (or taken) when reserves are deployed at the energy price, in
+# settlement and in the plan's objective alike. ASSUMPTION: false until EMA says how its
+# simulator settles deployment energy.
+pay_deployment_energy = false
 
 # Expected energy deployed per MW of reserve award per hour (MWh/MW/h). ASSUMPTION.
 # Regulation is modelled as a symmetric raise/lower product.
@@ -90,6 +94,12 @@ energy_flex_to_zero = true  # with energy_flex_mw > 0: the capped offer can stil
 # planned charge (lower side); the offer curve may not clear the planned charge, and the SOC
 # guard then cuts the reserve that relied on it (true: -10% revenue in a 3-day default backtest).
 sustain_charge_credit = false
+# Realised prices known at the decision origin. 0: the price of the origin period itself is
+# known (the default assumes the price and SOC of t-3 are known at the gate closure of t).
+# k > 0: the forecast uses realised prices only up to origin - k (e.g. 1 if the price of the
+# period still running at gate closure is published after it ends); the SOC at the origin
+# and the open offers are used as before.
+info_lag_periods = 0
 
 [forecast]
 method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"
@@ -105,7 +115,8 @@ error_period_window = 2
 
 [simulation]
 shortfall_penalty = 4500.0  # $/MWh of energy the battery could not deliver within SOC limits
-stochastic_deployment = false
+stochastic_deployment = false  # true: each deployment fraction (regulation up and down separately,
+                               # primary, contingency) drawn uniformly in [0, 2 x expected] per period
 seed = 7
 
 # Canonical name -> column name in EMA's files. Edit when the dataset is released.

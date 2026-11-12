@@ -11,12 +11,20 @@ default_start_row(cfg::Config) = max(fc_min_origin(cfg), 7 * cfg.market.periods_
 
 """
     run_backtest(df, cfg; start_row, end_row, progress=true) -> BacktestResult
+
+Rolling mode bids each period at its gate closure τ = t - lead_periods, after τ has settled,
+with the offers for τ+1 .. t-1 still open; day_ahead mode bids each trading day at the gate
+closure of its first period, the same way. The summary reports `net_market_revenue` (as
+settled), `compliance_adjusted_revenue` (reserve payment withheld for awards the SOC could
+not sustain, shortfall penalty applied), the same plus the value of the SOC change, and the
+perfect-foresight benchmarks (`perfect_foresight`).
 """
 function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start_row(cfg),
                       end_row::Int = nrow(df), progress::Bool = true)
     s = cfg.strategy
     L = s.lead_periods
-    start_row - L >= fc_min_origin(cfg) || error("start_row too early: need one day of history plus lead time")
+    start_row - L - s.info_lag_periods >= fc_min_origin(cfg) ||
+        error("start_row too early: need one day of history plus lead time (and info_lag_periods)")
     end_row <= nrow(df) || error("end_row beyond data")
     rng = MersenneTwister(cfg.simulation.seed)
     bids = Dict{Int,PeriodBids}()
@@ -54,18 +62,18 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         day_starts = [r for r in start_row:end_row if df.period[r] == 1]
         isempty(day_starts) || first(day_starts) == start_row ||
             @warn "day_ahead mode: periods before the first day boundary are left idle"
-        t = start_row
-        while t <= end_row
-            if df.period[t] == 1
-                rows = t:min(end_row, t + ppd - 1)
-                # SOC known at the origin is the SOC after the last settled period.
-                for pb in day_ahead_bids(df, t - L, soc, rows, cfg)
-                    bids[pb.row] = pb
-                end
-                progress && @info "bidding day" date = Date(df.timestamp[t]) soc = round(soc; digits = 1)
+        # A day's offers are built at its gate closure τ = day start - L, with the SOC known
+        # then; the previous day's offers for τ+1 .. day start - 1 are still open.
+        for τ in (start_row - L):end_row
+            τ >= start_row && settle!(τ)
+            t = τ + L
+            (start_row <= t <= end_row && df.period[t] == 1) || continue
+            rows = t:min(end_row, t + ppd - 1)
+            pending = [get(bids, k, idle_bids(k, df.timestamp[k])) for k in (τ + 1):(t - 1)]
+            for pb in day_ahead_bids(df, τ, soc, pending, rows, cfg)
+                bids[pb.row] = pb
             end
-            settle!(t)
-            t += 1
+            progress && @info "bidding day" date = Date(df.timestamp[t]) soc = round(soc; digits = 1)
         end
     end
 
@@ -88,6 +96,7 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         shortfall_mwh = [outcomes[t].shortfall_mwh for t in rows],
         sustain_violation = [outcomes[t].sustain_violation for t in rows],
         sustain_violation_mwh = [outcomes[t].sustain_violation_mwh for t in rows],
+        reserve_withheld = [outcomes[t].reserve_withheld for t in rows],
         throughput_mwh = [outcomes[t].throughput_mwh for t in rows],
         clearing_fallback = [fellback[t] for t in rows],
     )
@@ -96,41 +105,78 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
 end
 
 """
-    perfect_foresight(df, rows, cfg) -> (revenue, schedule)
+    perfect_foresight(df, rows, cfg; end_soc_ge_start=false) -> (revenue, schedule)
 
-Upper bound: co-optimise the whole window with realised prices (LP, no binaries).
+Perfect-foresight benchmark: co-optimise the whole window with the realised prices (LP)
+from the initial SOC, with no degradation cost and the simulator's rules (joint capability,
+expected deployment, and the net-transfer sustainability rule `settle_period` checks, i.e.
+`sustain_charge_credit = true`); `revenue` is the market revenue of that schedule, as
+settled (deployment energy included when `market.pay_deployment_energy`).
+
+With the end SOC free (the default) this is an upper bound on `net_market_revenue` of any
+backtest over `rows` that has no sustain violation and no shortfall under expected
+deployment: such a run's dispatch is a feasible point of this LP with the same revenue.
+(Stochastic deployment, violations or shortfalls take a run outside the LP, so the bound
+does not apply to them.) `end_soc_ge_start = true` adds SOC at the end >= the start SOC,
+the benchmark for a strategy that must not run the battery down.
 """
-function perfect_foresight(df::DataFrame, rows::UnitRange{Int}, cfg::Config)
-    c2 = with_strategy(cfg; use_binary = false, price_impact = 0.0, terminal_value_mode = "hard",
-                       terminal_soc_frac = cfg.battery.initial_soc_frac)
-    prices = Dict(p => df[rows, PRICE_COLS[p]] for p in PRODUCTS)
-    cm = build_coopt(c2, initial_soc(cfg.battery), prices)
-    optimize!(cm.model)
-    sch = coopt_schedule(cm)
-    dt = cfg.market.period_hours
-    rev = dt * (sum(prices[:energy] .* (sch.discharge_mw .- sch.charge_mw)) +
-                sum(prices[:regulation] .* sch.regulation_mw) + sum(prices[:primary] .* sch.primary_mw) +
-                sum(prices[:contingency] .* sch.contingency_mw))
-    return rev, sch
+function perfect_foresight(df::DataFrame, rows::UnitRange{Int}, cfg::Config; end_soc_ge_start::Bool = false)
+    b = cfg.battery
+    bat = BatteryConfig(power_mw = b.power_mw, energy_mwh = b.energy_mwh, soc_min_frac = b.soc_min_frac,
+                        soc_max_frac = b.soc_max_frac, round_trip_eff = b.round_trip_eff,
+                        initial_soc_frac = b.initial_soc_frac, degradation_cost = 0.0)
+    # "hard" with the target at the SOC floor leaves the end SOC free (and adds no terminal value)
+    st = with_strategy(cfg; use_binary = false, price_impact = 0.0, terminal_value_mode = "hard",
+                       terminal_soc_frac = end_soc_ge_start ? b.initial_soc_frac : b.soc_min_frac,
+                       sustain_charge_credit = true).strategy
+    c2 = Config(bat, cfg.market, st, cfg.forecast, cfg.simulation, cfg.data)
+    prices = Dict(p => Vector{Float64}(df[rows, PRICE_COLS[p]]) for p in PRODUCTS)
+    cm = build_coopt(c2, initial_soc(b), prices)
+    _optimize_checked!(cm)
+    # no degradation, no terminal value: the objective is the market revenue
+    return objective_value(cm.model), coopt_schedule(cm)
 end
 
 function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg::Config)
     tot(c) = sum(periods[!, c])
     market_rev = tot(:rev_energy) + tot(:rev_regulation) + tot(:rev_primary) + tot(:rev_contingency)
+    # Compliance-adjusted: no payment for reserve the SOC could not sustain, penalty applied.
+    adjusted = market_rev - tot(:reserve_withheld) + tot(:penalty)
+    # Value the SOC change over the window at the median realised energy price, net of
+    # discharge losses, so runs that end with different stored energy compare fairly.
+    soc0, soc1 = periods.soc_start_mwh[1], periods.soc_end_mwh[end]
+    soc_value = (soc1 - soc0) * max(0.0, median(periods.price_energy)) * eta_one_way(cfg.battery)
     pf, _ = perfect_foresight(df, rows, cfg)
+    pf_ge, _ = perfect_foresight(df, rows, cfg; end_soc_ge_start = true)
     cycles = tot(:throughput_mwh) / (2 * cfg.battery.energy_mwh)
     days = length(rows) / cfg.market.periods_per_day
-    DataFrame(
-        metric = ["days", "net_market_revenue", "revenue_energy", "revenue_regulation", "revenue_primary",
-                  "revenue_contingency", "shortfall_penalty", "net_revenue_after_penalty",
-                  "degradation_cost_internal", "equivalent_full_cycles", "cycles_per_day",
-                  "shortfall_mwh", "sustain_violation_periods", "max_sustain_violation_mwh", "soc_min_seen_mwh", "soc_max_seen_mwh",
-                  "perfect_foresight_revenue", "capture_ratio", "clearing_fallback_periods"],
-        value = [days, market_rev, tot(:rev_energy), tot(:rev_regulation), tot(:rev_primary),
-                 tot(:rev_contingency), tot(:penalty), market_rev + tot(:penalty),
-                 cfg.battery.degradation_cost * tot(:throughput_mwh), cycles, cycles / days,
-                 tot(:shortfall_mwh), count(periods.sustain_violation), maximum(periods.sustain_violation_mwh),
-                 minimum(periods.soc_end_mwh), maximum(periods.soc_end_mwh),
-                 pf, pf > 0 ? market_rev / pf : NaN, count(periods.clearing_fallback)],
-    )
+    m = [
+        "days" => days,
+        "net_market_revenue" => market_rev,
+        "revenue_energy" => tot(:rev_energy),
+        "revenue_regulation" => tot(:rev_regulation),
+        "revenue_primary" => tot(:rev_primary),
+        "revenue_contingency" => tot(:rev_contingency),
+        "shortfall_penalty" => tot(:penalty),
+        "net_revenue_after_penalty" => market_rev + tot(:penalty),
+        "reserve_payment_withheld" => tot(:reserve_withheld),
+        "compliance_adjusted_revenue" => adjusted,
+        "start_soc_mwh" => soc0,
+        "end_soc_mwh" => soc1,
+        "soc_change_value" => soc_value,
+        "compliance_adjusted_revenue_incl_soc_value" => adjusted + soc_value,
+        "degradation_cost_internal" => cfg.battery.degradation_cost * tot(:throughput_mwh),
+        "equivalent_full_cycles" => cycles,
+        "cycles_per_day" => cycles / days,
+        "shortfall_mwh" => tot(:shortfall_mwh),
+        "sustain_violation_periods" => count(periods.sustain_violation),
+        "max_sustain_violation_mwh" => maximum(periods.sustain_violation_mwh),
+        "clearing_fallback_periods" => count(periods.clearing_fallback),
+        "soc_min_seen_mwh" => minimum(periods.soc_end_mwh),
+        "soc_max_seen_mwh" => maximum(periods.soc_end_mwh),
+        "perfect_foresight_bound" => pf,
+        "perfect_foresight_end_soc_ge_start" => pf_ge,
+        "capture_ratio" => pf > 0 ? market_rev / pf : NaN,
+    ]
+    return DataFrame(metric = first.(m), value = Float64.(last.(m)))
 end

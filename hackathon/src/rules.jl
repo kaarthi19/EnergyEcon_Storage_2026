@@ -30,14 +30,31 @@ reserve_cap(m::MarketConfig, b::BatteryConfig, p::Symbol) =
 sustain_hours(m::MarketConfig, p::Symbol) =
     p == :regulation ? m.sustain_regulation : p == :primary ? m.sustain_primary : m.sustain_contingency
 
-"Expected change of SOC (MWh) per MW of reserve award over one period."
-function deployment_energy_coef(cfg::Config)
-    m, η, dt = cfg.market, eta_one_way(cfg.battery), cfg.market.period_hours
-    return Dict(
-        :regulation => dt * (η * m.deploy_reg_down - m.deploy_reg_up / η),
-        :primary => -dt * m.deploy_primary / η,
-        :contingency => -dt * m.deploy_contingency / η,
-    )
+"Deployment fractions (MWh/MW/h) of regulation up, regulation down, primary, contingency."
+deployment_fractions(m::MarketConfig) = (m.deploy_reg_up, m.deploy_reg_down, m.deploy_primary, m.deploy_contingency)
+
+"""
+    deployment_energy_coef(cfg[, fr]) -> Dict
+
+Change of SOC (MWh) per MW of reserve award over one period when the reserves are deployed
+at fractions `fr` = (reg up, reg down, primary, contingency); default the expected ones.
+"""
+function deployment_energy_coef(cfg::Config, fr = deployment_fractions(cfg.market))
+    η, dt = eta_one_way(cfg.battery), cfg.market.period_hours
+    up, dn, pri, con = fr
+    return Dict(:regulation => dt * (η * dn - up / η), :primary => -dt * pri / η, :contingency => -dt * con / η)
+end
+
+"""
+    deployment_grid_mwh(reg, pri, con, cfg[, fr])
+
+Energy (MWh) delivered to the grid (negative: taken from it) over one period by deploying
+the reserve awards at fractions `fr` (default: expected). Paid at the energy price when
+`market.pay_deployment_energy` is on, in settlement and in the plan alike. Linear.
+"""
+function deployment_grid_mwh(reg, pri, con, cfg::Config, fr = deployment_fractions(cfg.market))
+    up, dn, fp, fc = fr
+    return cfg.market.period_hours * ((up - dn) * reg + fp * pri + fc * con)
 end
 
 """
@@ -78,11 +95,12 @@ raise_energy(d::AbstractDict, m::MarketConfig) = raise_energy(d[:regulation], d[
     soc_change(ch, dis, reg, pri, con, cfg)
 
 SOC change (MWh) over one period with charge `ch` and discharge `dis` MW and the given
-reserve awards deployed at their expected rates. Linear, so it also takes JuMP expressions.
+reserve awards deployed at fractions `fr` (default: the expected rates). Linear, so it also
+takes JuMP expressions.
 """
-function soc_change(ch, dis, reg, pri, con, cfg::Config)
+function soc_change(ch, dis, reg, pri, con, cfg::Config, fr = deployment_fractions(cfg.market))
     η, dt = eta_one_way(cfg.battery), cfg.market.period_hours
-    dep = deployment_energy_coef(cfg)
+    dep = deployment_energy_coef(cfg, fr)
     return dt * (η * ch - dis / η) + dep[:regulation] * reg + dep[:primary] * pri + dep[:contingency] * con
 end
 
@@ -93,12 +111,47 @@ How far the awards at the start of a period exceed what the SOC can sustain: rai
 must be deliverable above the minimum SOC, regulation-lower plus charging absorbable below
 the maximum. 0 when compliant.
 """
-function sustain_violation_mwh(net, res::AbstractDict, soc, cfg::Config)
+sustain_violation_mwh(net, res::AbstractDict, soc, cfg::Config) =
+    max(0.0, sustain_violation_sides(net, res[:regulation], res[:primary], res[:contingency], soc, cfg)...)
+
+"""
+    sustain_violation_sides(net, reg, pri, con, soc, cfg) -> (raise, lower)
+
+The two parts of `sustain_violation_mwh`: MWh by which the raise needs go below the minimum
+SOC, and by which charging plus regulation-lower go above the maximum (each >= 0).
+"""
+function sustain_violation_sides(net, reg, pri, con, soc, cfg::Config)
     b, m = cfg.battery, cfg.market
     η = eta_one_way(b)
-    need_up = max(0.0, maximum(raise_needs(net, res[:regulation], res[:primary], res[:contingency], m))) / η
-    need_dn = η * max(0.0, lower_need(net, res[:regulation], m))
-    return max(0.0, soc_min(b) - (soc - need_up), (soc + need_dn) - soc_max(b))
+    need_up = max(0.0, maximum(raise_needs(net, reg, pri, con, m))) / η
+    need_dn = η * max(0.0, lower_need(net, reg, m))
+    return max(0.0, soc_min(b) - (soc - need_up)), max(0.0, (soc + need_dn) - soc_max(b))
+end
+
+"""
+    sustainable_share(net, res, soc, cfg) -> (raise, lower)
+
+Largest shares s_up, s_dn in [0, 1] of the awards that the SOC could sustain under
+`sustain_violation_sides`: scaling every raise award (regulation, primary, contingency) by
+s_up clears the raise-side violation, scaling regulation by s_dn the lower-side one, with the
+energy transfer as awarded. Used to withhold payment for reserve that could not be backed.
+"""
+function sustainable_share(net, res::AbstractDict, soc, cfg::Config)
+    r, p, c = res[:regulation], res[:primary], res[:contingency]
+    up(s) = sustain_violation_sides(net, s * r, s * p, s * c, soc, cfg)[1]
+    dn(s) = sustain_violation_sides(net, s * r, 0.0, 0.0, soc, cfg)[2]
+    # each side's violation is non-decreasing in s, so bisect for the largest compliant share
+    function largest(f)
+        f(1.0) <= 1e-6 && return 1.0
+        f(0.0) > 1e-6 && return 0.0
+        a, z = 0.0, 1.0
+        for _ in 1:50
+            mid = 0.5 * (a + z)
+            f(mid) <= 1e-6 ? (a = mid) : (z = mid)
+        end
+        return a
+    end
+    return largest(up), largest(dn)
 end
 
 # ---------------------------------------------------------------------------------------

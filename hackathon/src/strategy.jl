@@ -130,31 +130,89 @@ function _window_prices(f::PriceForecast, from::Int, n::Int)
 end
 
 """
+    forecast_at(df, τ, last_row, cfg) -> (f, τf)
+
+Price forecast for rows τf+1 .. last_row made at decision origin τ. The forecast origin is
+τf = τ - `strategy.info_lag_periods`: realised prices are used only up to τf (row r of the
+table is position r - τf of `f`). The SOC at τ and the open offers are not affected.
+"""
+function forecast_at(df::DataFrame, τ::Int, last_row::Int, cfg::Config)
+    τf = τ - cfg.strategy.info_lag_periods
+    return forecast_prices(df, τf, (τf + 1):last_row, cfg), τf
+end
+
+"""
+    any_offer_bids(row, ts, cfg) -> PeriodBids
+
+Stand-in for an open offer that is not known: energy over the whole transfer range and every
+reserve at its cap, so `soc_bounds_after` gives the widest SOC interval any offer could reach.
+"""
+function any_offer_bids(row::Int, ts::DateTime, cfg::Config)
+    Pc = transfer_cap(cfg)
+    o = Dict{Symbol,Offer}(:energy => Offer(:energy, -Pc, [0.0], [2 * Pc]))
+    for p in RESERVES
+        o[p] = Offer(p, reserve_cap(cfg.market, cfg.battery, p), Float64[], Float64[])
+    end
+    return PeriodBids(row, ts, o)
+end
+
+"""
+    soc_after_open_offers(pending, τ, soc_now, f, τf, cfg) -> (soc_exp, lo, hi)
+
+SOC at the start of the first period after the open offers `pending` (rows τ+1, τ+2, ...;
+oldest first), from the SOC `soc_now` known at the end of τ: the expected value (offers
+cleared at the mean forecast) and the interval [lo, hi] the SOC guard must cover
+(`strategy.soc_guard`). An entry `nothing` is an open offer that is not known; it is covered
+by the worst case over every offer the battery could have submitted (`any_offer_bids`).
+Rolling and day-ahead bidding both start from this.
+"""
+function soc_after_open_offers(pending::AbstractVector, τ::Int, soc_now::Float64, f::PriceForecast,
+                               τf::Int, cfg::Config)
+    s, b = cfg.strategy, cfg.battery
+    soc_exp, lo, hi = soc_now, soc_now, soc_now
+    unknown = false
+    for (i, pb) in enumerate(pending)
+        k = τ + i                       # row of this open offer
+        j = k - τf                      # its position in the forecast
+        if pb === nothing
+            unknown = true
+            lo, hi = soc_bounds_after(any_offer_bids(k, DateTime(0), cfg), lo, hi, cfg)
+            soc_exp = clamp(soc_exp, lo, hi)
+            continue
+        end
+        pb.row == k || error("open offer for row $(pb.row) given where row $k was expected")
+        pr = Dict(p => f.mean[p][j] for p in PRODUCTS)
+        soc_exp = soc_expected_after(pb, soc_exp, pr, cfg)
+        lo, hi = s.soc_guard == "quantile" ?
+            soc_quantile_bounds_after(pb, lo, hi, f, j, s.soc_guard_quantile, cfg) :
+            soc_bounds_after(pb, lo, hi, cfg)
+    end
+    # an unknown open offer keeps its worst case: never narrow it to the expected path
+    if s.soc_guard == "expected" && !isempty(pending) && !unknown
+        lo = max(soc_min(b), soc_exp - s.soc_margin_mwh)
+        hi = min(soc_max(b), soc_exp + s.soc_margin_mwh)
+    end
+    return soc_exp, lo, hi
+end
+
+"""
     rolling_bids(df, τ, soc_now, pending, cfg) -> PeriodBids
 
 Rolling mode. At decision origin `τ` (end of period τ, SOC `soc_now` known) produce the
-offer for trading period t = τ + lead. `pending` holds already-submitted offers for
-periods τ+1 .. t-1 (oldest first).
+offer for trading period t = τ + lead. `pending` holds the already-submitted offers for
+periods τ+1 .. t-1 (oldest first, exactly lead - 1 of them); an entry `nothing` stands for
+an offer that is open but not known, covered by its worst case.
 """
-function rolling_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::Vector{PeriodBids}, cfg::Config)
+function rolling_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::AbstractVector, cfg::Config)
     s = cfg.strategy
     t = τ + s.lead_periods
+    length(pending) == t - τ - 1 ||
+        error("rolling_bids needs the $(t - τ - 1) open offers for rows $(τ + 1):$(t - 1), got $(length(pending))")
     last_row = min(nrow(df), t + s.horizon_periods - 1)
-    f = forecast_prices(df, τ, (τ + 1):last_row, cfg)
+    f, τf = forecast_at(df, τ, last_row, cfg)
     # Propagate SOC through offers already in the market.
-    soc_exp, lo, hi = soc_now, soc_now, soc_now
-    for (i, pb) in enumerate(pending)
-        pr = Dict(p => f.mean[p][i] for p in PRODUCTS)
-        soc_exp = soc_expected_after(pb, soc_exp, pr, cfg)
-        lo, hi = s.soc_guard == "quantile" ?
-            soc_quantile_bounds_after(pb, lo, hi, f, i, s.soc_guard_quantile, cfg) :
-            soc_bounds_after(pb, lo, hi, cfg)
-    end
-    if s.soc_guard == "expected" && !isempty(pending)
-        lo = max(soc_min(cfg.battery), soc_exp - s.soc_margin_mwh)
-        hi = min(soc_max(cfg.battery), soc_exp + s.soc_margin_mwh)
-    end
-    j0 = t - τ
+    soc_exp, lo, hi = soc_after_open_offers(pending, τ, soc_now, f, τf, cfg)
+    j0 = t - τf
     n = last_row - t + 1
     cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n))
     pb = bids_from_model!(cm, f, 1, j0, t, df.timestamp[t], cfg)
@@ -162,25 +220,32 @@ function rolling_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::Vector{
 end
 
 """
-    day_ahead_bids(df, τ, soc_now, rows, cfg) -> Vector{PeriodBids}
+    day_ahead_bids(df, τ, soc_now, pending, rows, cfg) -> Vector{PeriodBids}
 
-Day-ahead mode: at origin τ, produce offers for every row in `rows` (e.g. the next trading
-day) from one forecast, with SOC bounds propagated worst-case through the day. This is
-more conservative than rolling mode because later periods must stay feasible for every
-clearing outcome of earlier ones.
+Day-ahead mode: at origin τ (SOC `soc_now` known at the end of τ), produce offers for every
+row in `rows` (e.g. the next trading day) from one forecast. `pending` holds the offers
+still open for rows τ+1 .. first(rows)-1 (the previous day's last periods; `nothing` = not
+known), and the SOC interval is propagated through them as in `rolling_bids`, then through
+every offer of the day. This is more conservative than rolling mode because later periods
+must stay feasible for every clearing outcome of earlier ones.
+
+Not competitive under the default quantile guard: the propagated interval only widens, so
+on synthetic data it reaches about [5.5, 94.5] MWh by period ~37 and the guard trims the
+last ~12 periods of every day to empty offers (a 2-day window made ~25% of the rolling
+mode's revenue). It is kept for EMA's day-ahead submission format.
 """
-function day_ahead_bids(df::DataFrame, τ::Int, soc_now::Float64, rows::UnitRange{Int}, cfg::Config)
+function day_ahead_bids(df::DataFrame, τ::Int, soc_now::Float64, pending::AbstractVector,
+                        rows::UnitRange{Int}, cfg::Config)
     s = cfg.strategy
+    length(pending) == first(rows) - τ - 1 ||
+        error("day_ahead_bids needs the $(first(rows) - τ - 1) open offers for rows $(τ + 1):$(first(rows) - 1), got $(length(pending))")
     last_row = min(nrow(df), max(last(rows), first(rows) + s.horizon_periods - 1))
-    f = forecast_prices(df, τ, (τ + 1):last_row, cfg)
-    j0 = first(rows) - τ
+    f, τf = forecast_at(df, τ, last_row, cfg)
+    j0 = first(rows) - τf
     n = last_row - first(rows) + 1
-    # Expected SOC at the start of the first bid period (periods between τ and rows have no
-    # offers in this mode, so the battery idles there).
-    cm = build_coopt(cfg, soc_now, _window_prices(f, j0, n))
+    soc_exp, lo, hi = soc_after_open_offers(pending, τ, soc_now, f, τf, cfg)
+    cm = build_coopt(cfg, soc_exp, _window_prices(f, j0, n))
     out = PeriodBids[]
-    lo, hi = soc_now, soc_now
-    soc_exp = soc_now
     margin = s.soc_margin_mwh
     for (k, t) in enumerate(rows)
         pb = bids_from_model!(cm, f, k, j0 + k - 1, t, df.timestamp[t], cfg)
@@ -191,8 +256,10 @@ function day_ahead_bids(df::DataFrame, τ::Int, soc_now::Float64, rows::UnitRang
             pb = guard_soc(pb, lo, hi, cfg)
             lo, hi = soc_quantile_bounds_after(pb, lo, hi, f, j0 + k - 1, s.soc_guard_quantile, cfg)
         else
-            pb = guard_soc(pb, max(soc_min(cfg.battery), soc_exp - margin),
-                           min(soc_max(cfg.battery), soc_exp + margin), cfg)
+            # the first period also keeps the worst case of unknown open offers
+            plo, phi = max(soc_min(cfg.battery), soc_exp - margin), min(soc_max(cfg.battery), soc_exp + margin)
+            k == 1 && ((plo, phi) = (min(plo, lo), max(phi, hi)))
+            pb = guard_soc(pb, plo, phi, cfg)
             pr = Dict(p => f.mean[p][j0 + k - 1] for p in PRODUCTS)
             soc_exp = soc_expected_after(pb, soc_exp, pr, cfg)
         end

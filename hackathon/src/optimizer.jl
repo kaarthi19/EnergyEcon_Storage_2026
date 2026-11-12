@@ -104,7 +104,7 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
     dt = m.period_hours
     obj = @expression(model, sum(dt * (prices[:energy][j] * (d[j] - c[j]) - b.degradation_cost * (c[j] + d[j]))
                                   for j in 1:H) +
-                             sum(dt * prices[p][j] * r[p][j] for p in RESERVES for j in 1:H) +
+                             sum(_reserve_coef(cfg, prices, p, j) * r[p][j] for p in RESERVES for j in 1:H) +
                              tv * (soc[H] - target))
     if k > 0
         @objective(model, Max, obj - sum(dt * k * (d[j] - c[j])^2 for j in 1:H))
@@ -112,6 +112,21 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
         @objective(model, Max, obj)
     end
     return CoOptModel(model, H, c, d, r, soc, deepcopy(prices), cfg)
+end
+
+"""
+Objective coefficient (\$ per MW) of reserve `p` in window position `j`: the reserve price,
+plus the energy its expected deployment delivers at the energy price when
+`market.pay_deployment_energy` is on (the same term settle_period pays).
+"""
+function _reserve_coef(cfg::Config, prices, p::Symbol, j::Int)
+    coef = cfg.market.period_hours * prices[p][j]
+    if cfg.market.pay_deployment_energy
+        g = deployment_grid_mwh(p == :regulation ? 1.0 : 0.0, p == :primary ? 1.0 : 0.0,
+                                p == :contingency ? 1.0 : 0.0, cfg)
+        coef += prices[:energy][j] * g
+    end
+    return coef
 end
 
 "Change the price of product `p` in window position `j` (updates objective coefficients)."
@@ -122,8 +137,13 @@ function set_price!(cm::CoOptModel, p::Symbol, j::Int, λ::Float64)
     if p == :energy
         set_objective_coefficient(cm.model, cm.d[j], dt * (λ - deg))
         set_objective_coefficient(cm.model, cm.c[j], dt * (-λ - deg))
+        if cm.cfg.market.pay_deployment_energy   # deployment energy is paid at this price
+            for q in RESERVES
+                set_objective_coefficient(cm.model, cm.r[q][j], _reserve_coef(cm.cfg, cm.prices, q, j))
+            end
+        end
     else
-        set_objective_coefficient(cm.model, cm.r[p][j], dt * λ)
+        set_objective_coefficient(cm.model, cm.r[p][j], _reserve_coef(cm.cfg, cm.prices, p, j))
     end
     return cm
 end

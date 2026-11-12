@@ -662,6 +662,197 @@ end
     @test sm["sustain_violation_periods"] == 0 && sm["shortfall_mwh"] == 0
 end
 
+@testset "settlement: delivered energy, withheld reserve, deployment energy" begin
+    z = Dict(p => 0.0 for p in RESERVES)
+    prs(e; reg = 0.0, pri = 0.0, con = 0.0) = Dict(:energy => e, :regulation => reg, :primary => pri, :contingency => con)
+    # discharge 100 MW from near Emin at the cap: only the delivered MWh is paid
+    o = settle_period(100.0, z, 10.0, prs(4500.0), cfg)
+    @test o.shortfall_mwh > 40
+    @test o.revenue[:energy] ≈ 4500 * (50 - o.shortfall_mwh)
+    @test o.revenue[:energy] + o.revenue[:penalty] < 0
+    # charging at the floor: payment only for the MWh absorbed
+    o = settle_period(-100.0, z, 90.0, prs(-4500.0), cfg)
+    @test o.shortfall_mwh > 40 && o.revenue[:energy] ≈ -4500 * -(50 - o.shortfall_mwh)
+    # no clamp: unchanged settlement
+    @test settle_period(40.0, z, 50.0, prs(100.0), cfg).revenue[:energy] ≈ 100 * 40 * 0.5
+    # an award the SOC cannot sustain: the unsustainable share of its payment is withheld
+    r = Dict(:regulation => 0.0, :primary => 100.0, :contingency => 0.0)
+    o = settle_period(0.0, r, 20.0, prs(100.0; pri = 10.0), cfg)
+    @test o.sustain_violation && o.revenue[:primary] ≈ 500
+    s_up, s_dn = B.sustainable_share(0.0, r, 20.0, cfg)
+    @test o.reserve_withheld ≈ (1 - s_up) * 500 && 0 < s_up < 1 && s_dn == 1
+    @test sustain_violation_mwh(0.0, Dict(:regulation => 0.0, :primary => 100s_up, :contingency => 0.0), 20.0, cfg) <= 1e-6
+    @test sustain_violation_mwh(0.0, Dict(:regulation => 0.0, :primary => 100s_up + 1, :contingency => 0.0), 20.0, cfg) > 0
+    @test settle_period(0.0, r, 80.0, prs(100.0; pri = 10.0), cfg).reserve_withheld == 0
+    # regulation-lower that cannot be absorbed withholds regulation only
+    o = settle_period(-90.0, Dict(:regulation => 50.0, :primary => 0.0, :contingency => 0.0), 80.0, prs(0.0; reg = 10.0), cfg)
+    @test o.sustain_violation && 0 < o.reserve_withheld <= o.revenue[:regulation]
+    # deployment energy: unpaid by default, paid at the energy price with the flag
+    r = Dict(:regulation => 0.0, :primary => 100.0, :contingency => 0.0)
+    @test settle_period(0.0, r, 50.0, prs(150.0; pri = 3.0), cfg).revenue[:energy] == 0
+    cpay = mkcfg(cfg; market = mkmarket(cfg.market; pay_deployment_energy = true))
+    o = settle_period(0.0, r, 50.0, prs(150.0; pri = 3.0), cpay)
+    @test o.revenue[:energy] ≈ 150 * 0.5 * cfg.market.deploy_primary * 100
+    @test o.soc_end ≈ settle_period(0.0, r, 50.0, prs(150.0; pri = 3.0), cfg).soc_end
+    # ... and the plan's objective carries the same term, also after a price sweep
+    pr = Dict(p => fill(p == :energy ? 150.0 : 3.0, 4) for p in PRODUCTS)
+    coef(cm, p, j) = B.JuMP.coefficient(B.objective_function(cm.model), cm.r[p][j])
+    g(p) = B.deployment_grid_mwh(p == :regulation ? 1.0 : 0.0, p == :primary ? 1.0 : 0.0, p == :contingency ? 1.0 : 0.0, cfg)
+    cm0, cm1 = build_coopt(cfg, 50.0, pr), build_coopt(cpay, 50.0, pr)
+    for p in RESERVES
+        @test coef(cm0, p, 2) ≈ 0.5 * 3.0
+        @test coef(cm1, p, 2) ≈ 0.5 * 3.0 + 150 * g(p)
+    end
+    set_price!(cm1, :energy, 2, 400.0); set_price!(cm1, :primary, 2, 7.0)
+    @test coef(cm1, :primary, 2) ≈ 0.5 * 7.0 + 400 * g(:primary)
+    @test coef(cm1, :contingency, 2) ≈ 0.5 * 3.0 + 400 * g(:contingency)
+    # stochastic deployment: regulation's net energy goes either way, mean preserved
+    cst = B.Config(cfg.battery, cfg.market, cfg.strategy, cfg.forecast,
+                   B.SimulationConfig(stochastic_deployment = true, seed = 1), cfg.data)
+    rr = Dict(:regulation => 100.0, :primary => 0.0, :contingency => 0.0)
+    rng = MersenneTwister(5)
+    d = [settle_period(0.0, rr, 50.0, prs(0.0), cst; rng = rng).soc_end - 50 for _ in 1:2000]
+    @test minimum(d) < -2 && maximum(d) > 2
+    @test abs(B.mean(d) - (settle_period(0.0, rr, 50.0, prs(0.0), cfg).soc_end - 50)) < 0.1
+end
+
+@testset "perfect-foresight benchmark" begin
+    rows = (7 * 48 + 1):(7 * 48 + 48)
+    pf, sch = perfect_foresight(df, rows, cfg)
+    pfge, schge = perfect_foresight(df, rows, cfg; end_soc_ge_start = true)
+    @test pfge <= pf + 1e-6 && schge.soc_mwh[end] >= 50 - 1e-6
+    # the reported number is the schedule's market revenue (no degradation, no terminal value)
+    pr(p) = df[rows, B.PRICE_COLS[p]]
+    rev = 0.5 * (sum(pr(:energy) .* (sch.discharge_mw .- sch.charge_mw)) + sum(pr(:regulation) .* sch.regulation_mw) +
+                 sum(pr(:primary) .* sch.primary_mw) + sum(pr(:contingency) .* sch.contingency_mw))
+    @test rev ≈ pf rtol = 1e-6
+    # never below the old benchmark (degradation cost, terminal SOC >= start, gross sustain rule)
+    old = with_strategy(cfg; terminal_value_mode = "hard", terminal_soc_frac = 0.5)
+    cm = build_coopt(old, 50.0, Dict(p => Vector{Float64}(pr(p)) for p in PRODUCTS)); B.optimize!(cm.model)
+    s0 = coopt_schedule(cm)
+    rev0 = 0.5 * (sum(pr(:energy) .* (s0.discharge_mw .- s0.charge_mw)) + sum(pr(:regulation) .* s0.regulation_mw) +
+                  sum(pr(:primary) .* s0.primary_mw) + sum(pr(:contingency) .* s0.contingency_mw))
+    @test pfge >= rev0 - 1e-6
+    # pay_deployment_energy is part of the benchmark's revenue
+    cpay = mkcfg(cfg; market = mkmarket(cfg.market; pay_deployment_energy = true))
+    @test perfect_foresight(df, rows, cpay)[1] >= pf - 1e-6
+end
+
+@testset "bids CSV round trip" begin
+    τ = 7 * 48 + 20
+    pend = [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):(τ + 2)]
+    bl = [rolling_bids(df, τ + i, 50.0, [B.idle_bids(k, df.timestamp[k]) for k in (τ + i + 1):(τ + i + 2)], cfg) for i in 0:1]
+    push!(bl, B.idle_bids(τ + 10, df.timestamp[τ + 10]))
+    mktempdir() do d
+        write_bids(joinpath(d, "a.csv"), bl[1:1], cfg)
+        write_bids(joinpath(d, "b.csv"), bl[2:3], cfg)
+        back = read_bids(d; df = df)
+        @test length(back) == 3
+        for (x, y) in zip(bl, back)
+            @test y.row == x.row && y.timestamp == x.timestamp
+            for p in PRODUCTS
+                @test y.offers[p].base_mw == x.offers[p].base_mw
+                @test y.offers[p].prices == x.offers[p].prices && y.offers[p].sizes == x.offers[p].sizes
+            end
+        end
+        # a later file replaces an earlier offer for the same period (offer variation)
+        write_bids(joinpath(d, "c.csv"), [B.PeriodBids(bl[1].row, bl[1].timestamp, B.idle_bids(0, bl[1].timestamp).offers)], cfg)
+        @test max_mw(read_bids(d)[1].offers[:regulation]) == 0
+        @test read_bids(joinpath(d, "a.csv"))[1].row == 0
+    end
+end
+
+@testset "generate_bids in a closed loop equals the backtest" begin
+    L = cfg.strategy.lead_periods
+    st, en = 7 * 48 + 30, 7 * 48 + 37
+    r = run_backtest(df, cfg; start_row = st, end_row = en, progress = false)
+    # External simulator: once per period, give generate_bids the history up to the origin
+    # (realised prices after it are unknown), the SOC, and every offer submitted so far.
+    soc = B.initial_soc(cfg.battery)
+    mine = Dict{Int,PeriodBids}()
+    mktempdir() do d
+        # the battery had no offers before the window (the backtest leaves those periods idle)
+        write_bids(joinpath(d, "before.csv"), [B.idle_bids(k, df.timestamp[k]) for k in (st - L + 1):(st - 1)], cfg)
+        for τ in (st - L):(en - L)
+            if τ >= st
+                pr = B.realised_prices(df, τ)
+                net, res = clear_period(mine[τ], pr, cfg)
+                soc = settle_period(net, res, soc, pr, cfg).soc_end
+            end
+            hist = copy(df)
+            for p in PRODUCTS; hist[(τ + 1):end, B.PRICE_COLS[p]] .= NaN; end
+            files = filter(f -> endswith(f, ".csv"), readdir(d; join = true))
+            bl = generate_bids(hist, τ, soc, cfg; pending = read_bids(files; df = df))
+            mine[τ + L] = bl[1]
+            write_bids(joinpath(d, "bids_$(τ + L).csv"), bl, cfg)
+        end
+    end
+    @test length(r.bids) == en - st + 1
+    for pb in r.bids
+        x = mine[pb.row]
+        for p in PRODUCTS
+            @test x.offers[p].base_mw == pb.offers[p].base_mw
+            @test x.offers[p].prices == pb.offers[p].prices && x.offers[p].sizes == pb.offers[p].sizes
+        end
+    end
+    # Without the open offers: the SOC interval covers the one from the known offers, and the
+    # offers keep the guard's guarantee for it (more conservative, never less safe).
+    τ = en - L
+    known = [r.bids[findfirst(b -> b.row == k, r.bids)] for k in (τ + 1):(τ + L - 1)]
+    soc_τ = r.periods.soc_end_mwh[τ - st + 1]
+    f, τf = B.forecast_at(df, τ, τ + 96, cfg)
+    _, lo_k, hi_k = B.soc_after_open_offers(known, τ, soc_τ, f, τf, cfg)
+    _, lo_u, hi_u = B.soc_after_open_offers(fill(nothing, L - 1), τ, soc_τ, f, τf, cfg)
+    @test lo_u <= lo_k && hi_u >= hi_k && hi_u - lo_u > hi_k - lo_k
+    blind = (@test_logs (:warn, r"no offer supplied") match_mode = :any generate_bids(df, τ, soc_τ, cfg))[1]
+    @test isempty(validate_bids(blind, cfg))
+    @test guarantee_holds(blind, lo_k, hi_k, cfg)
+    @test guarantee_holds(blind, lo_u + cfg.strategy.soc_guard_buffer_mwh, hi_u - cfg.strategy.soc_guard_buffer_mwh, cfg) ||
+          lo_u + 0.5 > hi_u - 0.5
+    # the low-level entry points refuse a wrong number of open offers
+    @test_throws ErrorException rolling_bids(df, τ, soc_τ, PeriodBids[], cfg)
+    @test_throws ErrorException rolling_bids(df, τ, soc_τ, reverse(known), cfg)
+end
+
+@testset "day_ahead: bids made at the true origin" begin
+    # cheap settings; "expected" guard so the last periods of a day carry real offers
+    c = with_strategy(cfg; mode = "day_ahead", soc_guard = "expected", horizon_periods = 48,
+                      energy_grid_quantiles = [0.1, 0.5, 0.9], reserve_grid_quantiles = [0.5])
+    L = c.strategy.lead_periods
+    st = 4 * 48 + 1; en = st + 48 + 1               # day 1 and the first 2 periods of day 2
+    d2 = copy(df)
+    for k in (st + 48 - L + 1):(st + 47)            # the open periods at day 2's gate closure
+        d2.price_energy[k] = -3000.0                # their charging offers now clear
+    end
+    r1 = run_backtest(df, c; start_row = st, end_row = en, progress = false)
+    r2 = run_backtest(d2, c; start_row = st, end_row = en, progress = false)
+    k = st + 47 - st + 1
+    @test r1.periods.soc_end_mwh[k] != r2.periods.soc_end_mwh[k]   # the spikes moved the SOC
+    b1 = filter(b -> b.row >= st + 48, r1.bids); b2 = filter(b -> b.row >= st + 48, r2.bids)
+    @test length(b1) == 2
+    for (x, y) in zip(b1, b2), p in PRODUCTS
+        @test x.offers[p].prices == y.offers[p].prices && x.offers[p].sizes == y.offers[p].sizes &&
+              x.offers[p].base_mw == y.offers[p].base_mw
+    end
+    # the same as calling day_ahead_bids at τ with the SOC then and the open offers
+    τ = st + 48 - L
+    pend = [r1.bids[findfirst(b -> b.row == j, r1.bids)] for j in (τ + 1):(st + 47)]
+    da = day_ahead_bids(df, τ, r1.periods.soc_end_mwh[τ - st + 1], pend, (st + 48):en, c)
+    @test all(da[i].offers[p].sizes == b1[i].offers[p].sizes for i in 1:2, p in PRODUCTS)
+end
+
+@testset "info_lag_periods: forecast ignores the origin's price" begin
+    τ = 7 * 48 + 20
+    pend = [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):(τ + 2)]
+    d2 = copy(df); d2.price_energy[τ] += 500; d2.price_regulation[τ] += 50
+    same(a, b) = all(a.offers[p].prices == b.offers[p].prices && a.offers[p].sizes == b.offers[p].sizes &&
+                     a.offers[p].base_mw == b.offers[p].base_mw for p in PRODUCTS)
+    c1 = with_strategy(cfg; info_lag_periods = 1)
+    @test same(rolling_bids(df, τ, 50.0, pend, c1), rolling_bids(d2, τ, 50.0, pend, c1))
+    @test !same(rolling_bids(df, τ, 50.0, pend, cfg), rolling_bids(d2, τ, 50.0, pend, cfg))
+    @test_throws ErrorException run_backtest(df, with_strategy(cfg; info_lag_periods = 5); start_row = 48 + 4, progress = false)
+end
+
 @testset "backtest" begin
     st = 7 * 48 + 1
     r = run_backtest(df, cfg; start_row = st, end_row = st + 47, progress = false)
@@ -670,7 +861,14 @@ end
     @test sm["sustain_violation_periods"] == 0
     @test sm["shortfall_mwh"] == 0
     @test sm["soc_min_seen_mwh"] >= 5 - 1e-6 && sm["soc_max_seen_mwh"] <= 95 + 1e-6
-    @test sm["net_market_revenue"] <= sm["perfect_foresight_revenue"] + 1e-6
+    # guaranteed: a compliant run under expected deployment is feasible for the benchmark LP
+    @test sm["net_market_revenue"] <= sm["perfect_foresight_bound"] + 1e-6
+    @test sm["perfect_foresight_end_soc_ge_start"] <= sm["perfect_foresight_bound"] + 1e-6
+    @test sm["reserve_payment_withheld"] == 0
+    @test sm["compliance_adjusted_revenue"] ≈ sm["net_market_revenue"]
+    @test sm["end_soc_mwh"] == r.periods.soc_end_mwh[end]
+    @test sm["compliance_adjusted_revenue_incl_soc_value"] ≈ sm["compliance_adjusted_revenue"] +
+        (sm["end_soc_mwh"] - 50) * B.median(r.periods.price_energy) * B.eta_one_way(cfg.battery)
     @test sm["net_market_revenue"] > 0
     @test all(isempty(validate_bids(pb, cfg)) for pb in r.bids)
     @test sm["clearing_fallback_periods"] == 0

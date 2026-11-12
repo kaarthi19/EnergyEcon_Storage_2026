@@ -36,6 +36,6 @@ export Config, BatteryConfig, MarketConfig, StrategyConfig, ForecastConfig, Simu
        clear_period, settle_period,
        rolling_bids, day_ahead_bids, generate_bids,
        run_backtest, perfect_foresight, BacktestResult,
-       write_backtest, write_bids
+       write_backtest, write_bids, read_bids
 
 end

@@ -13,11 +13,12 @@ struct PeriodOutcome
     reserve_mw::Dict{Symbol,Float64}
     soc_start::Float64
     soc_end::Float64
-    revenue::Dict{Symbol,Float64}   # $ by product
+    revenue::Dict{Symbol,Float64}   # $ by product (energy on delivered MWh) and :penalty
     shortfall_mwh::Float64
     sustain_violation::Bool
     sustain_violation_mwh::Float64   # how far awards exceeded the sustainable energy
     throughput_mwh::Float64
+    reserve_withheld::Float64        # $ of reserve payment for awards the SOC could not sustain
 end
 
 "Running count of clearings that fell back to the energy base (`run_backtest` reports the periods)."
@@ -73,41 +74,61 @@ end
 """
     settle_period(net_mw, reserves, soc, prices, cfg; rng) -> PeriodOutcome
 
-Apply awards physically: move SOC, deploy reserves (expected or random), clamp at SOC
-limits and record any shortfall and sustainability breach.
+Apply awards physically: move SOC, deploy reserves (expected, or random with
+`simulation.stochastic_deployment` and an `rng`), clamp at SOC limits and record any
+shortfall and sustainability breach.
+
+Settlement: energy is paid on the delivered quantity (scheduled MWh minus what the SOC
+clamp kept from being delivered or absorbed), reserves on the award; the shortfall penalty
+comes on top. With `market.pay_deployment_energy` the energy delivered by deploying
+reserves is paid at the energy price as well. `reserve_withheld` is the reserve payment
+for the share of the awards the start SOC could not sustain (`sustainable_share`); it is
+reported, not deducted from `revenue` (the backtest's compliance-adjusted revenue does).
 """
 function settle_period(net::Float64, res::Dict{Symbol,Float64}, soc::Float64,
                        prices::Dict{Symbol,Float64}, cfg::Config; rng = nothing)
     b, m, sim = cfg.battery, cfg.market, cfg.simulation
     η, dt = eta_one_way(b), m.period_hours
     Emin, Emax = soc_min(b), soc_max(b)
+    reg, pri, con = res[:regulation], res[:primary], res[:contingency]
 
     # Sustainability check of awards at the start of the period (compliance metric), the
     # rule the guard and the optimiser use (rules.jl).
     viol_mwh = sustain_violation_mwh(net, res, soc, cfg)
     viol = viol_mwh > 1e-6
 
-    ch, dis = max(-net, 0.0), max(net, 0.0)
-    transfer = soc_change(ch, dis, 0.0, 0.0, 0.0, cfg)
-    deploy = soc_change(0.0, 0.0, res[:regulation], res[:primary], res[:contingency], cfg)
+    fr = deployment_fractions(m)
     if sim.stochastic_deployment && rng !== nothing
-        deploy *= 2 * rand(rng)   # mean-preserving random deployment
+        # Mean-preserving random deployment. Regulation raise and lower are drawn separately,
+        # so the net regulation energy of a period can go either way.
+        fr = map(f -> f * 2 * rand(rng), fr)
     end
-    soc_new = soc + transfer + deploy
+    ch, dis = max(-net, 0.0), max(net, 0.0)
+    soc_new = soc + soc_change(ch, dis, reg, pri, con, cfg, fr)
     shortfall = 0.0
+    undelivered = 0.0                        # of the scheduled energy transfer (MWh, grid side)
     if soc_new < Emin
         shortfall = (Emin - soc_new) * η     # MWh the grid did not receive
+        undelivered = min(shortfall, dis * dt)
         soc_new = Emin
     elseif soc_new > Emax
         shortfall = (soc_new - Emax) / η     # MWh the battery could not absorb
+        undelivered = -min(shortfall, ch * dt)
         soc_new = Emax
     end
-    rev = Dict{Symbol,Float64}(:energy => prices[:energy] * net * dt)
+    λ = prices[:energy]
+    rev = Dict{Symbol,Float64}(:energy => λ * (net * dt - undelivered))
+    m.pay_deployment_energy && (rev[:energy] += λ * deployment_grid_mwh(reg, pri, con, cfg, fr))
     for p in RESERVES
         rev[p] = prices[p] * res[p] * dt
     end
     rev[:penalty] = -sim.shortfall_penalty * shortfall
-    return PeriodOutcome(net, res, soc, soc_new, rev, shortfall, viol, viol_mwh, (ch + dis) * dt)
+    withheld = 0.0
+    if viol
+        s_up, s_dn = sustainable_share(net, res, soc, cfg)
+        withheld = (1 - min(s_up, s_dn)) * rev[:regulation] + (1 - s_up) * (rev[:primary] + rev[:contingency])
+    end
+    return PeriodOutcome(net, res, soc, soc_new, rev, shortfall, viol, viol_mwh, (ch + dis) * dt, withheld)
 end
 
 realised_prices(df::DataFrame, t::Int) = Dict(p => df[t, PRICE_COLS[p]] for p in PRODUCTS)

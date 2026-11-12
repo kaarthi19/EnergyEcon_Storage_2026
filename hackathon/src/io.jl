@@ -13,6 +13,52 @@ write_bids(path::AbstractString, bl::Vector{PeriodBids}, cfg::Config) =
     CSV.write(path, offers_table(bl, cfg))
 
 """
+    read_bids(paths; df=nothing) -> Vector{PeriodBids}
+
+Read offers back from bids CSV files written by `write_bids` / `write_backtest` (one file,
+several files, or a directory whose *.csv files are all read). Energy rows are RC383 pairs
+(`from_storage_pairs`), reserve rows are the base (slot 0) and tranches; a product without
+rows is an empty offer. With `df`, each offer's `row` is the row of its timestamp in `df`
+(0 when the timestamp is not in the table); without it, `row` is 0. The planned quantities
+are not in the file and read as 0. Sorted by timestamp; a timestamp that appears in several
+files takes the offer from the file read last (paths in the order given, a directory's
+files in name order), as an offer variation replaces the earlier offer.
+"""
+function read_bids(paths; df::Union{DataFrame,Nothing} = nothing)
+    files = String[]
+    for p in (paths isa AbstractString ? [paths] : paths)
+        isdir(p) ? append!(files, sort(filter(f -> endswith(lowercase(f), ".csv"), readdir(p; join = true)))) :
+                   push!(files, p)
+    end
+    isempty(files) && error("no bids CSV files in $(repr(paths))")
+    byts = Dict{DateTime,PeriodBids}()
+    for f in files
+        tab = CSV.read(f, DataFrame; types = Dict(:timestamp => String, :product => String))
+        for c in ("timestamp", "product", "slot", "price", "quantity_mw")
+            c in names(tab) || error("$f is not a bids file: no $c column")
+        end
+        ts = DateTime.(tab.timestamp)
+        for t in unique(ts)
+            sub = tab[ts .== t, :]
+            o = Dict{Symbol,Offer}()
+            e = sub[sub.product .== "energy", :]
+            o[:energy] = nrow(e) == 0 ? Offer(:energy, 0.0, Float64[], Float64[]) :
+                from_storage_pairs([(slot = Int(r.slot), price = Float64(r.price), mw = Float64(r.quantity_mw))
+                                    for r in eachrow(e)])
+            for p in RESERVES
+                r = sort(sub[sub.product .== String(p), :], :slot)
+                base = sum(Float64.(r.quantity_mw[r.slot .== 0]); init = 0.0)
+                tr = r[r.slot .> 0, :]
+                o[p] = Offer(p, base, Float64.(tr.price), Float64.(tr.quantity_mw))
+            end
+            row = df === nothing ? 0 : something(findfirst(==(t), df.timestamp), 0)
+            byts[t] = PeriodBids(row, t, o)
+        end
+    end
+    return [byts[t] for t in sort(collect(keys(byts)))]
+end
+
+"""
     generate_bids(df, origin_row, soc_now, cfg; pending=PeriodBids[], rows=nothing) -> Vector{PeriodBids}
 
 Entry point for running the algorithm inside an external simulator (e.g. EMA's).
@@ -20,26 +66,50 @@ Uses only data in rows 1:origin_row (plus pre-dispatch for later rows within the
 pre-dispatch horizon) and the battery's SOC at the end of `origin_row`. The table may end
 at `origin_row`; gaps in its realised prices are filled with a warning (`sanitize_history`).
 
+`pending` are the offers already submitted (e.g. from `read_bids`), matched by timestamp to
+the periods between the origin and the first bid period; others are ignored. Those offers
+are still open at the decision time, so the SOC at the start of the bid period is uncertain.
+A period whose offer is not supplied is covered by the worst case over every offer the
+battery could have made (more conservative bids, never less safe), with a warning.
+
 - rolling mode: returns the offer for trading period origin_row + lead_periods.
-  `pending` are offers already submitted for the periods in between.
 - day_ahead mode: returns offers for `rows` (default: the next full trading day).
 """
 function generate_bids(df::DataFrame, origin_row::Int, soc_now::Float64, cfg::Config;
-                       pending::Vector{PeriodBids} = PeriodBids[], rows = nothing)
+                       pending::AbstractVector = PeriodBids[], rows = nothing)
     df = sanitize_history(df, origin_row, cfg)   # NaN/missing history must not reach the forecaster
     need = origin_row + cfg.strategy.lead_periods + max(cfg.strategy.horizon_periods, cfg.market.periods_per_day) - 1
     df = extend_rows(df, need, cfg)
     if cfg.strategy.mode == "rolling"
-        return [rolling_bids(df, origin_row, soc_now, pending, cfg)]
-    end
-    if rows === nothing
-        t = origin_row + cfg.strategy.lead_periods
-        while t <= nrow(df) && df.period[t] != 1
-            t += 1
+        first_bid = origin_row + cfg.strategy.lead_periods
+    else
+        if rows === nothing
+            t = origin_row + cfg.strategy.lead_periods
+            while t <= nrow(df) && df.period[t] != 1
+                t += 1
+            end
+            rows = t:min(nrow(df), t + cfg.market.periods_per_day - 1)
         end
-        rows = t:min(nrow(df), t + cfg.market.periods_per_day - 1)
+        first_bid = first(rows)
     end
-    return day_ahead_bids(df, origin_row, soc_now, rows, cfg)
+    opened = _open_offers(pending, df, (origin_row + 1):(first_bid - 1))
+    cfg.strategy.mode == "rolling" && return [rolling_bids(df, origin_row, soc_now, opened, cfg)]
+    return day_ahead_bids(df, origin_row, soc_now, opened, rows, cfg)
+end
+
+# Offers in `pending` for each row of `open_rows` (by timestamp; later entries win), `nothing`
+# for a row without one.
+function _open_offers(pending::AbstractVector, df::DataFrame, open_rows::UnitRange{Int})
+    byts = Dict{DateTime,PeriodBids}(pb.timestamp => pb for pb in pending)
+    out = Union{PeriodBids,Nothing}[]
+    for k in open_rows
+        pb = get(byts, df.timestamp[k], nothing)
+        push!(out, pb === nothing ? nothing : PeriodBids(k, pb.timestamp, pb.offers, pb.planned))
+    end
+    miss = [df.timestamp[k] for (k, pb) in zip(open_rows, out) if pb === nothing]
+    isempty(miss) || @warn "generate_bids: no offer supplied for open period(s) $(join(miss, ", ")); " *
+        "assuming the worst case over every offer the battery could have made (pass `pending`)" maxlog = 1
+    return out
 end
 
 """

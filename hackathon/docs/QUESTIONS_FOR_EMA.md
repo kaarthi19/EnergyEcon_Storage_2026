@@ -72,12 +72,12 @@ Kind regards,
 | Question | Current assumption | Where it is set |
 |---|---|---|
 | 1, 2 | Rolling, one decision per period; offer for period t fixed after period t−3 settles | `strategy.mode`, `strategy.lead_periods` |
-| 3 | SOC supplied at each decision | `generate_bids(df, origin_row, soc_now, cfg)` |
+| 3 | SOC supplied at each decision, with the offers still open at gate closure | `generate_bids(df, origin_row, soc_now, cfg; pending)` |
 | 4 | Pre-dispatch available up to 48 periods ahead of each decision | `forecast.pd_horizon_periods`, `forecast.method` |
 | 5 | Price taker for all products; reserve offers up to 100 MW each | `strategy.price_impact` (energy only), `[market.reserve_cap_mw]` (cap the regulation offer below the requirement) |
 | 6 | No violations tolerated; reserves sustainable for 0.5 h; RC386 and RC390 not yet read | `strategy.soc_guard`, `strategy.soc_guard_quantile`, `[market.sustain_hours]`, `simulation.shortfall_penalty` |
 | 7 | Energy at one price; reserves at quantity × price; no other charges | `src/simulator.jl` (`settle_period`) |
-| 8 | Expected activation of 10% (regulation, each direction), 2% (primary), 1% (contingency); not settled as energy | `[market.deployment]` |
+| 8 | Expected activation of 10% (regulation, each direction), 2% (primary), 1% (contingency); not settled as energy | `[market.deployment]`, `market.pay_deployment_energy` |
 | 9 | Awards maximise offer surplus under RC383 joint capability, per reserve class | `market.reserve_headroom`, `src/simulator.jl` (`clear_period`) |
 | 10 | Not modelled; forecasts are not clipped at the caps | `src/forecast.jl` (to add once parameters are known) |
 | 11 | Start at 50%; stored energy at the end valued at the forecast price | `battery.initial_soc_frac`, `strategy.terminal_value_mode`, `strategy.terminal_soc_frac` |

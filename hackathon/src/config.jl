@@ -41,6 +41,7 @@ Base.@kwdef struct MarketConfig
     reserve_cap_mw::Dict{Symbol,Float64} = Dict(:regulation => 0.0, :primary => 0.0, :contingency => 0.0)
     facility_id::String = "BESS1"            # §5.2B.2.1 identity of the energy storage facility
     offer_type::String = "variation"         # §5.2B.2.2 "standing" offer or offer "variation"
+    pay_deployment_energy::Bool = false      # pay energy delivered by reserve deployment at the energy price
 end
 
 Base.@kwdef struct StrategyConfig
@@ -60,6 +61,7 @@ Base.@kwdef struct StrategyConfig
     energy_flex_mw::Float64 = 0.0      # max MW the energy offer may deviate from plan (0 = off)
     energy_flex_to_zero::Bool = true   # the capped offer can always back off to 0 MW
     sustain_charge_credit::Bool = false # plan's sustainability credits planned charging (net transfer)
+    info_lag_periods::Int = 0          # forecast uses realised prices only up to origin - this
 end
 
 Base.@kwdef struct ForecastConfig
@@ -211,6 +213,7 @@ function validate(c::Config)
     s.lead_periods >= 1 || error("lead_periods must be >= 1")
     s.lead_periods <= s.horizon_periods || error("lead_periods must be <= horizon_periods")
     s.soc_margin_mwh >= 0 || error("soc_margin_mwh must be >= 0")
+    0 <= s.info_lag_periods <= 2 * m.periods_per_day || error("strategy.info_lag_periods must be in [0, 2 days]")
     0 <= s.soc_guard_buffer_mwh < (soc_max(b) - soc_min(b)) / 2 ||
         error("soc_guard_buffer_mwh must be in [0, half the usable SOC range)")
     soc_min(b) <= s.terminal_soc_frac * b.energy_mwh <= soc_max(b) || error("terminal_soc_frac outside SOC limits")

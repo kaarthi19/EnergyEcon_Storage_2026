@@ -46,7 +46,7 @@ julia --project=hackathon hackathon/scripts/backtest.jl --data hackathon/data/sy
 4. Generate offers from the data available at a decision time and the current SOC:
 
 ```bash
-julia --project=hackathon hackathon/scripts/generate_bids.jl --data hackathon/data/synthetic/market.csv --origin 2026-01-10T17:30:00 --soc 60 --out hackathon/results/bids.csv
+julia --project=hackathon hackathon/scripts/generate_bids.jl --data hackathon/data/synthetic/market.csv --origin 2026-01-10T17:30:00 --soc 60 --pending hackathon/results/backtest/bids.csv --out hackathon/results/bids.csv
 ```
 
 ### Backtest options
@@ -69,7 +69,8 @@ The backtest writes three files:
 include("hackathon/src/BESSBidding.jl"); using .BESSBidding
 cfg = load_config("hackathon/configs/default.toml")
 df  = load_market_data("path/to/ema_data", cfg)
-bids = generate_bids(df, origin_row, soc_mwh, cfg)   # Vector{PeriodBids}
+pending = read_bids("path/to/submitted_bids")        # offers still open at gate closure
+bids = generate_bids(df, origin_row, soc_mwh, cfg; pending = pending)   # Vector{PeriodBids}
 write_bids("bids.csv", bids, cfg)
 ```
 
