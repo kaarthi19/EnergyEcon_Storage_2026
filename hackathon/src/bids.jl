@@ -254,6 +254,15 @@ function storage_pairs(o::Offer, cfg::Config)
         pos = z
     end
     always_ch = pos < -1e-9 ? -pos : 0.0                              # charge at any price
+    # Pieces that round below 0.001 MW would be dropped at export anyway; drop them now, so
+    # they neither take a price cent or a slot (no slot gaps) nor reach the merge (zero-size
+    # tranches would average to 0/0). An always-block only takes a slot if it survives too.
+    for (pr, q) in ((chp, chq), (dsp, dsq))
+        keep = round_mw.(q) .> 0
+        keepat!(pr, keep); keepat!(q, keep)
+    end
+    round_mw(always_ch) > 0 || (always_ch = 0.0)
+    round_mw(always_ds) > 0 || (always_ds = 0.0)
     # Merge real tranches only: averaging the always-blocks (priced at the cap or floor) into
     # a tranche would offer large quantities far from their opportunity cost.
     nch = m.max_charge_pairs - (always_ch > 0 && m.max_charge_pairs > 1)

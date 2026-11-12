@@ -62,6 +62,7 @@ Base.@kwdef struct StrategyConfig
     energy_flex_to_zero::Bool = true   # the capped offer can always back off to 0 MW
     sustain_charge_credit::Bool = false # plan's sustainability credits planned charging (net transfer)
     info_lag_periods::Int = 0          # forecast uses realised prices only up to origin - this
+    require_pending::Bool = false      # generate_bids: error (not a warning) when an open offer is missing
 end
 
 Base.@kwdef struct ForecastConfig

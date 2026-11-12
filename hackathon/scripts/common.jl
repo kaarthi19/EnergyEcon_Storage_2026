@@ -1,5 +1,6 @@
 # Shared helpers for the command-line scripts.
-include(joinpath(@__DIR__, "..", "src", "BESSBidding.jl"))
+# Not again when already loaded (the test suite includes a script to call its main function).
+isdefined(Main, :BESSBidding) || include(joinpath(@__DIR__, "..", "src", "BESSBidding.jl"))
 using .BESSBidding, DataFrames, Dates
 
 "Parse `--key value` pairs (and bare `--flag`) into a Dict."

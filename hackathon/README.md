@@ -43,7 +43,7 @@ julia --project=hackathon hackathon/scripts/make_synthetic.jl --days 21
 julia --project=hackathon hackathon/scripts/backtest.jl --data hackathon/data/synthetic/market.csv
 ```
 
-4. Generate offers from the data available at a decision time and the current SOC:
+4. Generate offers from the data available at a decision time and the current SOC. Pass the offers already submitted with `--pending`: without them the periods still open at gate closure are covered by their worst case, so the bids are safe but earn almost nothing (`strategy.require_pending = true` turns this into an error):
 
 ```bash
 julia --project=hackathon hackathon/scripts/generate_bids.jl --data hackathon/data/synthetic/market.csv --origin 2026-01-10T17:30:00 --soc 60 --pending hackathon/results/backtest/bids.csv --out hackathon/results/bids.csv

@@ -15,6 +15,9 @@ mutable struct CoOptModel
     soc::Vector{VariableRef}    # MWh at end of each period
     prices::Dict{Symbol,Vector{Float64}}
     cfg::Config
+    # Bounds solve! left at 0 for the branch it returned (so the model's solution matches the
+    # returned one); restored before the next set_price! or solve!.
+    branch::Vector{Tuple{VariableRef,Float64}}
 end
 
 struct PeriodSolution
@@ -25,9 +28,13 @@ struct PeriodSolution
     objective::Float64
 end
 
-# One thread and a fixed seed so the same inputs always give the same offers.
+# A fixed seed so the same inputs always give the same offers. No "threads" option: HiGHS
+# keeps one global scheduler per process and fails (OTHER_ERROR) any later model whose
+# "threads" differs from the first solved one, so setting it would break every solve once
+# a caller's default HiGHS model ran first. The simplex LP is serial, so results stay
+# deterministic without it (the test suite checks repeated runs give identical bids).
 _highs(attrs::Pair...) = optimizer_with_attributes(HiGHS.Optimizer, "output_flag" => false,
-                                                   "threads" => 1, "random_seed" => 1234, attrs...)
+                                                   "random_seed" => 1234, attrs...)
 _optimizer() = _highs("mip_rel_gap" => 1e-4, "time_limit" => 60.0)
 
 """
@@ -94,7 +101,15 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
 
     target = s.terminal_soc_frac * b.energy_mwh
     if s.terminal_value_mode == "hard"
-        @constraint(model, soc[H] >= min(target, Emax))
+        # A target the window cannot reach (short horizon, low start) would make the model
+        # infeasible: use the reachable SOC closest to it (charge at full power throughout).
+        reach = soc0 + H * soc_change(Pc, 0.0, 0.0, 0.0, 0.0, cfg)
+        hard = min(target, Emax)
+        if reach < hard
+            @warn "terminal SOC target $(round(hard, digits = 2)) MWh is unreachable in $H periods; using $(round(reach, digits = 2)) MWh" maxlog = 5
+            hard = reach
+        end
+        @constraint(model, soc[H] >= hard)
         tv = 0.0
     else
         # Value stored energy at the median forecast energy price, net of discharge losses.
@@ -111,7 +126,7 @@ function build_coopt(cfg::Config, soc0::Float64, prices::Dict{Symbol,Vector{Floa
     else
         @objective(model, Max, obj)
     end
-    return CoOptModel(model, H, c, d, r, soc, deepcopy(prices), cfg)
+    return CoOptModel(model, H, c, d, r, soc, deepcopy(prices), cfg, Tuple{VariableRef,Float64}[])
 end
 
 """
@@ -131,6 +146,7 @@ end
 
 "Change the price of product `p` in window position `j` (updates objective coefficients)."
 function set_price!(cm::CoOptModel, p::Symbol, j::Int, λ::Float64)
+    _restore_branch!(cm)
     dt = cm.cfg.market.period_hours
     deg = cm.cfg.battery.degradation_cost
     cm.prices[p][j] = λ
@@ -148,12 +164,29 @@ function set_price!(cm::CoOptModel, p::Symbol, j::Int, λ::Float64)
     return cm
 end
 
+_solved(st) = st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+
 function _optimize_checked!(cm::CoOptModel)
     optimize!(cm.model)
     st = termination_status(cm.model)
+    if !_solved(st) && cm.cfg.strategy.price_impact > 0 && objective_function(cm.model) isa QuadExpr
+        # The HiGHS QP solver can stop with a tiny primal infeasibility (~1e-5) on badly
+        # scaled windows. Retry with a looser tolerance (kept for this model's later solves);
+        # failing that, drop the price-impact term and solve the LP for the rest of this
+        # model's life, so one sweep never mixes QP and LP responses.
+        set_attribute(cm.model, "primal_feasibility_tolerance", 1e-4)
+        optimize!(cm.model)
+        st = termination_status(cm.model)
+        if !_solved(st)
+            @warn "price-impact QP failed ($st); solving without the price-impact term" maxlog = 5
+            @objective(cm.model, Max, objective_function(cm.model).aff)
+            optimize!(cm.model)
+            st = termination_status(cm.model)
+        end
+    end
     if st == MOI.TIME_LIMIT && has_values(cm.model)
         @warn "co-optimisation stopped at the time limit; using the best solution found" maxlog = 5
-    elseif !(st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED))
+    elseif !_solved(st)
         error("co-optimisation failed: $st")
     end
     return cm
@@ -170,22 +203,37 @@ Solve and return the solution for window position `j`. Without the binary the LP
 and discharge at once (it burns energy at strongly negative prices), which a net-MW offer
 cannot do. If that happens in period `j`, re-solve with charge and with discharge fixed to
 0 in turn and keep the better one: exactly the MILP's branch for that period, at the cost of
-two LPs and only when it occurs.
+two LPs and only when it occurs. The winning branch's bound stays in the model until the
+next `set_price!` or `solve!`, so `value`s and `coopt_schedule` match the returned solution
+(one more LP when the first branch wins).
 """
 function solve!(cm::CoOptModel; j::Int = 1)
+    _restore_branch!(cm)
     _optimize_checked!(cm)
     sol = _period_solution(cm, j)
     min(sol.charge_mw, sol.discharge_mw) <= 1e-6 && return sol
-    best = nothing
-    for v in (cm.c[j], cm.d[j])
-        ub = upper_bound(v)
-        set_upper_bound(v, 0.0)
-        _optimize_checked!(cm)
-        s2 = _period_solution(cm, j)
+    _fix_branch!(cm, cm.c[j])            # discharge-only branch
+    _optimize_checked!(cm)
+    s1 = _period_solution(cm, j)
+    _restore_branch!(cm)
+    _fix_branch!(cm, cm.d[j])            # charge-only branch
+    _optimize_checked!(cm)
+    s2 = _period_solution(cm, j)
+    s2.objective > s1.objective && return s2
+    _restore_branch!(cm)                 # ties keep the first branch, as before
+    _fix_branch!(cm, cm.c[j])
+    _optimize_checked!(cm)
+    return _period_solution(cm, j)
+end
+
+_fix_branch!(cm::CoOptModel, v::VariableRef) = (push!(cm.branch, (v, upper_bound(v))); set_upper_bound(v, 0.0))
+
+function _restore_branch!(cm::CoOptModel)
+    for (v, ub) in cm.branch
         set_upper_bound(v, ub)
-        (best === nothing || s2.objective > best.objective) && (best = s2)
     end
-    return best
+    empty!(cm.branch)
+    return cm
 end
 
 "Full schedule of the current solution (for diagnostics and perfect-foresight benchmarks)."

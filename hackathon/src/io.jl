@@ -70,7 +70,8 @@ at `origin_row`; gaps in its realised prices are filled with a warning (`sanitiz
 the periods between the origin and the first bid period; others are ignored. Those offers
 are still open at the decision time, so the SOC at the start of the bid period is uncertain.
 A period whose offer is not supplied is covered by the worst case over every offer the
-battery could have made (more conservative bids, never less safe), with a warning.
+battery could have made, with a warning: never less safe, but with lead_periods > 1 the
+battery then earns almost nothing. `strategy.require_pending = true` makes it an error.
 
 - rolling mode: returns the offer for trading period origin_row + lead_periods.
 - day_ahead mode: returns offers for `rows` (default: the next full trading day).
@@ -78,28 +79,32 @@ battery could have made (more conservative bids, never less safe), with a warnin
 function generate_bids(df::DataFrame, origin_row::Int, soc_now::Float64, cfg::Config;
                        pending::AbstractVector = PeriodBids[], rows = nothing)
     df = sanitize_history(df, origin_row, cfg)   # NaN/missing history must not reach the forecaster
-    need = origin_row + cfg.strategy.lead_periods + max(cfg.strategy.horizon_periods, cfg.market.periods_per_day) - 1
-    df = extend_rows(df, need, cfg)
-    if cfg.strategy.mode == "rolling"
-        first_bid = origin_row + cfg.strategy.lead_periods
+    s, ppd = cfg.strategy, cfg.market.periods_per_day
+    first_bid = origin_row + s.lead_periods
+    # Extend a short table (empty future rows) as far as the full look-ahead window from the
+    # first bid row, as run_backtest sees it on a complete table.
+    if s.mode == "rolling"
+        df = extend_rows(df, first_bid + s.horizon_periods - 1, cfg)
     else
         if rows === nothing
-            t = origin_row + cfg.strategy.lead_periods
-            while t <= nrow(df) && df.period[t] != 1
+            df = extend_rows(df, first_bid + ppd - 1, cfg)   # the next day boundary is in here
+            t = first_bid
+            while df.period[t] != 1
                 t += 1
             end
-            rows = t:min(nrow(df), t + cfg.market.periods_per_day - 1)
+            rows = t:(t + ppd - 1)
         end
+        df = extend_rows(df, max(last(rows), first(rows) + s.horizon_periods - 1), cfg)
         first_bid = first(rows)
     end
-    opened = _open_offers(pending, df, (origin_row + 1):(first_bid - 1))
-    cfg.strategy.mode == "rolling" && return [rolling_bids(df, origin_row, soc_now, opened, cfg)]
+    opened = _open_offers(pending, df, (origin_row + 1):(first_bid - 1), cfg)
+    s.mode == "rolling" && return [rolling_bids(df, origin_row, soc_now, opened, cfg)]
     return day_ahead_bids(df, origin_row, soc_now, opened, rows, cfg)
 end
 
 # Offers in `pending` for each row of `open_rows` (by timestamp; later entries win), `nothing`
 # for a row without one.
-function _open_offers(pending::AbstractVector, df::DataFrame, open_rows::UnitRange{Int})
+function _open_offers(pending::AbstractVector, df::DataFrame, open_rows::UnitRange{Int}, cfg::Config)
     byts = Dict{DateTime,PeriodBids}(pb.timestamp => pb for pb in pending)
     out = Union{PeriodBids,Nothing}[]
     for k in open_rows
@@ -107,8 +112,14 @@ function _open_offers(pending::AbstractVector, df::DataFrame, open_rows::UnitRan
         push!(out, pb === nothing ? nothing : PeriodBids(k, pb.timestamp, pb.offers, pb.planned))
     end
     miss = [df.timestamp[k] for (k, pb) in zip(open_rows, out) if pb === nothing]
-    isempty(miss) || @warn "generate_bids: no offer supplied for open period(s) $(join(miss, ", ")); " *
-        "assuming the worst case over every offer the battery could have made (pass `pending`)" maxlog = 1
+    isempty(miss) && return out
+    msg = "generate_bids: no offer supplied for the open period(s) $(join(miss, ", ")). Pass the offers " *
+          "already submitted for them as `pending` (e.g. pending = read_bids(\"<bids CSV files or directory>\"), " *
+          "or --pending on the command line); every offer submitted earlier may be passed, only these " *
+          "timestamps are used."
+    cfg.strategy.require_pending && error(msg * " (strategy.require_pending = true)")
+    @warn msg * " Without them each is covered by the worst case over every offer the battery could " *
+          "have made: the bids are safe but earn almost nothing." maxlog = 1
     return out
 end
 

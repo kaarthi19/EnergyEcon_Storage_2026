@@ -100,6 +100,10 @@ sustain_charge_credit = false
 # period still running at gate closure is published after it ends); the SOC at the origin
 # and the open offers are used as before.
 info_lag_periods = 0
+# generate_bids with open periods (rolling with lead_periods > 1, day_ahead) whose offers are
+# not passed in `pending` covers them by their worst case: safe, but the battery then earns
+# almost nothing. true makes that an error instead of a warning.
+require_pending = false
 
 [forecast]
 method = "ridge"            # "ridge" | "seasonal_naive" | "predispatch"

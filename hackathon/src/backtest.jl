@@ -17,7 +17,10 @@ with the offers for τ+1 .. t-1 still open; day_ahead mode bids each trading day
 closure of its first period, the same way. The summary reports `net_market_revenue` (as
 settled), `compliance_adjusted_revenue` (reserve payment withheld for awards the SOC could
 not sustain, shortfall penalty applied), the same plus the value of the SOC change, and the
-perfect-foresight benchmarks (`perfect_foresight`).
+perfect-foresight benchmarks (`perfect_foresight`). For ranking runs use the strict metrics:
+`strict_compliant_revenue` withholds the whole reserve payment of every period with a
+sustain violation (and applies the shortfall penalty), and `compliant` is 1 only for a run
+with no sustain violation, no shortfall, no clearing fallback and every offer valid.
 """
 function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start_row(cfg),
                       end_row::Int = nrow(df), progress::Bool = true)
@@ -99,6 +102,7 @@ function run_backtest(df::DataFrame, cfg::Config; start_row::Int = default_start
         reserve_withheld = [outcomes[t].reserve_withheld for t in rows],
         throughput_mwh = [outcomes[t].throughput_mwh for t in rows],
         clearing_fallback = [fellback[t] for t in rows],
+        bid_valid = [!haskey(bids, t) || isempty(validate_bids(bids[t], cfg)) for t in rows],
     )
     bl = [bids[t] for t in rows if haskey(bids, t)]
     return BacktestResult(periods, bl, summarize(periods, df, rows, cfg))
@@ -142,6 +146,12 @@ function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg:
     market_rev = tot(:rev_energy) + tot(:rev_regulation) + tot(:rev_primary) + tot(:rev_contingency)
     # Compliance-adjusted: no payment for reserve the SOC could not sustain, penalty applied.
     adjusted = market_rev - tot(:reserve_withheld) + tot(:penalty)
+    # Strict: a period whose awards the SOC could not sustain earns no reserve payment at all
+    # (the proportional withholding above still ranked a non-compliant guard first).
+    v = periods.sustain_violation
+    strict = market_rev - sum(periods.rev_regulation[v] .+ periods.rev_primary[v] .+ periods.rev_contingency[v];
+                              init = 0.0) + tot(:penalty)
+    compliant = !any(v) && tot(:shortfall_mwh) <= 1e-6 && !any(periods.clearing_fallback) && all(periods.bid_valid)
     # Value the SOC change over the window at the median realised energy price, net of
     # discharge losses, so runs that end with different stored energy compare fairly.
     soc0, soc1 = periods.soc_start_mwh[1], periods.soc_end_mwh[end]
@@ -161,6 +171,8 @@ function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg:
         "net_revenue_after_penalty" => market_rev + tot(:penalty),
         "reserve_payment_withheld" => tot(:reserve_withheld),
         "compliance_adjusted_revenue" => adjusted,
+        "strict_compliant_revenue" => strict,
+        "compliant" => compliant,
         "start_soc_mwh" => soc0,
         "end_soc_mwh" => soc1,
         "soc_change_value" => soc_value,
@@ -172,6 +184,7 @@ function summarize(periods::DataFrame, df::DataFrame, rows::UnitRange{Int}, cfg:
         "sustain_violation_periods" => count(periods.sustain_violation),
         "max_sustain_violation_mwh" => maximum(periods.sustain_violation_mwh),
         "clearing_fallback_periods" => count(periods.clearing_fallback),
+        "invalid_bid_periods" => count(!, periods.bid_valid),
         "soc_min_seen_mwh" => minimum(periods.soc_end_mwh),
         "soc_max_seen_mwh" => maximum(periods.soc_end_mwh),
         "perfect_foresight_bound" => pf,

@@ -19,6 +19,22 @@ df = synthetic_market_data(days = 10, seed = 3, cfg = cfg)
     @test c2.strategy.lead_periods == 3 && c2.battery === cfg.battery
 end
 
+@testset "package solves after a caller's default HiGHS model" begin
+    # Must be the first HiGHS solve of the process: with "threads" => 1 in _highs(), every
+    # package model then failed with OTHER_ERROR (HiGHS has one scheduler per process).
+    md = B.JuMP.Model(B.HiGHS.Optimizer); B.JuMP.set_silent(md)
+    B.JuMP.@variable(md, 0 <= y <= 1); B.JuMP.@objective(md, Max, y); B.JuMP.optimize!(md)
+    @test B.JuMP.termination_status(md) == B.MOI.OPTIMAL
+    o = Dict(:energy => Offer(:energy, -50.0, [10.0, 50.0], [50.0, 60.0]),
+             (p => Offer(p, 10.0, Float64[], Float64[]) for p in RESERVES)...)
+    n0 = B.CLEAR_FALLBACKS[]
+    net, res = clear_period(B.PeriodBids(1, DateTime(2026), o),
+                            Dict(:energy => 20.0, :regulation => 5.0, :primary => 5.0, :contingency => 5.0), cfg)
+    @test B.CLEAR_FALLBACKS[] == n0 && net == 0.0 && all(res[p] == 10.0 for p in RESERVES)
+    sol = solve!(build_coopt(cfg, 50.0, Dict(p => fill(p == :energy ? 50.0 : 5.0, 8) for p in PRODUCTS)))
+    @test isfinite(sol.objective)
+end
+
 @testset "data" begin
     @test nrow(df) == 10 * 48
     @test df.period[1] == 1 && df.period[48] == 48 && df.period[49] == 1
@@ -288,6 +304,35 @@ end
         nfail += !ok
     end
     @test nfail == 0
+    # Unconformed "nasty" offers: zero and sub-0.001 MW tranches, equal prices, prices beyond
+    # the limits. No error, no slot gaps, and conforming does not change the exported pairs.
+    @test storage_pairs(Offer(:energy, 100.0, collect(1.0:6.0), zeros(6)), cfg) == [(slot = 6, price = -4500.0, mw = 100.0)]
+    @test storage_pairs(Offer(:energy, -60.0, [33.335], [0.0004]), cfg) == [(slot = 1, price = 4500.0, mw = -59.999)]
+    sp = storage_pairs(Offer(:energy, 0.0004, [-4500.0, 10.0], [30.0, 20.0]), cfg)
+    @test [x.slot for x in sp] == [6, 7] && sp[1].price == -4500.0     # no cent kept for a block that rounds away
+    nfail = 0
+    for _ in 1:3000
+        n = rand(rng, 0:12)
+        base = rand(rng, (-100.0, -60.0, -0.0004, 0.0, 0.0004, 30.0, -100 * rand(rng)))
+        ps = rand(rng) < 0.3 ? fill(rand(rng, (-5000.0, -4500.0, 0.0, 33.335, 4500.0, 5000.0)), n) :
+             sort(10000 .* rand(rng, n) .- 5000)
+        sz = [rand(rng, (0.0, 0.0004, 0.001, 0.0016, 5.0, 20 * rand(rng))) for _ in 1:n]
+        off = B.clip_offer(Offer(:energy, base, ps, sz), -100.0, 100.0)
+        local sp2, co
+        try
+            sp2 = storage_pairs(off, cfg); co = conform_storage_offer(off, cfg)
+        catch
+            nfail += 1; continue
+        end
+        sl = [x.slot for x in sp2]
+        nc = count(<=(5), sl)
+        ok = sl == vcat(1:nc, 6:(5 + length(sl) - nc))
+        ok &= storage_pairs(co, cfg) == sp2
+        pb = B.PeriodBids(1, DateTime(2026), Dict(:energy => co, (p => noff(p) for p in RESERVES)...))
+        ok &= isempty(validate_bids(pb, cfg))
+        nfail += !ok
+    end
+    @test nfail == 0
 end
 
 @testset "negative reserve base never reaches the market" begin
@@ -457,6 +502,42 @@ end
     @test with_credit.reserve_mw[:contingency] > without.reserve_mw[:contingency] + 50
     res = Dict(:regulation => 0.0, :primary => 0.0, :contingency => with_credit.reserve_mw[:contingency])
     @test sustain_violation_mwh(with_credit.net_mw, res, 10.0, cfg) <= 1e-6
+end
+
+@testset "optimiser: solved state after a branch, QP retry, unreachable hard target" begin
+    z(pe) = Dict(p => (p == :energy ? pe : fill(5.0, length(pe))) for p in PRODUCTS)
+    for (pe, res) in (([-80.0, -1000.0], false), ([-80.0, -1000.0], true), ([-300.0, -4500.0, -4500.0], false))
+        cm = build_coopt(cfg, 50.0, z(pe); reserves = res)
+        s = solve!(cm)
+        sch = coopt_schedule(cm)                                   # threw OptimizeNotCalled
+        @test sch.charge_mw[1] ≈ s.charge_mw && sch.discharge_mw[1] ≈ s.discharge_mw
+        @test min(s.charge_mw, s.discharge_mw) <= 1e-6 && B.objective_value(cm.model) ≈ s.objective
+        set_price!(cm, :energy, 1, 50.0)                           # the branch bound is lifted again
+        @test isempty(cm.branch) && B.JuMP.upper_bound(cm.c[1]) > 0 && B.JuMP.upper_bound(cm.d[1]) > 0
+        @test solve!(cm).net_mw > 0
+    end
+    # Verifier's case: HiGHS QP stops with a 2e-5 primal infeasibility; the retry solves it.
+    pe = [179.13, 209.32, 88.72, 79.99, 22.93, 261.30, 74.22, 108.08, 96.24, 78.39, -57.47, 134.68,
+          41.02, -1000.0, 113.36, 246.52, 199.23, 195.05, 57.10, 139.43, 308.25, 177.32, 182.71, 4500.0]
+    prg = [0.0, 4500.0, 0.0, 33.87, 40.72, 0.0, 0.0, 68.66, 87.41, 5.84, 63.99, 21.63, 0.0, 51.21, 20.47, 88.85,
+           41.32, 31.22, 0.0, 47.61, 11.39, 126.55, 95.60, 0.0]
+    ppr = [23.43, 61.53, 4500.0, 42.07, 37.29, 0.0, 24.33, 15.18, 21.41, 1.67, 0.0, 0.0, 16.73, 5.12, 74.70, 35.56,
+           67.96, 119.15, 41.35, 3.31, 33.85, 48.39, 0.0, 76.60]
+    pco = [500.0, 24.39, 26.35, 28.19, 5.13, 0.0, 35.16, 13.41, 4500.0, 0.54, 16.93, 4500.0, 27.52, 59.88, 71.37,
+           73.27, 49.03, 0.0, 58.06, 18.60, 5.05, 33.90, 9.54, 45.09]
+    mq = mkmarket(cfg.market; deploy_reg_down = 0.4598, deploy_primary = 0.9653, sustain_contingency = 1.9162,
+                  reserve_cap_mw = Dict(:regulation => 200.0, :primary => 30.0, :contingency => 0.0),
+                  pay_deployment_energy = true)
+    cq = mkcfg(cfg; market = mq, strategy = with_strategy(cfg; price_impact = 0.05, soc_guard_buffer_mwh = 0.0).strategy)
+    prq = Dict(:energy => pe, :regulation => prg, :primary => ppr, :contingency => pco)
+    sq = solve!(build_coopt(cq, 77.0673, prq))
+    @test isfinite(sq.objective) && -100 - 1e-3 <= sq.net_mw <= 100 + 1e-3
+    # hard terminal target out of reach in one period from 6 MWh: the reachable SOC is used
+    ch = with_strategy(cfg; terminal_value_mode = "hard", terminal_soc_frac = 0.9)
+    cm = @test_logs (:warn, r"unreachable") match_mode = :any build_coopt(ch, 6.0, z([50.0]))
+    s = solve!(cm)
+    @test B.JuMP.value(cm.soc[end]) ≈ 6.0 + B.soc_change(100.0, 0.0, 0.0, 0.0, 0.0, cfg) atol = 1e-4
+    @test s.charge_mw ≈ 100 atol = 1e-6
 end
 
 @testset "config: unknown keys are errors, validate catches bad values" begin
@@ -809,6 +890,14 @@ end
     @test guarantee_holds(blind, lo_k, hi_k, cfg)
     @test guarantee_holds(blind, lo_u + cfg.strategy.soc_guard_buffer_mwh, hi_u - cfg.strategy.soc_guard_buffer_mwh, cfg) ||
           lo_u + 0.5 > hi_u - 0.5
+    # the warning says what to pass; require_pending turns it into an error
+    @test_logs (:warn, r"Pass the offers already submitted for them as `pending`") match_mode = :any generate_bids(df[1:τ, :], τ, soc_τ, cfg)
+    @test_throws ErrorException generate_bids(df, τ, soc_τ, with_strategy(cfg; require_pending = true))
+    @test length(generate_bids(df, τ, soc_τ, with_strategy(cfg; require_pending = true); pending = known)) == 1
+    # same inputs, same offers (fixed HiGHS seed, no thread option)
+    again = generate_bids(df, τ, soc_τ, cfg; pending = known)[1]
+    @test all(again.offers[p].prices == mine[τ + L].offers[p].prices && again.offers[p].sizes == mine[τ + L].offers[p].sizes
+              for p in PRODUCTS)
     # the low-level entry points refuse a wrong number of open offers
     @test_throws ErrorException rolling_bids(df, τ, soc_τ, PeriodBids[], cfg)
     @test_throws ErrorException rolling_bids(df, τ, soc_τ, reverse(known), cfg)
@@ -839,6 +928,53 @@ end
     pend = [r1.bids[findfirst(b -> b.row == j, r1.bids)] for j in (τ + 1):(st + 47)]
     da = day_ahead_bids(df, τ, r1.periods.soc_end_mwh[τ - st + 1], pend, (st + 48):en, c)
     @test all(da[i].offers[p].sizes == b1[i].offers[p].sizes for i in 1:2, p in PRODUCTS)
+end
+
+@testset "day_ahead generate_bids on a short table sees the full look-ahead" begin
+    c = with_strategy(cfg; mode = "day_ahead", soc_guard = "expected", horizon_periods = 60,
+                      energy_grid_quantiles = [0.1, 0.5, 0.9], reserve_grid_quantiles = [0.5])
+    τ = 5 * 48 + 16                                  # next trading day starts at row 289
+    pend = [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):288]
+    hist = copy(df)                                  # what is known at τ (no pre-dispatch here)
+    for p in PRODUCTS; hist[(τ + 1):end, B.PRICE_COLS[p]] .= NaN; hist[(τ + 1):end, B.PD_COLS[p]] .= NaN; end
+    full = generate_bids(hist, τ, 50.0, c; pending = pend)
+    short = generate_bids(hist[1:τ, :], τ, 50.0, c; pending = pend)   # was extended to row 318 < 289 + 59
+    @test length(full) == length(short) == 48 && first(full).row == 289
+    @test all(x.offers[p].prices == y.offers[p].prices && x.offers[p].sizes == y.offers[p].sizes &&
+              x.offers[p].base_mw == y.offers[p].base_mw for (x, y) in zip(full, short), p in PRODUCTS)
+end
+
+@testset "forecast with conditional_errors = false: pooled bands, valid bids" begin
+    c = with_forecast(cfg; conditional_errors = false)
+    τ = 6 * 48 + 11
+    f0, f1 = forecast_prices(df, τ, (τ + 1):(τ + 96), cfg), forecast_prices(df, τ, (τ + 1):(τ + 96), c)
+    qs = [0.001, 0.1, 0.5, 0.9, 0.999]
+    for p in PRODUCTS
+        @test f1.errors[p] === nothing && f1.mean[p] == f0.mean[p]
+        pooled = f1.mean[p][5] .+ B.quantile(f1.residuals[p], qs)
+        @test B.forecast_quantiles(f1, p, 5, qs) == pooled == B.forecast_quantiles(f1, p, 5, qs; conservative = true)
+    end
+    pend = [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):(τ + 2)]
+    pb = rolling_bids(df, τ, 50.0, pend, c)
+    @test isempty(validate_bids(pb, c)) && all(isfinite, pb.offers[:energy].prices)
+end
+
+@testset "scripts/generate_bids.jl main function and exit status" begin
+    include(joinpath(@__DIR__, "..", "scripts", "generate_bids.jl"))
+    τ = 7 * 48 + 20
+    mktempdir() do d
+        data, out = joinpath(d, "m.csv"), joinpath(d, "bids.csv")
+        B.CSV.write(data, df[1:τ, :])
+        write_bids(joinpath(d, "pend.csv"), [B.idle_bids(k, df.timestamp[k]) for k in (τ + 1):(τ + 2)], cfg)
+        args = ["--data", data, "--soc", "50", "--out", out, "--pending", joinpath(d, "pend.csv")]
+        @test Base.invokelatest(generate_bids_main, args) == 0
+        bl = read_bids(out)
+        @test length(bl) == 1 && bl[1].timestamp == df.timestamp[τ + 3]
+        # an offer that fails validation: still written, exit status 1
+        rm(out)
+        @test Base.invokelatest(generate_bids_main, args; check = (pb, c) -> ["bad"]) == 1 && isfile(out)
+        @test_throws ErrorException Base.invokelatest(generate_bids_main, ["--data", data])   # no --soc
+    end
 end
 
 @testset "info_lag_periods: forecast ignores the origin's price" begin
@@ -872,6 +1008,17 @@ end
     @test sm["net_market_revenue"] > 0
     @test all(isempty(validate_bids(pb, cfg)) for pb in r.bids)
     @test sm["clearing_fallback_periods"] == 0
+    @test sm["compliant"] == 1 && sm["invalid_bid_periods"] == 0 && sm["strict_compliant_revenue"] ≈ sm["net_market_revenue"]
+    # strict metric: a period with a sustain violation earns no reserve payment at all
+    pv = copy(r.periods)
+    k = argmax(pv.rev_regulation .+ pv.rev_primary .+ pv.rev_contingency)
+    pv.sustain_violation[k] = true
+    smd(x) = Dict(x.metric .=> x.value)
+    sv = smd(B.summarize(pv, df, st:(st + 47), cfg))
+    @test sv["strict_compliant_revenue"] ≈ sm["net_market_revenue"] - (pv.rev_regulation[k] + pv.rev_primary[k] + pv.rev_contingency[k])
+    @test sv["compliant"] == 0 && sv["compliance_adjusted_revenue"] ≈ sm["compliance_adjusted_revenue"]
+    pv.sustain_violation[k] = false; pv.bid_valid[k] = false
+    @test smd(B.summarize(pv, df, st:(st + 47), cfg))["compliant"] == 0
     # SOC continuity
     @test all(r.periods.soc_start_mwh[2:end] .≈ r.periods.soc_end_mwh[1:end-1])
     mktempdir() do d
