@@ -31,4 +31,7 @@ packages = ["bessbid"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
-markers = ["data: needs EMA's data (set BESSBID_DATA_DIR)"]
+markers = [
+    "data: needs EMA's data (set BESSBID_DATA_DIR)",
+    "slow: full-length data runs (deselect with -m \"not slow\")",
+]

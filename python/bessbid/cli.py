@@ -4,6 +4,9 @@
         [--template T] [--strategy regulation|full] [--month 2026-11] [--config cfg.toml]
     python -m bessbid validate OUT.xlsx [--month 2026-11] [--config cfg.toml]
     python -m bessbid inspect --data-dir D --work-dir W
+    python -m bessbid backtest --data-dir D --work-dir W (--bids X.xlsx | --strategy NAME) \
+        [--month 2026-10 ...] [--mode maker|taker|both] [--convention sqrt|charge|discharge|all] \
+        [--soc-policy none|clip|reject] [--tie strict|inclusive]
 
 ``generate`` builds the bids, writes them into a copy of EMA's template, validates the file
 with the independent validator, reads it back and compares it with what was meant to be
@@ -163,6 +166,63 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def cmd_backtest(args) -> int:
+    """Replay bids on training months with the EMA-replica engine; summary to stdout and to
+    ``<work>/backtest_<label>.json`` (per-period frames as ``.parquet`` with --frames)."""
+    from . import io
+    from .backtest import MarketData, run_months
+    from .bids import to_table as _to_table
+
+    cfg = load_config(args.config)
+    work = Path(args.work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    data_r = Path(args.data_dir).resolve()
+    if work.resolve() == data_r or data_r in work.resolve().parents:
+        print("error: --work-dir must be outside the data dir", file=sys.stderr)
+        return 1
+    ds = io.load_all(args.data_dir, work)
+    md = MarketData.from_dataset(ds, start=cfg.stack_fit_start)
+    if bool(args.bids) == bool(args.strategy):
+        print("error: give exactly one of --bids or --strategy", file=sys.stderr)
+        return 1
+    if args.bids:
+        table = read_back(args.bids)
+        bids_for_month = lambda m: table  # noqa: E731
+        label = Path(args.bids).stem
+        allow_missing = True  # a workbook covers one month; other periods carry no offer
+    else:
+        strategy = get_strategy(args.strategy)
+        infoset = None
+        if strategy.needs_data:
+            from .infoset import InfoSet
+
+            infoset = InfoSet.from_dataset(ds, cfg)
+
+        def bids_for_month(m):
+            bids = strategy.generate(m, infoset, cfg.replace(month=m))
+            check_complete(bids, m)
+            return _to_table(bids)
+
+        label = strategy.name
+        allow_missing = False
+    modes = ("maker", "taker") if args.mode == "both" else (args.mode,)
+    convs = ("discharge", "sqrt", "charge") if args.convention == "all" else (args.convention,)
+    try:
+        res = run_months(bids_for_month, md, months=args.month, modes=modes, conventions=convs, cfg=cfg,
+                         soc_policy=args.soc_policy, tie=args.tie, allow_missing=allow_missing)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    cols = ["month", "mode", "convention", "revenue", "revenue_per_30d", "rev_E", "rev_P", "rev_C", "rev_R",
+            "breach_periods", "clipped_periods", "rejected_periods", "runtime_s"]
+    with __import__("pandas").option_context("display.width", 200, "display.max_columns", 20):
+        print(res[[c for c in cols if c in res.columns]].round(1).to_string(index=False))
+    out = work / f"backtest_{label}.json"
+    out.write_text(json.dumps(res.to_dict(orient="records"), indent=2, default=str) + "\n")
+    print(f"summary -> {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m bessbid", description="EMA BESS bid generator")
     ap.add_argument("--version", action="version", version=__version__)
@@ -189,6 +249,19 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--data-dir", required=True)
     i.add_argument("--work-dir", required=True)
     i.set_defaults(func=cmd_inspect)
+
+    b = sub.add_parser("backtest", help="replay bids on training months with the EMA-replica engine")
+    b.add_argument("--data-dir", required=True)
+    b.add_argument("--work-dir", required=True)
+    b.add_argument("--bids", help="bid workbook to replay (its dates must be in the months)")
+    b.add_argument("--strategy", help="strategy name; bids are generated for each month")
+    b.add_argument("--month", nargs="+", default=["2026-08", "2026-09", "2026-10"])
+    b.add_argument("--mode", choices=["maker", "taker", "both"], default="both")
+    b.add_argument("--convention", choices=["sqrt", "charge", "discharge", "all"], default="sqrt")
+    b.add_argument("--soc-policy", choices=["none", "clip", "reject"], default="none")
+    b.add_argument("--tie", choices=["strict", "inclusive"], default="strict")
+    b.add_argument("--config", default=None)
+    b.set_defaults(func=cmd_backtest)
     return ap
 
 

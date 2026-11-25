@@ -131,7 +131,9 @@ manifest.
 | `writer.py` | `write_submission(bids, template, out, cfg, month)` and `read_back(path)` |
 | `strategy.py` | the `Strategy` protocol, `register_strategy`, `get_strategy`, `check_complete` |
 | `strategy_regulation.py` | `RegulationOnlyStrategy` |
-| `cli.py` | `python -m bessbid generate \| validate \| inspect` |
+| `engine.py` | EMA-replica clearing LP: `ClearingEngine`, `clear`, `clear_period`, `price_taker_clear`, `replicate`; `StackArrays`, `PeriodStack`, `BessOffer`, `ClearResult` |
+| `backtest.py` | `simulate(bids, month, data, mode, convention, soc_policy, ...)`, `run_months`, `MarketData`, `soc_path` |
+| `cli.py` | `python -m bessbid generate \| validate \| inspect \| backtest` |
 
 ### Extension points
 
@@ -148,8 +150,6 @@ register_strategy("full", "bessbid.strategy_full:FullStrategy")   # already pre-
 exists, the CLI reports it as unavailable.
 
 Planned modules:
-- `engine.py`: per-period clearing LP with highspy.
-- `backtest.py`
 - `calendar.py`: outage and event cycles.
 - `netdemand.py`
 - `stackmodel.py`
@@ -161,6 +161,101 @@ Planned modules:
 These modules should take data only from an `InfoSet` and build bids only with the
 `bids.py` builders, which enforce rounding and the capacity rule. The output must pass
 `validate_table` before it is written; `write_submission` refuses invalid tables.
+
+## Market engine and backtest
+
+### `engine.py`: exact replica of EMA's clearing
+
+One LP per 30-minute period, solved with HiGHS (`highspy`) directly:
+
+- It minimises offer cost.
+- Energy balance: generation + unserved + BESS discharge - BESS charge = `net_demand_mw`.
+  The energy price is the dual of this row.
+- Reserve rows: offered + shortfall >= requirement. Shortfalls are uncapped and priced at 750
+  (P), 1000 (C) and 1200 (R). VoLL is 4500, an assumption, since energy was never unserved.
+- Per unit: e + p + c + r <= `available_mw`. Reserve caps are the reserve `offered_mw`.
+- Energy ramp-up: e(t) <= e(t-1) + 0.42 x `available_mw`(t). It is applied by clipping bands
+  in merit order, which is the same LP as an explicit ramp row.
+
+**BESS offers** enter as RC383 bands:
+- discharge (MW > 0) is supply at its offer price;
+- charge (MW < 0) is a demand bid, cleared when the price is below the offer;
+- reserve bands are supply at their price.
+
+The engine also applies two physical joint rows: discharge + P + C + R <= 100 and
+charge + R <= 100 (`bess_pmax`). The bid builders separately enforce the stricter
+offered-MW rule (|energy| + all AS <= 100). For our own bids, therefore, these rows never
+bind.
+
+**Price-taker awards.** `price_taker_clear(offer, prices, tie=)` awards the bands that are in
+the money. With the default `tie='strict'` (RC383 wording), a band offered exactly at the
+price does not clear; `'inclusive'` clears it. If the joint rows would be exceeded, MW go to
+the largest margins first.
+
+**Speed.** One model per (facilities, bands) shape is reused: each call changes bounds,
+costs and row bounds and warm-starts the simplex. A solve takes about 0.4 ms. With
+`warm_start=False` the results do not depend on solve history.
+
+**Replication** (`replicate(stacks, clearing)`): all 5904 training periods, Jul 1 - Oct 31,
+cold start Jul 1, ramp chained as EMA did. Runtime is 2.3 s.
+
+| Price | MAE | Max error |
+|---|---|---|
+| E | 0.0003 | 0.0019 |
+| P | 0.0003 | 0.0020 |
+| C | 0.0003 | 0.0020 |
+| R | 0.0004 | 0.0018 |
+
+Unmet reserve MW agree to within 0.002. BESS insertion matches the Phase A engine to 1e-12.
+
+### `backtest.py`: EMA-replica evaluator
+
+```python
+from bessbid import io
+from bessbid.backtest import MarketData, simulate, run_months
+md = MarketData.from_dataset(io.load_all(data_dir, work_dir), start="2026-07-01")
+r = simulate(bid_table, "2026-10", md, mode="maker", convention="sqrt", soc_policy="clip")
+r.frame     # one row per period: prices, awards, revenue by product, SOC (+ per convention)
+r.summary   # totals, revenue per 30 days, SOC min/max/final, breaches, clips, rejections
+```
+
+**Modes.**
+- `maker`: our offers inside the LP, with actual stacks, net demand and requirements. The
+  ramp state is chained from a cold start on Jul 1. `ramp='baseline'` instead chains the
+  no-BESS dispatch (the Phase A convention).
+- `taker`: actual training prices, with `price_taker_clear` awards.
+
+**SOC.** SOC starts at 50 MWh and moves by 0.5 h x (eta_c x charge - discharge / eta_d).
+`convention` is `'sqrt'`, `'charge'`, `'discharge'` or an (eta_c, eta_d) pair. When a period
+would leave 5-95 MWh, `soc_policy` decides what happens:
+- `none`: report the breach;
+- `clip`: trim the energy offer to what SOC allows, before clearing;
+- `reject`: drop that period's energy offer and keep its reserves.
+
+Every run also reports the SOC path of the realised dispatch under all three conventions.
+
+**Settlement.**
+- Energy: price x (discharge - charge) x 0.5 h, so charging costs money.
+- Reserves: price x MW x 0.5 h.
+
+**Golden numbers** (regulation-only, 100 MW at 0.00, sqrt convention):
+
+| Window | Maker (re-cleared) | Taker (actual prices) |
+|---|---|---|
+| October | 2.0582 M per 30 days (2.1268 M for the 31 days) | 2.4062 M per 30 days |
+| Jul-Oct | 1,415,911 per 30 days | 1,575,608 per 30 days |
+
+These equal the Phase A values exactly. Pseudo-Novembers are Aug, Sep and Oct
+(`PSEUDO_MONTHS`). A whole month runs in about 2.5 s as maker (of which about 1.8 s is the
+ramp warm-up from Jul 1) and about 0.1 s as taker.
+
+```bash
+python -m bessbid backtest --data-dir D --work-dir W --strategy regulation \
+    --month 2026-08 2026-09 2026-10 --mode both --convention all --soc-policy clip
+python -m bessbid backtest --data-dir D --work-dir W --bids some_october_bids.xlsx --month 2026-10
+```
+
+The summary goes to stdout and to `<work>/backtest_<label>.json`.
 
 ## Tests
 
@@ -177,6 +272,25 @@ Tests marked `data` run only when `BESSBID_DATA_DIR` is set. They check the foll
 - the November information cut (stacks up to Oct 3 14:30 at Nov 1 00:00; lead 2 h for all
   1440 periods);
 - a full `generate` run on EMA's real template.
+
+Engine and backtest tests (`test_engine.py`, `test_backtest.py`) run on small synthetic
+markets. They compare the engine with an independent scipy formulation (skipped if scipy
+is absent) and also check the following:
+- BESS monotonicity;
+- the price-taker tie rules;
+- the joint limits;
+- SOC under the three conventions;
+- the clip and reject policies;
+- revenue signs.
+
+The data tests in `test_engine_data.py` check:
+- 200 sampled periods, including the Oct 12 16:30-17:30 scarcity;
+- all 5904 periods;
+- the regulation-only golden numbers;
+- the CLI `backtest`.
+
+Tests marked `slow` (all 5904 periods; Jul-Oct goldens) take about 10 s; deselect them with
+`-m "not slow"`.
 
 `BESSBID_WORK_DIR` reuses the parquet caches. Without it, the tests build the caches in a
 temporary folder.
