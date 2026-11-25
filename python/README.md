@@ -134,6 +134,11 @@ manifest.
 | `engine.py` | EMA-replica clearing LP: `ClearingEngine`, `clear`, `clear_period`, `price_taker_clear`, `replicate`; `StackArrays`, `PeriodStack`, `BessOffer`, `ClearResult` |
 | `backtest.py` | `simulate(bids, month, data, mode, convention, soc_policy, ...)`, `run_months`, `MarketData`, `soc_path` |
 | `cli.py` | `python -m bessbid generate \| validate \| inspect \| backtest` |
+| `calendar.py` | `learn_calendar(infoset, cut) -> EventCalendar` (outage cycles, contingency and surge windows learned from data); `event_flags`, `contingency_req`, `surge_mw`, `expected_outage` |
+| `netdemand.py` | `NetDemandModel`: legal lead-2 h/3 h net demand (night solar zeroed), day-ahead profile + surge, error nodes |
+| `stackmodel.py` | `StackModel`: offer-price factor model, legal 7-lag stack blend (`forecast_stack(T, decision_time, outage)`) |
+| `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`; `walk_forward`, `evaluate`, `month_forecasts`; `python -m bessbid.forecast` |
+| `_clearlp.py` | small reference clearing LP (cross-checked against `engine.py` in the tests) |
 
 ### Extension points
 
@@ -150,10 +155,6 @@ register_strategy("full", "bessbid.strategy_full:FullStrategy")   # already pre-
 exists, the CLI reports it as unavailable.
 
 Planned modules:
-- `calendar.py`: outage and event cycles.
-- `netdemand.py`
-- `stackmodel.py`
-- `forecast.py`
 - `planner.py`: SOC plan under every efficiency convention in
   `Config.efficiency_conventions`, keeping `soc_margin_mwh`.
 - `soc.py`
@@ -257,6 +258,62 @@ python -m bessbid backtest --data-dir D --work-dir W --bids some_october_bids.xl
 
 The summary goes to stdout and to `<work>/backtest_<label>.json`.
 
+## Price forecasts
+
+Prices are forecast structurally, the way EMA clears them: a forecast offer stack, forecast
+net demand and the event calendar go through the clearing LP (`engine.py`, cold-started so a
+forecast never depends on earlier solves).
+
+- **Calendar** (`calendar.py`). Learned at a cut from the known-outage state in
+  pre-dispatch rows issued by then: outage onsets are explained greedily by periodic cycles
+  (time of day, period in days, anchor); each cycle's duration is the candidate that best
+  reproduces the observed states and its event MW is the median onset jump. The raised
+  contingency requirement and the demand surge are windows relative to a cycle, learned from
+  training clearing rows that ended by the cut. Nothing is hard-coded. On EMA's data the
+  calendar learned from data up to Jul 28 already classifies every training and November
+  known-outage state above 400 MW with 0 exceptions.
+- **Net demand** (`netdemand.py`). Lead forecast: T's own lead-2 h vintage, else lead 3 h,
+  `load - solar` with forecast solar set to zero in periods of the day where training solar
+  was always zero. Day-ahead: mean of the same period over the last 4 days of the same day
+  type, outside surge windows, plus the learned surge. Under the strict reading
+  (`Config.strict_predispatch`) the history is training actual net demand; otherwise it is
+  the lead-0.5 h vintages of past periods. The hour-of-day bias correction exists
+  (`bias_correction=True`) but is off: it made lead-2 h error slightly worse.
+- **Stack** (`stackmodel.py`). log price = base(unit, band, period of day) + factor; the
+  factor is regressed on stack outage MW and weekend. The forecast for T blends the 7 most
+  recent published stacks for T's period of day (publication per row, so lags of 29+ days),
+  normalised to zero outage and weekday, rescaled to T's expected outage and day type, with
+  outaged units restored. Stack periods that are exact copies of a published period 28 days
+  later (EMA's June files) are left out of the fit.
+- **Forecasts** (`forecast.py`). `lead2(T)`: decision `T - 65 min`; expected outage = the
+  vintage's known outage moved forward with the calendar. `day_ahead(day)`: decision 00:00
+  the day before (any decision time can be given). `scenarios(...)`: net-demand error nodes
+  (and event MW x 0.87/1/1.13 day-ahead in event windows) through the LP, times whole-day
+  empirical log-residual blocks of the same regime from a walk-forward residual library;
+  gives means, quantiles, P(spike) and price paths. Every forecast checks its decision time
+  against the fit cut and writes an audit entry.
+
+Walk-forward accuracy, Aug-Oct, monthly refits at 00:00 the day before each month (MAE in
+SGD/MWh; spike = price > 400):
+
+| | Energy MAE | Primary | Contingency | Regulation | Energy spike precision / recall |
+|---|---|---|---|---|---|
+| lead 2 h | 18.8 | 1.27 | 1.80 | 2.27 | 0.74 / 0.97 |
+| day-ahead, strict reading | 23.1 | 2.45 | 3.08 | 3.55 | 0.70 / 0.93 |
+| day-ahead, broad reading | 22.1 | 1.95 | 2.53 | 3.00 | 0.72 / 0.96 |
+
+Scenario ensembles (Sep-Oct, residual library from Aug 1): q10/q50/q90 coverage
+0.06-0.10 / 0.42-0.48 / 0.82-0.87; P(energy spike) >= 0.5 has precision/recall 0.78/0.97
+(lead 2 h) and 0.64/0.99 (day-ahead).
+
+```bash
+# a month of forecasts (lead 2 h, day-ahead, month-ahead, ensembles) into the work dir
+python -m bessbid.forecast --data-dir D --work-dir W --month 2026-11
+```
+
+The output (`<work>/forecasts_<month>.parquet`, a daily CSV and a JSON summary) is derived
+from EMA's data and stays in the work dir.
+
 ## Tests
 
 ```bash
@@ -288,6 +345,15 @@ The data tests in `test_engine_data.py` check:
 - all 5904 periods;
 - the regulation-only golden numbers;
 - the CLI `backtest`.
+
+Forecast tests (`test_forecast.py`) run on a synthetic market with two outage cycles, a
+surge window and LP-cleared prices. They check that the calendar is learned exactly, the stack
+lags are published and of the right period of day, copy detection, night-solar zeroing, and
+forecast accuracy. They also include a no-leak property test: every stack, pre-dispatch and
+clearing row not legal at the decision time is perturbed, and the lead-2 h, day-ahead and
+scenario forecasts must come out bit-identical. A control test checks that perturbing legal
+rows does change the forecast. `test_forecast_data.py` repeats the calendar and no-leak checks
+on EMA's data and runs an October walk-forward.
 
 Tests marked `slow` (all 5904 periods; Jul-Oct goldens) take about 10 s; deselect them with
 `-m "not slow"`.

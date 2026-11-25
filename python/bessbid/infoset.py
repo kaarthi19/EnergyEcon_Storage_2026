@@ -119,6 +119,7 @@ class InfoSet:
             self._stk_avail = s["avail_time"].to_numpy()
         else:
             self._stk, self._stk_avail = None, None
+        self._stk_arrays = None
 
     # ---- construction helpers ------------------------------------------------------------
     @classmethod
@@ -142,6 +143,12 @@ class InfoSet:
         if not e.ok:
             raise LeakError(f"{accessor}: data up to {mu} used for decision time {t}")
         self._audit.append(e)
+
+    def record(self, accessor: str, decision_time, max_time_used, n_rows: int, for_period=None) -> None:
+        """Append an audit entry for data a caller derived from earlier accessor calls
+        (raises :class:`LeakError` if ``max_time_used`` is after ``decision_time``)."""
+        fp = None if for_period is None else _ts(for_period)
+        self._record(accessor, _ts(decision_time), max_time_used, n_rows, fp)
 
     @property
     def audit(self) -> list[AuditEntry]:
@@ -260,6 +267,28 @@ class InfoSet:
 
     def stacks_for(self, T) -> pd.DataFrame:
         return self.stacks_known_at(self.cutoff(T))
+
+    def stack_arrays(self):
+        """Dense :class:`bessbid.stackmodel.StackArrays` view of all stacks (built once).
+
+        Callers must index it only with rows from :meth:`stack_index_known_at`."""
+        if self._stk is None:
+            raise ValueError("InfoSet has no offer-stack data")
+        if self._stk_arrays is None:
+            from .stackmodel import StackArrays
+
+            self._stk_arrays = StackArrays.from_frame(self._stk, "avail_time")
+        return self._stk_arrays
+
+    def stack_index_known_at(self, t, for_period=None) -> np.ndarray:
+        """Row indices into :meth:`stack_arrays` of the stack periods fully published at or
+        before ``t`` (audited)."""
+        arr = self.stack_arrays()
+        t = _ts(t)
+        idx = np.flatnonzero(arr.avail <= np.datetime64(t, "ns"))
+        mx = arr.avail[idx].max() if len(idx) else None
+        self._record("stack_index_known_at", t, mx, len(idx), None if for_period is None else _ts(for_period))
+        return idx
 
     def latest_stack_ts_known_at(self, t) -> pd.Timestamp | None:
         """Latest trading period whose stack is published by ``t`` (no data returned)."""
