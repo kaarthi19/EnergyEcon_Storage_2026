@@ -1,0 +1,15 @@
+# Never commit competition data or anything derived from it (hackathon clause 21).
+*.csv
+*.csv.gz
+*.parquet
+*.xlsx
+*.npz
+*.npy
+*.pkl
+work/
+cache/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+__pycache__/
