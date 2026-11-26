@@ -1,0 +1,13 @@
+{
+  "title": "bessbid: a bidding algorithm for a 100 MW / 100 MWh battery in EMA's BESS Bidding Algorithm Hackathon",
+  "upload_type": "software",
+  "description": "Python code that generates a one-month bid schedule for a hypothetical 100 MW / 100 MWh battery across Energy, Primary Reserve, Contingency Reserve and Regulation, for the Energy Market Authority of Singapore's BESS Bidding Algorithm Hackathon (Phase 1). It includes a reconstruction of the competition's market clearing, structural price forecasts, a state-of-charge-safe bid planner, a template writer and validator, and a backtester. The competition datasets are confidential and are not included.",
+  "creators": [
+    {"name": "Gnapathy, Kaarthi A", "affiliation": "University of California San Diego"}
+  ],
+  "license": "MIT",
+  "access_right": "embargoed",
+  "embargo_date": "2026-12-12",
+  "keywords": ["battery energy storage", "electricity market bidding", "ancillary services", "Singapore wholesale electricity market", "market clearing"],
+  "version": "v1.0-submission"
+}

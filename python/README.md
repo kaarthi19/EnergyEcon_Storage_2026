@@ -19,8 +19,8 @@ information rules. In walk-forward tests on August-October it adds about +115k S
 expect about +100k. The full strategy description is in
 [`docs/strategy.md`](docs/strategy.md).
 
-This is a hackathon submission, not a paper, so there is no DOI, archive or citation file.
-No competition data, and nothing derived from it, is stored in this repository (hackathon
+The code is released under the MIT licence and archived on Zenodo; see Citation below. No
+competition data, and nothing derived from it, is stored in this repository (hackathon
 clause 21).
 
 ## Quick start
@@ -36,7 +36,8 @@ python3 -m venv .venv
 pip install -r requirements.txt -r requirements-figures.txt
 
 # unit tests on small synthetic markets; no EMA data needed (about 6 minutes)
-python -m pytest -q
+# (env -u keeps the slower data tests off even if BESSBID_DATA_DIR is set in your shell)
+env -u BESSBID_DATA_DIR python -m pytest -q
 
 # November bids, validation and figures (about 4 minutes)
 ./run_all.sh --skip-tests --data-dir "/path/to/ema bidding comp" --work-dir /path/to/work
@@ -221,14 +222,18 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   | `[strategy.full] guard_margin_mw`, `guard_price` | 300, 400 | charging bans and the lead-2 h charge guard |
   | `[strategy.full] refine` | `"guard"` | `"none"`, `"guard"` or `"lead2"` (gate-time re-optimisation) |
 
+## Citation
+
+Cite the archived code using [`CITATION.cff`](CITATION.cff). The Zenodo record (metadata in
+[`.zenodo.json`](.zenodo.json)) stays embargoed until 12 December 2026, after the submission
+deadline; its DOI will be added here once the record is published.
+
 ## Licence
 
-Licensing of this code is pending. The hackathon terms (clause 20) assign intellectual
-property in submissions to EMA, and the team will decide the licence once that is settled.
-The MIT `LICENSE` at the repository root comes from the repository template and predates
-the hackathon; this folder adds no licence file of its own. EMA's data is not covered by
-any licence here: it stays under the hackathon's confidentiality terms (clause 21).
+The code is released under the [MIT licence](LICENSE), copyright (c) 2026 Kaarthi A
+Gnapathy. EMA's data is not covered by this licence: it stays under the hackathon's
+confidentiality terms (clause 21) and is not included.
 
 ## Contact
 
-Team contact: to be added before the submission.
+Kaarthi A Gnapathy, University of California San Diego.

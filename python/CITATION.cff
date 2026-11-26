@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the archived code."
+title: "bessbid: a bidding algorithm for a 100 MW / 100 MWh battery in EMA's BESS Bidding Algorithm Hackathon"
+version: "v1.0-submission"
+repository-code: "https://github.com/kaarthi19/bess-bidding-algorithm"
+license: MIT
+authors:
+  - family-names: "Gnapathy"
+    given-names: "Kaarthi A"
+    affiliation: "University of California San Diego"
+keywords:
+  - battery energy storage
+  - electricity market bidding
+  - ancillary services
+  - Singapore wholesale electricity market
+  - market clearing

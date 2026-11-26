@@ -12,7 +12,10 @@
 #   submission.manifest.json   inputs and hashes, config, checks, information audit, run record
 #   figures/                   fig01_stress_window.*, figS01_november_plan.* and *_numbers.json
 set -euo pipefail
+CALLER_DIR="$(pwd)"
 cd "$(dirname "$0")"
+# Relative paths given on the command line are relative to where the script was called from.
+abspath() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$CALLER_DIR" "$1" ;; esac; }
 
 DATA_DIR=""
 WORK_DIR=""
@@ -22,9 +25,9 @@ SKIP_TESTS=0
 SKIP_FIGURES=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --data-dir) DATA_DIR="$2"; shift 2 ;;
-    --work-dir) WORK_DIR="$2"; shift 2 ;;
-    --config) CONFIG="$2"; shift 2 ;;
+    --data-dir) DATA_DIR="$(abspath "$2")"; shift 2 ;;
+    --work-dir) WORK_DIR="$(abspath "$2")"; shift 2 ;;
+    --config) CONFIG="$(abspath "$2")"; shift 2 ;;
     --python) PY="$2"; shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-figures) SKIP_FIGURES=1; shift ;;
