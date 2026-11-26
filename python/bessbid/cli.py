@@ -1,9 +1,11 @@
 """Command line interface.
 
     python -m bessbid generate --data-dir D --out OUT.xlsx --work-dir W \
-        [--template T] [--strategy regulation|full] [--month 2026-11] [--config cfg.toml]
+        [--template T] [--strategy full|regulation] [--month 2026-11] [--config cfg.toml] \
+        [--plan-out PLAN.csv]
     python -m bessbid validate OUT.xlsx [--month 2026-11] [--config cfg.toml]
     python -m bessbid inspect --data-dir D --work-dir W
+    python -m bessbid evaluate --data-dir D --work-dir W [--month M ...] [--no-pf]
     python -m bessbid backtest --data-dir D --work-dir W (--bids X.xlsx | --strategy NAME) \
         [--month 2026-10 ...] [--mode maker|taker|both] [--convention sqrt|charge|discharge|all] \
         [--soc-policy none|clip|reject] [--tie strict|inclusive]
@@ -11,7 +13,10 @@
 ``generate`` builds the bids, writes them into a copy of EMA's template, validates the file
 with the independent validator, reads it back and compares it with what was meant to be
 written, and stores a JSON manifest (inputs, config, checks, information-audit summary,
-output SHA-256) in the work dir. Exit code 0 on success, 2 if the file fails validation.
+output SHA-256) in the work dir. The default strategy is ``full`` (Regulation plus the planned
+energy overlay); it also writes the per-period plan (dispatch, SOC under every efficiency
+convention, forecasts) to ``--plan-out`` (default ``<work>/<out stem>.plan.csv``).
+Exit code 0 on success, 2 if the file fails validation.
 Nothing is written into the data dir.
 """
 
@@ -108,6 +113,13 @@ def cmd_generate(args) -> int:
         infoset.assert_no_leak()
         audit = infoset.audit_summary()
 
+    plan_path = None
+    plan_frame = getattr(strategy, "plan_frame", None)
+    if plan_frame is not None:
+        plan_path = Path(args.plan_out) if args.plan_out else work / f"{out.stem}.plan.csv"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_frame.to_csv(plan_path, index=False, float_format="%.4f", date_format="%Y-%m-%d %H:%M:%S")
+
     manifest = {
         "package_version": __version__,
         "strategy": strategy.name,
@@ -124,6 +136,7 @@ def cmd_generate(args) -> int:
                        "messages": [str(v) for v in vs[:50]]},
         "roundtrip_ok": roundtrip_ok,
         "information_audit": audit,
+        "plan": None if plan_path is None else {"path": str(plan_path), "info": getattr(strategy, "plan_info", None)},
         "offered_mw": {
             "energy_abs_total_mwh_equiv": float(np.nansum(np.abs(table.loc[table["product"] == "Energy", [f"quantity_{i}" for i in range(1, 11)]].to_numpy()))) * cfg.period_hours,
             "max_period_offer_mw": float(max(sum(abs(b.mw) for o in pb.offers().values() for b in o) for pb in bids)),
@@ -223,6 +236,40 @@ def cmd_backtest(args) -> int:
     return 0
 
 
+def cmd_evaluate(args) -> int:
+    """Walk-forward evaluation of the full strategy on pseudo-Novembers (see
+    :mod:`bessbid.evaluate`); table to stdout, ``<work>/evaluation_full.csv`` and the plans as
+    ``<work>/evaluation_plan_<month>.csv``."""
+    import pandas as pd
+
+    from . import io
+    from .evaluate import evaluate
+
+    cfg = load_config(args.config)
+    work = Path(args.work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    data_r = Path(args.data_dir).resolve()
+    if work.resolve() == data_r or data_r in work.resolve().parents:
+        print("error: --work-dir must be outside the data dir", file=sys.stderr)
+        return 1
+    ds = io.load_all(args.data_dir, work)
+    caps = () if args.no_pf else (50.0, 100.0)
+    res, plans = evaluate(ds, cfg, months=args.month, perfect_foresight=caps,
+                          progress=lambda msg: print(msg, flush=True))
+    out = work / "evaluation_full.csv"
+    res.to_csv(out, index=False, float_format="%.4f")
+    for m, f in plans.items():
+        f.to_csv(work / f"evaluation_plan_{m}.csv", index=False, float_format="%.4f",
+                 date_format="%Y-%m-%d %H:%M:%S")
+    cols = ["policy", "month", "mode", "convention", "revenue", "revenue_per_30d", "uplift", "uplift_per_30d",
+            "rev_E", "rev_R", "soc_min", "soc_max", "breach_periods"]
+    with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_rows", 500):
+        print(res[cols].round(1).to_string(index=False))
+    print(f"summary -> {out}")
+    full = res[(res["policy"] == "full") & (res["month"] != "ALL")]
+    return 0 if int(full["breach_periods"].sum()) == 0 else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m bessbid", description="EMA BESS bid generator")
     ap.add_argument("--version", action="version", version=__version__)
@@ -233,9 +280,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--template", help="EMA template .xlsx (default: found in --data-dir)")
     g.add_argument("--out", required=True, help="output .xlsx path")
     g.add_argument("--work-dir", required=True, help="cache/manifest folder (outside the repo and data dir)")
-    g.add_argument("--strategy", default="regulation", choices=available_strategies())
+    g.add_argument("--strategy", default="full", choices=available_strategies(),
+                   help="full (default): Regulation + planned energy overlay; regulation: fallback")
     g.add_argument("--month", default=None, help="YYYY-MM (default from config: 2026-11)")
     g.add_argument("--config", default=None, help="optional .toml/.json overrides")
+    g.add_argument("--plan-out", default=None, help="CSV for the per-period plan (strategies that make one)")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("validate", help="validate a bid workbook")
@@ -262,6 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--tie", choices=["strict", "inclusive"], default="strict")
     b.add_argument("--config", default=None)
     b.set_defaults(func=cmd_backtest)
+
+    e = sub.add_parser("evaluate", help="walk-forward pseudo-November evaluation of the full strategy")
+    e.add_argument("--data-dir", required=True)
+    e.add_argument("--work-dir", required=True)
+    e.add_argument("--month", nargs="+", default=["2026-08", "2026-09", "2026-10"])
+    e.add_argument("--no-pf", action="store_true", help="skip the perfect-foresight bounds")
+    e.add_argument("--config", default=None)
+    e.set_defaults(func=cmd_evaluate)
     return ap
 
 
