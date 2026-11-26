@@ -62,13 +62,16 @@ class Config:
 
     # ---- Offer prices ---------------------------------------------------------------------
     #: Price of an always-clearing discharge band (clears when offer < clearing price).
-    discharge_floor_price: float = 0.0
+    #: 0.01 rather than 0.00: the template's number format shows zero as '-', which a reader
+    #: could take for a blank cell. Training energy prices never fell below 133.
+    discharge_floor_price: float = 0.01
     #: Price of an always-clearing charge band (clears when offer > clearing price).
     #: Training energy prices never exceeded 2058.4; 3000 also avoids charging into a
     #: deeper shortage.
     charge_cap_price: float = 3000.0
-    #: Price used for always-clearing AS bands.
-    as_floor_price: float = 0.0
+    #: Price used for always-clearing AS bands (0.01, not 0.00, for the same display reason;
+    #: training reserve prices never fell below 1.8).
+    as_floor_price: float = 0.01
     #: Hard bounds the validator accepts for any offer price (SWEM limits, assumption).
     offer_price_min: float = -4500.0
     offer_price_max: float = 4500.0

@@ -270,7 +270,7 @@ def make_period_bid(
 def regulation_only(date, period: int, cfg: Config | None = None, mw: float | None = None,
                     price: float | None = None, tag: str = "regulation_only") -> PeriodBid:
     """``mw`` (default the full rating) of Regulation at ``price`` (default the AS floor,
-    0.00); no Energy, Primary or Contingency offer (those rows stay blank)."""
+    0.01); no Energy, Primary or Contingency offer (those rows stay blank)."""
     cfg = cfg or Config()
     mw = cfg.power_mw if mw is None else mw
     price = cfg.as_floor_price if price is None else price

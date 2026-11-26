@@ -65,7 +65,7 @@ def test_layout_matches_template(template, tmp_path):
     assert ws["B2"].value == 1 and ws["C2"].value == "Energy"
     # example values from the template are gone: period 1 Energy is blank
     assert all(ws.cell(row=2, column=c).value is None for c in range(4, 24))
-    assert ws["C5"].value == "Regulation" and ws["D5"].value == 0 and ws["E5"].value == 100
+    assert ws["C5"].value == "Regulation" and ws["D5"].value == 0.01 and ws["E5"].value == 100
     assert ws["D5"].number_format == "#,##0.00;[Red]\\(#,##0.00\\);\\-"
     assert ws["N3"].fill.fgColor.rgb == "FFF1F3F5"  # AS bands 6-10 keep the grey fill
     assert ws.row_dimensions[100].height == 23.1
@@ -162,7 +162,8 @@ def test_cli_generate_regulation(template, tmp_path, capsys):
     assert cli.main(["validate", str(out), "--month", "2026-12"]) == 2
     # a second run gives the same bytes
     out2 = tmp_path / "out" / "sub2.xlsx"
-    cli.main(["generate", "--template", str(template), "--out", str(out2), "--work-dir", str(work)])
+    cli.main(["generate", "--template", str(template), "--out", str(out2), "--work-dir", str(work),
+              "--strategy", "regulation"])
     assert sha(out) == sha(out2)
 
 

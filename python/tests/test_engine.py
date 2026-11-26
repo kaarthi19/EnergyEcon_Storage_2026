@@ -244,7 +244,7 @@ def test_from_period_bid_and_wrappers():
     cfg = Config()
     pb = energy_fixed("2026-10-01", 30, 40, cfg)
     off = BessOffer.from_period_bid(pb)
-    assert off.discharge == ((0.0, 40.0),) and off.regulation == ((0.0, 60.0),)
+    assert off.discharge == ((0.01, 40.0),) and off.regulation == ((0.01, 60.0),)
     pb = energy_fixed("2026-10-01", 10, -40, cfg)
     off = BessOffer.from_period_bid(pb)
     assert off.charge == ((3000.0, 40.0),)
