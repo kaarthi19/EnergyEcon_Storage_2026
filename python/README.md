@@ -85,7 +85,7 @@ has these fingerprints, which `generate` writes to the manifest:
 |---|---|
 | `submission.xlsx` | `c6260df22a9262adfc8bc3ea4743f2502b21d0c93e0e070e35d1cc3d831ed1a5` |
 | bid table (`table_sha256`, independent of the xlsx writer) | `2240964c8146686f238c01d686b897774955ed4aaaafd73229675c8c25c2ce30` |
-| `submission.plan.csv` | `15d9dd1a466c3a75c6f70b59fffd3f9d8fa7180d4bed8c04484fe7a61bb3cb7e` |
+| `submission.plan.csv` | `164bbefd51859fe1c9d7512f5c481ecc174318850ab16397d5d558511f3cb3a5` |
 
 Running with `--config config/default.toml` or with no `--config` gives the same bytes.
 
