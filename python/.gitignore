@@ -1,4 +1,5 @@
-# Never commit competition data or anything derived from it (hackathon clause 21).
+# Never commit competition data or anything derived from it (hackathon clause 21):
+# inputs, caches, bid workbooks, plans, manifests, figures and their number sidecars.
 *.csv
 *.csv.gz
 *.parquet
@@ -8,8 +9,20 @@
 *.pkl
 work/
 cache/
+outputs/
+figures/
+*_numbers.json
+*.manifest.json
+data/*
+!data/README.md
+!data/DATA_SOURCES.md
+
+# Python and tooling
+.venv/
+venv/
 *.egg-info/
 build/
 dist/
 .pytest_cache/
+.ruff_cache/
 __pycache__/

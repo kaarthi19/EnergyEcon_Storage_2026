@@ -52,7 +52,7 @@ def test_calendar_real(ds, info, cut):
 def test_walk_forward_october(info):
     wf = walk_forward(info, None, "2026-10-01", "2026-10-31 23:30")
     ev = evaluate(wf).set_index(["kind", "product"])
-    assert ev.loc[("lead2", "E"), "MAE"] < 23  # October holds the 2058 overlap event
+    assert ev.loc[("lead2", "E"), "MAE"] < 23  # October holds a scarcity event
     assert ev.loc[("day_ahead", "E"), "MAE"] < 28
     assert ev.loc[("lead2", "R"), "MAE"] < 5
     assert ev.loc[("lead2", "E"), "spike_recall"] > 0.9

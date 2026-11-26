@@ -34,14 +34,13 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .periods import PERIOD
-
 __all__ = [
     "DataFiles",
     "Dataset",
     "SchemaError",
     "find_files",
     "find_template",
+    "file_sha256",
     "parse_sgt",
     "load_clearing",
     "load_predispatch",
@@ -77,10 +76,15 @@ class DataFiles:
     ignored: list[Path] = field(default_factory=list)
     duplicates: list[Path] = field(default_factory=list)
 
-    def describe(self) -> dict:
+    def describe(self, hashes: bool = False) -> dict:
+        """File names and sizes per role (and SHA-256 with ``hashes=True``)."""
+
         def info(p: Path) -> dict:
             st = p.stat()
-            return {"name": p.name, "size": st.st_size}
+            d = {"name": p.name, "size": st.st_size}
+            if hashes:
+                d["sha256"] = file_sha256(p)
+            return d
 
         return {
             "clearing": [info(p) for p in self.clearing],
@@ -91,6 +95,15 @@ class DataFiles:
             "ignored": [p.name for p in self.ignored],
             "duplicates": [p.name for p in self.duplicates],
         }
+
+
+def file_sha256(p: str | Path, chunk: int = 1 << 20) -> str:
+    """SHA-256 of a file, read in chunks."""
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
 
 
 def _norm_name(name: str) -> str:
@@ -104,7 +117,26 @@ def _is_csv(n: str) -> bool:
     return n.endswith(".csv") or n.endswith(".csv.gz")
 
 
-def _classify(name: str) -> str | None:
+_TRAIN_WORDS = {"train", "training"}
+_TEST_WORDS = {"test", "testing", "november"}
+
+
+def _words(s: str) -> set[str]:
+    """Whole words of a name (split on anything that is not a letter), lower case."""
+    return {w for w in re.split(r"[^a-z]+", s.lower()) if w}
+
+
+def _split(n: str) -> str | None:
+    """'train' / 'test' from whole words of a name or folder, None if neither or both."""
+    w = _words(n)
+    tr, te = bool(w & _TRAIN_WORDS), bool(w & _TEST_WORDS)
+    return "train" if tr and not te else "test" if te and not tr else None
+
+
+def _classify(name: str, folders: Sequence[str] = ()) -> str | None:
+    """Role of a file from its name; ``folders`` (the folder names between the data dir and
+    the file, outermost first) settle train vs test when the name does not. Words are
+    matched whole ('constrained' does not mean 'train')."""
     n = _norm_name(name)
     if n.startswith("~$") or n.startswith("."):
         return None
@@ -114,12 +146,17 @@ def _classify(name: str) -> str | None:
         return None
     if "offer_stack" in n:
         return "stacks"
+    split = _split(name)
+    for f in reversed(list(folders)):  # the nearest folder that says it wins
+        if split is not None:
+            break
+        split = _split(f)
     if "pre_dispatch" in n or "predispatch" in n:
-        return "predispatch_train" if "train" in n else "predispatch_test"
+        return "predispatch_train" if split == "train" else "predispatch_test"
     if "clearing" in n and "price" in n:
         # Only training clearing prices may be used. Any other clearing file (e.g. actual
         # November results added later) is ignored on purpose.
-        return "clearing" if "train" in n else "ignored"
+        return "clearing" if split == "train" else "ignored"
     return None
 
 
@@ -135,7 +172,8 @@ def find_template(data_dir: str | Path) -> Path:
     hits.sort(key=str)
     uniq = {(_norm_name(p.name), p.stat().st_size): p for p in reversed(hits)}
     if not uniq:
-        raise FileNotFoundError(f"no template workbook (*template*.xlsx) under {root}")
+        raise FileNotFoundError(f"no template workbook (*template*.xlsx) under {root}; pass --template "
+                                "with the path of EMA's BESS_Competition_Template.xlsx")
     if len(uniq) > 1:
         raise FileNotFoundError(f"more than one template workbook under {root}: {[p.name for p in hits]}; pass --template")
     return next(iter(uniq.values()))
@@ -161,7 +199,7 @@ def find_files(data_dir: str | Path) -> DataFiles:
     out = DataFiles()
     seen: dict[tuple[str, str, int], Path] = {}
     for p in found:
-        role = _classify(p.name)
+        role = _classify(p.name, p.relative_to(root).parts[:-1])
         if role is None:
             continue
         if role == "ignored":
@@ -183,10 +221,12 @@ def find_files(data_dir: str | Path) -> DataFiles:
 
     missing = [r for r in ("clearing", "predispatch_train", "stacks") if not getattr(out, r)]
     if missing:
-        raise FileNotFoundError(f"no {', '.join(missing)} file(s) found under {root}")
+        cands = [str(p.relative_to(root)) for p in found if _is_csv(_norm_name(p.name))]
+        raise FileNotFoundError(f"no {', '.join(missing)} file(s) found under {root}; CSV files seen: {cands[:12]}")
     if len(out.predispatch_test) > 1:
-        names = [p.name for p in out.predispatch_test]
-        raise FileNotFoundError(f"more than one test pre-dispatch file: {names}")
+        names = [str(p.relative_to(root)) for p in out.predispatch_test]
+        raise FileNotFoundError(f"more than one test pre-dispatch file: {names}; put 'train' or 'test' in "
+                                "the names (or folder names) to tell them apart")
     return out
 
 
@@ -298,7 +338,9 @@ def _cached(kind: str, paths: Sequence[Path], work_dir: str | Path | None, build
 
 
 def _read_csv(p: Path) -> pd.DataFrame:
-    return pd.read_csv(p, dtype=str, keep_default_na=True)
+    df = pd.read_csv(p, dtype=str, keep_default_na=True)
+    df.columns = [str(c).strip().lstrip("\ufeff").strip() for c in df.columns]
+    return df
 
 
 # --------------------------------------------------------------------------------------
@@ -575,6 +617,3 @@ def load_all(data_dir: str | Path, work_dir: str | Path | None = None) -> Datase
         stacks=load_stacks(files, work_dir),
     )
 
-
-# Re-exported for modules that need the period length.
-PERIOD_LENGTH = PERIOD

@@ -202,3 +202,33 @@ def test_copied_dates(tmp_path):
     p = write_stack_csv(tmp_path / "x_offer_stacks.csv", rows)
     s = io.load_stacks([p])
     assert io.copied_dates(s) == [pd.Timestamp("2026-06-03")]
+
+
+def test_classify_by_whole_words_and_folders(tmp_path):
+    from bessbid.io import _classify
+
+    assert _classify("training_market_clearing_prices.csv") == "clearing"
+    assert _classify("market_clearing_prices.csv") == "ignored"
+    assert _classify("market_clearing_prices.csv", ("train",)) == "clearing"
+    assert _classify("pre_dispatch_forecasts.csv", ("train",)) == "predispatch_train"
+    assert _classify("pre_dispatch_forecasts.csv", ("Training", "test")) == "predispatch_test"
+    assert _classify("pre_dispatch_forecasts.csv", ("Phase_1_Competition_Test_Dataset",)) == "predispatch_test"
+    assert _classify("pre-dispatch forecasts (constrained).csv") == "predispatch_test"
+    assert _classify("november_pre_dispatch_forecasts.csv", ("(Part 1) Training",)) == "predispatch_test"
+    assert _classify("(Part 2)training_offer_stacks_with_delay.csv") == "stacks"
+    # a generic layout: train/ and test/ folders, names without 'train'
+    for d, name in (("train", "market_clearing_prices.csv"), ("train", "pre_dispatch_forecasts.csv"),
+                    ("test", "pre_dispatch_forecasts.csv"), ("train", "offer_stacks.csv")):
+        (tmp_path / d).mkdir(exist_ok=True)
+        (tmp_path / d / name).write_text("x\n1\n")
+    f = io.find_files(tmp_path)
+    assert [p.parent.name for p in f.clearing] == ["train"]
+    assert [p.parent.name for p in f.predispatch_train] == ["train"]
+    assert [p.parent.name for p in f.predispatch_test] == ["test"]
+
+
+def test_csv_header_whitespace_is_stripped(tmp_path):
+    p = tmp_path / "x.csv"
+    p.write_text("\ufeffts , period,  energy_price_sgd_mwh\n2026-07-01 00:00,1,100\n", encoding="utf-8")
+    df = io._read_csv(p)
+    assert list(df.columns) == ["ts", "period", "energy_price_sgd_mwh"]

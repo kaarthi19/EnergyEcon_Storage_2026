@@ -1,0 +1,4 @@
+# Optional: the figure scripts in plots/ (not needed to generate the bids).
+# Install after requirements.txt:  pip install -r requirements-figures.txt
+matplotlib==3.11.2; python_version >= "3.12"
+matplotlib==3.10.9; python_version < "3.12"

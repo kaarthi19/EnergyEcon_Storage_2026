@@ -13,9 +13,14 @@ from bessbid.planner import (
     NEG,
     action_values,
     dp_backward,
+    dp_backward_ramp,
     dp_forward,
+    dp_forward_ramp,
     dp_plan,
     make_action_grid,
+    ramp_active,
+    ramp_ok,
+    soften_end_values,
     terminal_values,
 )
 from bessbid.soc import (
@@ -183,3 +188,72 @@ def test_dp_infeasible_terminal_raises():
     F = np.zeros((2, g.n_actions))
     with pytest.raises(RuntimeError):
         dp_plan(F, g, g.state_of(7.0), None, terminal_values(g, 50.0))
+
+
+# ---- ramp-limited programme ------------------------------------------------------------
+def _brute_ramp(F, g, s0, a0, allowed, V_end, ramp):
+    best = NEG
+    ok = ramp_ok(g, ramp)
+    for seq in itertools.product(range(g.n_actions), repeat=F.shape[0]):
+        s, ap, v = s0, a0, 0.0
+        for t, a in enumerate(seq):
+            if not allowed[t, a] or not ok[ap, a]:
+                v = NEG
+                break
+            s += g.steps[a]
+            if not 0 <= s < g.n_states:
+                v = NEG
+                break
+            v += F[t, a]
+            ap = a
+        if v > NEG / 2 and V_end[s] > NEG / 2:
+            best = max(best, v + V_end[s])
+    return best
+
+
+def test_ramp_dp_without_limit_equals_plain_dp():
+    g = make_action_grid(CFG, max_charge_mw=50, max_discharge_mw=100)
+    F = np.random.default_rng(0).normal(0, 100, (30, g.n_actions))
+    V_end = terminal_values(g, 50.0)
+    V0, p0 = dp_backward(F, g, None, V_end)
+    V1, p1 = dp_backward_ramp(F, g, None, V_end, ramp_mw=None)
+    for t in (0, 10, 30):
+        assert np.array_equal(V1[t][:, 0], V0[t])
+    assert np.array_equal(p1[:, :, 0], p0)
+    assert not ramp_active(0.0, CFG) and not ramp_active(200.0, CFG) and ramp_active(42.0, CFG)
+
+
+def test_ramp_dp_matches_brute_force_and_limits_steps():
+    cfg = CFG.replace(soc_margin_mwh=30.0)  # Y in [35, 65]
+    g = make_action_grid(cfg, max_charge_mw=12, max_discharge_mw=12, y_step=2.0)
+    assert g.n_actions >= 5
+    rng = np.random.default_rng(7)
+    ramp = 9.0
+    for _ in range(4):
+        F = rng.normal(0, 10, (4, g.n_actions))
+        allowed = rng.random((4, g.n_actions)) > 0.2
+        allowed[:, 0] = True
+        V_end = terminal_values(g, 50.0)
+        s0 = g.nearest_state(50.0)
+        V, pol = dp_backward_ramp(F, g, allowed, V_end, ramp)
+        assert V[0][s0, 0] == pytest.approx(_brute_ramp(F, g, s0, 0, allowed, V_end, ramp))
+        acts, states = dp_forward_ramp(pol, g, s0, 0)
+        mw = np.concatenate([[0.0], g.mw[acts]])
+        assert np.abs(np.diff(mw)).max() <= ramp + 1e-9
+        assert sum(F[t, a] for t, a in enumerate(acts)) == pytest.approx(V[0][s0, 0])
+    # keep / policy options
+    Vk, pk = dp_backward_ramp(F, g, allowed, V_end, ramp, keep=[0, 2], policy=False)
+    assert set(Vk) == {0, 2} and pk is None and np.array_equal(Vk[0], V[0])
+
+
+def test_soften_end_values_reaches_nearest_state():
+    g = make_action_grid(CFG, max_charge_mw=2, max_discharge_mw=2)
+    F = np.zeros((2, g.n_actions))
+    V_end = terminal_values(g, 50.0)
+    s0 = g.state_of(7.0)
+    soft = soften_end_values(V_end, g)
+    assert (soft > NEG / 2).all() and np.array_equal(soft[V_end > NEG / 2], V_end[V_end > NEG / 2])
+    acts, states, _ = dp_plan(F, g, s0, None, soft)
+    assert g.y[states[-1]] == pytest.approx(7.0 + 2 * 2 * 0.5)  # charged as much as possible
+    soft2 = soften_end_values(np.repeat(V_end[:, None], g.n_actions, 1), g)
+    assert soft2.shape == (g.n_states, g.n_actions) and (soft2 > NEG / 2).all()

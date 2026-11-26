@@ -29,7 +29,7 @@ def perturb_predispatch(p: pd.DataFrame | None, t) -> pd.DataFrame | None:
     p.loc[m, "forecast_load_mw"] += 333.0
     p.loc[m, "forecast_solar_mw"] *= 1.5
     p.loc[m, "known_outage_mw_at_issue"] += 444.0
-    a = ((p["ts"] + PERIOD) > t).to_numpy()
+    a = ((p["ts"] + PERIOD) >= t).to_numpy()  # not ended before t (strict rule)
     for c in ("synthetic_actual_load_mw", "synthetic_actual_solar_mw"):
         if c in p.columns:
             p.loc[a, c] = p.loc[a, c] * 1.2 + 77.0
@@ -39,7 +39,7 @@ def perturb_predispatch(p: pd.DataFrame | None, t) -> pd.DataFrame | None:
 def perturb_clearing(c: pd.DataFrame, t) -> pd.DataFrame:
     """Clearing rows whose period has not ended by t change (prices, demand, requirements)."""
     c = c.copy()
-    m = ((c["ts"] + PERIOD) > t).to_numpy()
+    m = ((c["ts"] + PERIOD) >= t).to_numpy()  # not ended before t (strict rule)
     for col in c.columns:
         if col in ("ts", "period"):
             continue

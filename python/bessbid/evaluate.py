@@ -12,12 +12,14 @@ by :func:`bessbid.backtest.simulate` in
 
 under every efficiency convention, against two baselines:
 
-* ``regulation``: 100 MW of Regulation at 0.00 in every period (the fallback strategy);
+* ``regulation``: 100 MW of Regulation at the AS floor price (``cfg.as_floor_price``) in every
+  period (the fallback strategy);
 * ``pf_cap50`` / ``pf_cap100``: a perfect-foresight bound. The *actual* stacks and net
   demand of each period are cleared with our offer at the planner's ladder of energy levels
   (price impact included, baseline ramp state), and the same SOC programme picks the best
   always-clearing schedule with hindsight, under the same SOC, capacity and terminal rules
-  (energy capped at 50 or 100 MW). It uses future information and is only a yardstick.
+  (energy capped at 50 or 100 MW) and the same BESS ramp limit (``cfg.bess_ramp_mw``). It
+  uses future information and is only a yardstick.
 
 The output is a tidy frame with one row per (policy, month, mode, convention) plus ``ALL``
 rows (sums over the months; ``revenue_per_30d`` and ``uplift_per_30d`` scale by the total
@@ -37,8 +39,9 @@ from .bids import PeriodBid, energy_fixed, regulation_only, to_table
 from .config import Config
 from .engine import BessOffer, ClearingEngine
 from .periods import month_slots
-from .planner import LEVELS, action_values, dp_plan, make_action_grid, terminal_values
-from .soc import check_soc, y_terminal_min
+from .planner import (LEVELS, NEG, action_values, dp_backward_ramp, dp_forward_ramp, dp_plan, make_action_grid,
+                      ramp_active, terminal_values)
+from .soc import y_terminal_min
 
 __all__ = ["perfect_foresight_plan", "evaluate", "summarize", "CONVENTIONS"]
 
@@ -61,7 +64,8 @@ def _offer(x: float, cfg: Config) -> BessOffer:
 
 def perfect_foresight_plan(month: str, data: MarketData, cfg: Config | None = None, cap_mw: float = 50.0,
                            levels=LEVELS, engine: ClearingEngine | None = None,
-                           y_step: float = 0.5, charge_step_mw: float = 2.0) -> tuple[list[PeriodBid], float]:
+                           y_step: float = 0.5, charge_step_mw: float = 2.0,
+                           ramp_mw: float | None = None) -> tuple[list[PeriodBid], float]:
     """Hindsight-optimal always-clearing schedule for a training month (a bound, not a
     strategy). Returns (bids, value the programme expected)."""
     cfg = cfg or Config()
@@ -90,8 +94,18 @@ def perfect_foresight_plan(month: str, data: MarketData, cfg: Config | None = No
     grid = make_action_grid(cfg, max_charge_mw=cap_mw, max_discharge_mw=cap_mw, y_step=y_step,
                             charge_step_mw=charge_step_mw)
     F = action_values(E, R, lv, grid.mw, cfg)
-    acts, _, val = dp_plan(F, grid, grid.state_of(cfg.initial_soc_mwh), None,
-                           terminal_values(grid, y_terminal_min(cfg)))
+    ramp = cfg.bess_ramp_mw if ramp_mw is None else ramp_mw
+    s0 = grid.state_of(cfg.initial_soc_mwh)
+    V_end = terminal_values(grid, y_terminal_min(cfg))
+    if ramp_active(ramp, cfg):
+        zero = int(np.where(grid.mw == 0)[0][0])
+        V, pol = dp_backward_ramp(F, grid, None, V_end, ramp, keep=[0])
+        val = float(V[0][s0, zero])
+        if val <= NEG / 2:
+            raise RuntimeError("no feasible perfect-foresight plan")
+        acts, _ = dp_forward_ramp(pol, grid, s0, zero)
+    else:
+        acts, _, val = dp_plan(F, grid, s0, None, V_end)
     mw = grid.mw[acts]
     bids = [energy_fixed(s.date, s.period, float(x), cfg, regulation_mw="fill", tag="pf") if x != 0
             else regulation_only(s.date, s.period, cfg, tag="pf") for s, x in zip(slots, mw)]
@@ -139,6 +153,7 @@ def evaluate(ds, cfg: Config | None = None, months: Sequence[str] = PSEUDO_MONTH
                 s = simulate(tb, m, md, mode=mode, convention=cv, cfg=mcfg, engine=eng).summary
                 r = _row("full", m, s, cv, mcfg)
                 r["generate_s"] = gen_s
+                r["max_ramp_mw"] = pinfo.get("max_ramp_mw")
                 rows.append(r)
         for cap in perfect_foresight:
             pb, _ = perfect_foresight_plan(m, md, mcfg, cap_mw=cap)
@@ -170,12 +185,8 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         d["months_positive"] = int((g["uplift"] > 0).sum())
         if "generate_s" in g:
             d["generate_s"] = g["generate_s"].sum()
+        if "max_ramp_mw" in g:
+            d["max_ramp_mw"] = g["max_ramp_mw"].max()
         agg.append(d)
     return pd.concat([df, pd.DataFrame(agg)], ignore_index=True)
 
-
-def check_plan_soc(frame: pd.DataFrame, cfg: Config) -> dict:
-    """SOC check of a plan frame's energy column under every convention."""
-    mw = frame["energy_mw"].to_numpy(float)
-    return check_soc(np.clip(mw, 0, None), np.clip(-mw, 0, None), cfg,
-                     terminal_mwh=cfg.terminal_soc_frac * cfg.energy_mwh).to_dict()

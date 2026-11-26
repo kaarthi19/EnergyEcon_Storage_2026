@@ -23,7 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -197,6 +197,7 @@ def offered_capacity(pb: PeriodBid, rule: str = "strict") -> float:
 
 
 def check_capacity(pb: PeriodBid, cfg: Config) -> None:
+    """Eq. (12) of ``docs/formulation.md``: offered MW within the rating (per ``capacity_rule``)."""
     tot = offered_capacity(pb, cfg.capacity_rule)
     if tot > cfg.power_mw + 1e-9:
         raise BidError(

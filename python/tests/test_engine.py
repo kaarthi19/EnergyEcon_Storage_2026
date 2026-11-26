@@ -11,6 +11,7 @@ from bessbid.config import Config
 from bessbid.engine import (
     BessOffer,
     ClearingEngine,
+    EngineError,
     PeriodStack,
     StackArrays,
     clear,
@@ -328,3 +329,26 @@ def test_taker_joint_limits_by_margin():
     off = BessOffer.from_period_bid(energy_fixed("2026-10-01", 30, 40, Config()))
     a = price_taker_clear(off, PR).awards
     assert a["dis"] == pytest.approx(40.0) and a["R"] == pytest.approx(60.0)
+
+
+@pytest.mark.parametrize("warm", [True, False])
+def test_non_finite_inputs_raise(warm):
+    """NaN inputs must never silently reuse the previous period's bounds."""
+    rng = np.random.default_rng(11)
+    st = rand_stack(rng)
+    eng = ClearingEngine(Config(), warm_start=warm)
+    eng.clear(st, 500.0, (50, 100, 40))
+    with pytest.raises(EngineError, match="net_demand"):
+        eng.clear(st, float("nan"), (50, 100, 40))
+    with pytest.raises(EngineError, match="requirements"):
+        eng.clear(st, 500.0, (np.nan, 100, 40))
+    bad = PeriodStack(*[a.copy() for a in (st.e_q, st.e_p, st.p_q, st.p_p, st.c_q, st.c_p, st.r_q, st.r_p, st.av)])
+    bad.e_p[0, 0] = np.nan
+    with pytest.raises(EngineError, match="stack.e_p"):
+        eng.clear(bad, 500.0, (50, 100, 40))
+    with pytest.raises(EngineError, match="bess.regulation"):
+        eng.clear(st, 500.0, (50, 100, 40), None, BessOffer(regulation=((np.nan, 10.0),)))
+    with pytest.raises(EngineError, match="prev"):
+        eng.clear(st, 500.0, (50, 100, 40), np.full(st.av.shape, np.nan))
+    r = eng.clear(st, 500.0, (50, 100, 40))  # still usable afterwards
+    assert np.isfinite(r.E)

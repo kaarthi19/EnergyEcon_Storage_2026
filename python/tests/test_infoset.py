@@ -65,7 +65,7 @@ def test_predispatch_known_at_masks_actuals(info):
     t = T("2026-07-01 06:00")
     k = info.predispatch_known_at(t)
     assert (k["issue_time"] <= t).all()
-    ended = (k["ts"] + pd.Timedelta(minutes=30)) <= t
+    ended = (k["ts"] + pd.Timedelta(minutes=30)) < t  # strict: ended before t
     assert k.loc[ended, "synthetic_actual_load_mw"].notna().all()
     assert k.loc[~ended, "synthetic_actual_load_mw"].isna().all()
     assert (~ended).any()
@@ -96,7 +96,9 @@ def test_stack_pub_rules(tmp_path):
 
 def test_clearing_known_at(info):
     c = info.clearing_known_at(T("2026-07-01 10:00"))
-    assert c["ts"].max() == T("2026-07-01 09:30") and len(c) == 20
+    # strict: the 09:30-10:00 period ends exactly at the decision time and is not used
+    assert c["ts"].max() == T("2026-07-01 09:00") and len(c) == 19
+    assert len(info.clearing_known_at(T("2026-07-01 10:00:01"))) == 20
     assert len(info.clearing_for(T("2026-07-01 12:00"))) == 21  # cut 10:55 -> through 10:00-10:30
 
 

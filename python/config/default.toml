@@ -1,0 +1,95 @@
+# bessbid configuration: every key with its default value.
+#
+# Pass a copy with changes as `--config FILE.toml` to `python -m bessbid generate | validate |
+# backtest | evaluate`. Keys left out keep their defaults, so an override file only needs
+# the keys it changes. Table names ([bess], [offers], ...) are for reading only and are
+# ignored, except the reserved [strategy.<name>] tables, which hold the parameters of the
+# strategy registered as <name>. Unknown keys are errors.
+#
+# Running with this file unchanged gives exactly the same bids and the same workbook bytes
+# as running without --config (tested in tests/test_config_periods.py).
+# Units: MW, MWh, S$/MWh, minutes, hours (docs/units.md).
+
+[bess]
+# EMA's hypothetical BESS (template "Assumptions" sheet).
+power_mw = 100.0                 # rated power, charge and discharge (MW)
+energy_mwh = 100.0               # energy capacity (MWh)
+soc_min_frac = 0.05              # lowest allowed SOC (fraction of energy_mwh)
+soc_max_frac = 0.95              # highest allowed SOC
+round_trip_eff = 0.85            # round-trip efficiency
+initial_soc_frac = 0.5           # SOC at the start of period 1 of the month
+period_hours = 0.5               # trading period length (h)
+# (eta_charge, eta_discharge) pairs the plan must stay feasible under; EMA has not said how
+# the loss is split. Each pair must multiply to round_trip_eff (change both together).
+efficiency_conventions = [[1.0, 0.85], [0.9219544457292888, 0.9219544457292888], [0.85, 1.0]]
+soc_margin_mwh = 2.0             # SOC safety margin kept inside [soc_min, soc_max] by the planner (MWh)
+terminal_soc_frac = 0.5          # minimum SOC at the end of the month, under every convention
+
+[offers]
+discharge_floor_price = 0.01     # price of an always-clearing discharge band (S$/MWh)
+charge_cap_price = 3000.0        # price of an always-clearing charge band (S$/MWh)
+as_floor_price = 0.01            # price of an always-clearing reserve/regulation band (S$/MWh)
+offer_price_min = -4500.0        # lowest offer price the validator accepts (S$/MWh)
+offer_price_max = 4500.0         # highest offer price the validator accepts (S$/MWh)
+
+[rules]
+# "strict": sum |energy band MW| + sum of all AS band MW <= power_mw in every period.
+# "max_side": max(total charge MW, total discharge MW) + sum AS MW <= power_mw.
+capacity_rule = "strict"
+mw_resolution = 0.1              # MW are rounded toward zero to this step
+max_energy_bands = 10            # template limit for Energy
+max_as_bands = 5                 # template limit per AS product
+strict_ascending = true          # prices strictly increase within a row
+
+[information]
+gate_closure_min = 65            # data for a period starting at T must be available by T - 65 min
+# When an offer-stack row becomes usable: "column" (assumed_publication_time_sgt),
+# "ts_plus_28d" (period time + 28 days) or "latest" (the later of the two).
+stack_pub_rule = "column"
+predispatch_leads = [2.0, 3.0]   # leads (h) of period T's own pre-dispatch rows, in order of preference
+strict_predispatch = true        # use only T's own rows (strict reading of the rules)
+stack_fit_start = "2026-07-01"   # stack rows before this date (a copy of July) are not fitted
+
+[market]
+# Constants of the replicated clearing engine (docs/formulation.md).
+shortfall_price_primary = 750.0        # S$/MWh
+shortfall_price_contingency = 1000.0   # S$/MWh
+shortfall_price_regulation = 1200.0    # S$/MWh
+voll = 4500.0                          # value of lost load (S$/MWh; assumption, never reached in training)
+ramp_up_frac = 0.42                    # generator ramp-up per period, fraction of available MW
+bess_ramp_mw = 42.0                    # largest change of the BESS energy schedule per period (MW); 0 = no limit
+
+[run]
+month = "2026-11"                         # month to bid (YYYY-MM); --month overrides
+fixed_timestamp = "2026-11-01T00:00:00"   # workbook created/modified time (keeps output bytes fixed)
+
+[strategy.full]
+# Parameters of the main strategy (bessbid.strategy_full.FullParams).
+charge_cap_mw = 50.0             # largest charge (MW); charging is banned inside event windows
+discharge_cap_mw = 50.0          # largest discharge outside event windows (MW)
+event_discharge_cap_mw = 100.0   # largest discharge inside event windows (MW)
+no_charge_in_events = true       # ban charging inside calendar event windows
+guard_margin_mw = 300.0          # ban/cancel charging when the forecast capacity margin is below this (MW)
+guard_price = 400.0              # cancel a planned charge if the lead-2 h energy forecast exceeds this (S$/MWh)
+# "none": day-ahead plan only; "guard": lead-2 h guards at each period's gate;
+# "lead2": guards plus a one-step re-optimisation on lead-2 h values (lost money in backtests).
+refine = "guard"
+lead2_scope = "all"              # where "lead2" applies: "all" periods or only "events"
+hurdle_per_mwh = 0.0             # cost per MWh of energy throughput in the planner (S$/MWh)
+use_nodes = true                 # average forecast prices over the net-demand error nodes
+y_step = 0.5                     # SOC planning grid (MWh)
+charge_step_mw = 2.0             # charge MW granularity
+plan_lead_days = 1               # fit the forecaster at 00:00 this many days before the month
+plan_time = "midnight"           # day D's plan: "midnight" = 00:00 of D-1; "gate" = gate of D's first period
+# Signed energy levels (MW, + = discharge) at which the forecast market is cleared with our offer.
+levels = [-100.0, -75.0, -50.0, -35.0, -20.0, -10.0, 0.0, 10.0, 20.0, 35.0, 50.0, 75.0, 100.0]
+price_impact = true              # value actions with our own price impact
+# Keys whose default is "not set" (TOML has no null); uncomment to set them:
+# regulation_price = 0.01        # Regulation band price (S$/MWh); default: as_floor_price
+# ramp_mw = 42.0                 # ramp limit for this strategy (MW); default: bess_ramp_mw; 0 = no limit
+
+[strategy.regulation]
+# The Regulation-only fallback (bessbid.strategy_regulation.RegulationOnlyStrategy) has two
+# optional keys, both "not set" by default; uncomment to set them:
+# mw = 100.0                     # Regulation MW offered; default: power_mw
+# price = 0.01                   # offer price (S$/MWh); default: as_floor_price

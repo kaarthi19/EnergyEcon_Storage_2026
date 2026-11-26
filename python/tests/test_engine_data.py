@@ -13,7 +13,7 @@ from bessbid import io
 from bessbid.backtest import MarketData, simulate
 from bessbid.bids import energy_fixed, regulation_only, to_table
 from bessbid.config import Config
-from bessbid.engine import ClearingEngine, StackArrays, replicate
+from bessbid.engine import ClearingEngine, replicate
 from bessbid.periods import month_slots
 
 pytestmark = pytest.mark.data

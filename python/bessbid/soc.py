@@ -55,7 +55,7 @@ def net_stored(dis, chg, cfg: Config) -> np.ndarray:
     """N_t (MWh, end of each period) for discharge/charge MW arrays."""
     dis = np.asarray(dis, float)
     chg = np.asarray(chg, float)
-    return np.cumsum(cfg.period_hours * (chg - dis / cfg.round_trip_eff))
+    return np.cumsum(cfg.period_hours * (chg - dis / cfg.round_trip_eff))  # N_t of Eq. (15)
 
 
 def soc_paths(dis, chg, cfg: Config, s0: float | None = None) -> dict[tuple[float, float], np.ndarray]:
@@ -64,20 +64,20 @@ def soc_paths(dis, chg, cfg: Config, s0: float | None = None) -> dict[tuple[floa
     h = cfg.period_hours
     out = {}
     for ec, ed in cfg.efficiency_conventions:
-        out[(ec, ed)] = s0 + np.cumsum(h * (ec * np.asarray(chg, float) - np.asarray(dis, float) / ed))
+        out[(ec, ed)] = s0 + np.cumsum(h * (ec * np.asarray(chg, float) - np.asarray(dis, float) / ed))  # Eq. (14)
     return out
 
 
 def binding_soc(dis, chg, cfg: Config, s0: float | None = None) -> np.ndarray:
     """Y_t = s0 + eta_c_max * N_t: the SOC path that decides feasibility for all conventions."""
     s0 = cfg.initial_soc_mwh if s0 is None else s0
-    return s0 + eta_c_range(cfg)[1] * net_stored(dis, chg, cfg)
+    return s0 + eta_c_range(cfg)[1] * net_stored(dis, chg, cfg)  # Eq. (15)
 
 
 def y_bounds(cfg: Config, margin: float | None = None) -> tuple[float, float]:
     """Allowed range of Y with the planning margin."""
     m = cfg.soc_margin_mwh if margin is None else margin
-    return cfg.soc_min_mwh + m, cfg.soc_max_mwh - m
+    return cfg.soc_min_mwh + m, cfg.soc_max_mwh - m  # Eq. (16)
 
 
 def y_terminal_min(cfg: Config, target_mwh: float | None = None, s0: float | None = None) -> float:
@@ -85,7 +85,7 @@ def y_terminal_min(cfg: Config, target_mwh: float | None = None, s0: float | Non
     s0 = cfg.initial_soc_mwh if s0 is None else s0
     tgt = cfg.terminal_soc_frac * cfg.energy_mwh if target_mwh is None else target_mwh
     lo, hi = eta_c_range(cfg)
-    if tgt <= s0:
+    if tgt <= s0:  # Eq. (20)
         return tgt  # N < 0 is binding at eta_c_max, i.e. Y itself
     return s0 + (tgt - s0) * hi / lo  # N > 0: the smallest SOC uses eta_c_min
 

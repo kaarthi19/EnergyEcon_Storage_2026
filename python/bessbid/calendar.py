@@ -105,12 +105,6 @@ class EventCalendar:
                 return c
         raise KeyError(name)
 
-    def event_flags(self, T) -> dict[str, np.ndarray] | dict[str, bool]:
-        """Per cycle: is an event active in the period starting at T? Scalar T gives bools."""
-        scalar = np.ndim(T) == 0 and not isinstance(T, (pd.DatetimeIndex, np.ndarray))
-        out = {c.name: c.active(T) for c in self.cycles}
-        return {k: bool(v[0]) for k, v in out.items()} if scalar else out
-
     def n_events(self, T) -> np.ndarray:
         return np.sum([c.active(T) for c in self.cycles], axis=0) if self.cycles else np.zeros(len(_as_ns(T)), int)
 
