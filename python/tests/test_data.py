@@ -115,5 +115,5 @@ def test_generate_regulation_on_real_template(data_dir, tmp_path):
     back = read_back(out)
     assert len(back) == 5760
     reg = back[back["product"] == "Regulation"]
-    assert (reg["price_1"] == 0).all() and (reg["quantity_1"] == 100).all()
+    assert (reg["price_1"] == Config().as_floor_price).all() and (reg["quantity_1"] == 100).all()
     assert back.loc[back["product"] != "Regulation", [f"quantity_{i}" for i in range(1, 11)]].isna().all().all()
