@@ -15,7 +15,9 @@ Layers
 2. **Events.** The same programme covers the 19-day stress event: the month-ahead values
    (one decision at the first period's gate) see the calendar's event days, so the
    continuation value makes the battery arrive full; inside event windows discharge may go
-   up to 100 MW and charging is banned.
+   up to 100 MW and charging is banned. An optional exception (``event_recharge``, off by
+   default) lifts the ban in cheap night periods of the 19-day windows, so the battery can
+   refill for the second surge morning; it lost money in Sep and Oct (docs/strategy.md).
 3. **Guards at each period's gate.** At ``T - 65 min`` the lead-2 h forecast of T (T's own
    pre-dispatch vintage) may cancel a planned charge when the forecast margin is thin, a
    reserve shortfall or an energy spike is forecast. The policy of the day's programme is
@@ -73,7 +75,7 @@ __all__ = ["FullParams", "FullStrategy", "plan_month"]
 
 @dataclass(frozen=True)
 class FullParams:
-    #: largest charge MW outside events (charging is banned inside events)
+    #: largest charge MW (charging is banned inside events unless ``event_recharge`` allows it)
     charge_cap_mw: float = 50.0
     #: largest discharge MW outside event windows
     discharge_cap_mw: float = 50.0
@@ -81,6 +83,20 @@ class FullParams:
     event_discharge_cap_mw: float = 100.0
     #: ban charging in calendar event windows
     no_charge_in_events: bool = True
+    #: exception to that ban: 'none'; 'overnight': charging is allowed in the night hours of
+    #: the 19-day stress-cycle windows (the cycle that carries the surge window), unless an
+    #: 11-day window overlaps; 'overnight_all': in the night hours of every event window.
+    #: Only in periods whose forecast energy price (x = 0, the plan's own ladder) is at most
+    #: ``event_recharge_max_price``; the margin ban and the lead-2 h guard still apply.
+    event_recharge: str = "none"
+    #: night hours [start, end) of the exception, by period start time (h, 0-24; wraps)
+    event_recharge_hours: tuple = (0.0, 7.0)
+    #: largest forecast energy price (S$/MWh) of a period in which the exception applies; the
+    #: lead-2 h guard also cancels such a charge above this price
+    event_recharge_max_price: float = 350.0
+    #: extra cost (S$/MWh charged) of a charge allowed by the exception, for the forecast's
+    #: low bias on stress nights (actual minus day-ahead forecast: median +55 to +87 in Aug-Oct)
+    event_recharge_hurdle: float = 0.0
     #: ban charging when the forecast capacity margin is below this (MW)
     guard_margin_mw: float = 300.0
     #: lead-2 h guard: cancel a planned charge if the lead-2 h energy forecast exceeds this
@@ -123,6 +139,13 @@ class FullParams:
             raise ValueError("plan_time must be 'midnight' or 'gate'")
         if self.ramp_mw is not None and self.ramp_mw < 0:
             raise ValueError("ramp_mw must be >= 0 (0 = no limit)")
+        if self.event_recharge not in ("none", "overnight", "overnight_all"):
+            raise ValueError("event_recharge must be 'none', 'overnight' or 'overnight_all'")
+        if self.event_recharge_hurdle < 0:
+            raise ValueError("event_recharge_hurdle must be >= 0")
+        h = tuple(self.event_recharge_hours)
+        if len(h) != 2 or not all(0.0 <= float(x) <= 24.0 for x in h):
+            raise ValueError("event_recharge_hours must be [start, end] with hours in 0..24")
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> "FullParams":
@@ -138,14 +161,46 @@ def _event_masks(cal, Ts: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
     return ev, surge
 
 
-def _allowed(grid, ev: np.ndarray, margin: np.ndarray | None, p: FullParams) -> np.ndarray:
+def _recharge_mask(cal, Ts: pd.DatetimeIndex, p: FullParams) -> np.ndarray:
+    """Periods in which the event charging ban may be lifted (``event_recharge``): inside
+    an event window of an eligible cycle and inside the night hours. The price condition
+    is applied per plan in :func:`_allowed`. Uses only the calendar learned at the fit cut."""
+    n = len(Ts)
+    if p.event_recharge == "none" or not cal.cycles:
+        return np.zeros(n, bool)
+    hod = np.asarray(Ts.hour + Ts.minute / 60.0, float)
+    lo, hi = (float(x) for x in p.event_recharge_hours)
+    night = ((hod >= lo) & (hod < hi)) if lo <= hi else ((hod >= lo) | (hod < hi))
+    t = Ts.to_numpy(dtype="datetime64[ns]")
+    if p.event_recharge == "overnight_all":
+        cyc = np.asarray(cal.in_event(t), bool)
+    else:  # 'overnight': the stress cycle only, and no other event at the same time
+        stress = cal.surge.cycle if cal.surge is not None else None
+        if stress is None:
+            return np.zeros(n, bool)
+        cyc = np.asarray(cal.cycle(stress).active(t), bool)
+        for c in cal.cycles:
+            if c.name != stress:
+                cyc &= ~np.asarray(c.active(t), bool)
+    return night & cyc
+
+
+def _allowed(grid, ev: np.ndarray, margin: np.ndarray | None, p: FullParams,
+             rech: np.ndarray | None = None, price0: np.ndarray | None = None) -> np.ndarray:
+    """Allowed actions per period. ``rech``: periods eligible for the event-recharge
+    exception (:func:`_recharge_mask`); ``price0``: the plan's forecast energy price at x = 0
+    for the same periods (the exception needs it at most ``event_recharge_max_price``)."""
     mw = grid.mw
     n = len(ev)
     A = np.ones((n, grid.n_actions), bool)
     chg = mw < 0
     A[:, chg] = (-mw[chg] <= p.charge_cap_mw + 1e-9)[None, :]  # Eq. (18): charge cap
     if p.no_charge_in_events:
-        A[np.ix_(ev, chg)] = False  # Eq. (19): no charging in event windows
+        ban = np.asarray(ev, bool).copy()
+        if rech is not None and price0 is not None:
+            # Eq. (19a): overnight recharge exception in cheap night periods
+            ban &= ~(np.asarray(rech, bool) & (np.asarray(price0, float) <= p.event_recharge_max_price))
+        A[np.ix_(ban, chg)] = False  # Eq. (19): no charging in event windows
     if margin is not None and p.guard_margin_mw is not None:
         A[np.ix_(np.asarray(margin) < p.guard_margin_mw, chg)] = False  # Eq. (19): thin margin
     dis = mw > 0
@@ -199,8 +254,15 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         flat = {k: np.repeat(lad[k][:, [x0]], len(vm.levels), axis=1) for k in ("E", "R")}
         return vm.values(flat, grid) - hurdle
     ev, surge = _event_masks(fc.calendar, Ts)
+    rech = _recharge_mask(fc.calendar, Ts, p) & ev
     nodes_da = fc.nd.nodes_da if p.use_nodes else None
     nodes_l2 = fc.nd.nodes_lead if p.use_nodes else None
+    chg_mwh = cfg.period_hours * np.clip(-grid.mw, 0, None)
+
+    def rech_cost(mask):
+        """Eq. (13a): hurdle on charging in exception periods (rows of ``mask``)."""
+        return p.event_recharge_hurdle * np.asarray(mask, float)[:, None] * chg_mwh[None, :]
+
     y_term = y_terminal_min(cfg)  # Eq. (20)
     V_term = terminal_values(grid, y_term)
 
@@ -210,8 +272,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     lad_ma = cached("lad_ma", lambda: vm.ladder(Ts, dec0, inp0["nd"].to_numpy(), inp0["outage"].to_numpy(),
                                                  kind="month_ahead", nodes=nodes_da,
                                                  inputs_time=inp0["input_time"].to_numpy()))
-    F_ma = values(lad_ma)
-    A_ma = _allowed(grid, ev, lad_ma["margin"], p)
+    F_ma = values(lad_ma) - rech_cost(rech)
+    A_ma = _allowed(grid, ev, lad_ma["margin"], p, rech, lad_ma["E"][:, x0])
     days = sorted(set(Ts.normalize()))
     day_idx = [np.where(Ts.normalize() == D)[0] for D in days]
     if use_ramp:
@@ -236,7 +298,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 inputs_time=pd.to_datetime(l2["issue_time"]).to_numpy()[il2]))
             F_l2 = np.full((n, grid.n_actions), np.nan)
             if len(il2):
-                F_l2[il2] = values(lad_l2)
+                F_l2[il2] = values(lad_l2) - rech_cost(rech[il2])
         if progress:
             progress(f"lead-2h forecasts done ({time.perf_counter() - t0:.1f}s)")
 
@@ -272,8 +334,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         lad = cached(("lad_da", D), lambda: vm.ladder(TD, dec, inp["nd"].to_numpy(), inp["outage"].to_numpy(),
                                                        kind="day_ahead", nodes=nodes_da,
                                                        inputs_time=inp["input_time"].to_numpy()))
-        F = values(lad)
-        A = _allowed(grid, ev[idx], lad["margin"], p)
+        F = values(lad) - rech_cost(rech[idx])
+        A = _allowed(grid, ev[idx], lad["margin"], p, rech[idx], lad["E"][:, x0])
         V_end = V_ma[idx[-1] + 1]  # Eq. (22): month-ahead continuation value
 
         def solve(V_end):
@@ -304,7 +366,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 r = l2.loc[Ts[i]]
                 margin_l2 = float(np.sum(fc.stacks.nom)) - float(r.nd_eff) - float(r.req_P + r.req_C + r.req_R)
                 short = float(r.sP + r.sC + r.sR)
-                if margin_l2 < p.guard_margin_mw or float(r.E) > p.guard_price or short > 1e-6:
+                gp = min(p.guard_price, p.event_recharge_max_price) if (ev[i] and rech[i]) else p.guard_price
+                if margin_l2 < p.guard_margin_mw or float(r.E) > gp or short > 1e-6:
                     # cancel the charge, or cut it as far as the ramp limit and the month-end
                     # SOC target still allow (the least charging such action)
                     # Eq. (23)
@@ -365,6 +428,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     frame["source"] = tag
     frame["event"] = ev
     frame["surge"] = surge
+    frame["event_recharge_ok"] = rech
     frame["soc_binding"] = Y
     for conv, path in soc_paths(dis, chg, cfg).items():
         frame[f"soc_c{conv[0]:.4f}_d{conv[1]:.4f}"] = path
@@ -385,6 +449,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         "discharge_mwh": float(dis.sum() * cfg.period_hours),
         "charge_mwh": float(chg.sum() * cfg.period_hours),
         "guarded_periods": int((tag == "guard").sum()),
+        "event_charge_periods": int(((mw < 0) & ev).sum()),
+        "event_charge_mwh": float(chg[ev].sum() * cfg.period_hours),
         "guard_blocked_periods": int((tag == "guard_blocked").sum()),
         "ramp_mw": float(ramp) if use_ramp else None,
         "max_ramp_mw": float(steps_mw.max()),

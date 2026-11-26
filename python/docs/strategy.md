@@ -36,7 +36,9 @@ from EMA. The quantities come from a dynamic programme over SOC (`planner.py`):
   then (Y, previous action) (`planner.dp_backward_ramp`). `bess_ramp_mw = 0` in the config
   file switches the limit off. Cost: see the results below.
 - Bans: no charging inside 11-day or 19-day event windows, or when the day-ahead forecast
-  capacity margin is below 300 MW.
+  capacity margin is below 300 MW. An overnight exception for the 19-day windows exists as
+  an option (`event_recharge`) but is off: it lost money in Sep and Oct (see "Overnight
+  recharge inside events" below).
 - SOC: the programme's state is the *binding* SOC `Y = s0 + eta_c_max x N`, where `N` is
   the grid-side net energy stored. For any convention, SOC = s0 + eta_c x N, so keeping Y
   in [5 % + margin, 95 % - margin] keeps the SOC inside the limits under **every**
@@ -171,6 +173,8 @@ per month where stated):
   - a throughput hurdle per MWh: +3k to +5k at 5-10 SGD/MWh (mixed by month, noise level),
     -39k at 20 SGD/MWh;
   - allowing charging inside event windows: -2.5k (+14k in Aug, -16k in Sep-Oct);
+  - the narrower overnight exception (`event_recharge`): 0k over Aug-Oct, -6k to -7k in
+    Sep and Oct (see the next section);
   - lead-2 h re-optimisation in all periods: -21k; only inside event windows: -3.3k;
   - deciding the daily plan at the gate of D's first period instead of 00:00 of D-1: -0.3k.
 - *Terminal SOC.* Ending the month at 5 % instead of 50 % would add about 10k per month.
@@ -198,6 +202,83 @@ per month where stated):
 (The investigations above were run before the ramp limit and the strict clearing cut were
 added; both changed the headline by less than 1k per 30 days, so the comparisons stand.)
 
+### Overnight recharge inside events (option, off by default)
+
+The 19-day event window lasts 60 h (12:00 on day 1 to 23:30 on day 3) and holds two surge
+mornings. With the ban, the battery enters full, empties on the first surge day and sits
+empty through the second surge morning; in November it is empty on the morning of Nov 20,
+one of the month's highest day-ahead forecast mornings (10:00-11:30). `[strategy.full] event_recharge`
+lifts the ban in a narrow set of periods, Eq. (19a) in [`formulation.md`](formulation.md):
+
+- `"overnight"`: night hours (`event_recharge_hours`, default 00:00-06:30 period starts) of
+  the 19-day windows (the cycle that carries the surge window), never where an 11-day window
+  overlaps; `"overnight_all"` also allows the 11-day windows' nights;
+- only where the plan's own forecast price at x = 0 is at most `event_recharge_max_price`
+  (350), from the month-ahead or day-ahead ladder, so legal at that plan's decision time;
+- the margin ban (300 MW) still applies, and the lead-2 h guard cancels such a charge if
+  T's lead-2 h price is above 350 (instead of 400), as well as on a thin margin or shortfall;
+- ramp, SOC (three conventions, 2 MWh margin), capacity and terminal rules are unchanged;
+  the programme simply gets more allowed actions;
+- `event_recharge_hurdle` (S$/MWh, default 0) adds a planning cost per MWh charged under the
+  exception.
+
+Walk-forward, Aug-Oct, uplift over Regulation only (SGD; same evaluator as the main table):
+
+| Option | Aug maker | Sep maker | Oct maker | Per 30 d maker | Aug taker | Sep taker | Oct taker | Per 30 d taker |
+|---|---|---|---|---|---|---|---|---|
+| `"none"` (default) | 109,980 | 120,348 | 121,054 | 114,581 | 126,932 | 128,011 | 143,123 | 129,804 |
+| `"overnight"` | 123,324 | 113,401 | 114,629 | 114,572 | 140,523 | 121,125 | 136,807 | 129,931 |
+| difference | +13,344 | -6,946 | -6,425 | -9 | +13,591 | -6,886 | -6,317 | +127 |
+| `"overnight"`, hurdle 60 | 123,324 | 115,315 | 121,054 | 117,291 | 140,523 | 123,056 | 143,123 | 132,620 |
+| difference | +13,344 | -5,033 | 0 | +2,710 | +13,591 | -4,955 | 0 | +2,816 |
+
+`"overnight_all"` gives exactly the `"overnight"` numbers: an 11-day window ends at 07:00,
+so a charge in its night can only be sold outside events at up to 50 MW, which the
+programme never found worth it. All variants: SOC range [7.0, 93.0] / [10.4, 89.6] /
+[13.4, 86.6] MWh (discharge / sqrt / charge-loss conventions), 0 breaches in both modes,
+month-end SOC 50 %, largest ramp step 42 MW. The exception charged 86, 139 and 86 MWh
+inside events in Aug, Sep and Oct.
+
+Why it does not pay: **the forecast is biased low on stress nights.** On the eligible
+night periods the actual energy price exceeded the day-ahead forecast by a median of +87
+(Aug), +55 (Sep) and +65 (Oct) S$/MWh (+63 to +69 against lead-2 h), while on ordinary nights
+the median error is -4 to +5. Stress-night charging is therefore dearer than planned, and
+0.85 x the later sale price beat it only when the sale hours spiked: in Aug the option let
+the planner discharge more into a spiking Aug 16 evening (+26.7k that day) and refill on the
+Aug 17 night (Aug 17 net -13.1k); in Sep the Sep 24 refill lost 4.6k (the forecast morning
+peak did not materialise) and three small trades 2.3k; in Oct the exception let the planner
+discharge into a modest Oct 30 evening and refill on the Oct 31 night at nearly the same
+price for the month-end SOC target (-6.3k). A hurdle of 60 S$/MWh (about the measured
+bias) removes the October trade but not Sep 24.
+
+Stress tests on the forecast markets (the plan cleared by the independent LP against the
+forecast stack and net demand of each month, event deltas shifted by one day or scaled by
+0.7 / 1.3; uplift difference "overnight" minus "none", maker, k SGD):
+
+| Market | Base | Shift -1 d | Shift +1 d | MW x 0.7 | MW x 1.3 |
+|---|---|---|---|---|---|
+| Aug | +13.2 | -0.9 | -3.7 | -2.0 | -1.2 |
+| Sep | +11.9 | +1.4 | +12.5 | -2.7 | +3.2 |
+| Oct | +1.2 | +25.1 | +6.9 | +1.5 | +0.6 |
+| Nov | +8.3 | +3.3 | +7.6 | -4.6 | +1.8 |
+
+Taker differences are within 4.2k of these. The shifted-calendar downside does not get
+worse (November's worst shifted case is +58.5k for the default, +66.1k with the option),
+but the forecast markets share the stress-night bias, so they overstate the option: they
+show Sep +11.9k and Oct +1.2k where the actual walk-forward lost 6.9k and 6.4k. Without a
+hurdle the November plan charges 155 MWh inside events (the Nov 1, Nov 19 and Nov 20
+nights); with a hurdle of 60, November's plan keeps only the Nov 20 recharge (86 MWh charged 03:30-05:30,
+discharged 10:00-11:30): +5.8k on the base forecast market, -1.5k / +6.0k shifted, -2.9k /
+-3.2k scaled. Note also that the lead-2 h forecast for Nov 20 10:00-10:30, which the guard
+does not use for discharges, is about 35 % below the day-ahead forecast.
+
+**Decision:** the default stays `"none"`. The adoption rule was a gain in every month in
+both modes without a materially worse shifted-calendar downside; the option loses in Sep
+and Oct in both modes (the hurdle-60 variant still loses in Sep), and its three-month total
+is about zero. The option stays in the code and in `config/default.toml`, tested, for a
+team that wants to take the Nov 20 bet (`event_recharge = "overnight"`,
+`event_recharge_hurdle = 60`).
+
 ### What to expect for November
 
 The headline above is the average of three training months, and the strategy settings
@@ -218,9 +299,10 @@ The same evaluator gave +120.0k (maker) for the earlier October plan against +11
 actual, so it is not biased low. **The realistic November expectation is therefore about +100k (maker range about
 94-106k, taker 110-121k), not the +115k three-month average.** Every energy offer cleared in
 full in every scenario, so the SOC path holds. Possible upside, not adopted: ending the
-month at 5 % SOC if EMA confirms there is no end-of-month requirement (+10k to +16k), and
-a narrow exception to the event charging ban on the 19-day surge nights (an earlier blanket
-test lost 2.5k, so this needs out-of-sample evidence first).
+month at 5 % SOC if EMA confirms there is no end-of-month requirement (+10k to +16k). The
+narrow exception to the event charging ban on the 19-day surge nights has now been tested
+(`event_recharge`, above): about zero over Aug-Oct and negative in Sep and Oct, so it is
+not adopted.
 
 ## Fallback submission: `--strategy regulation`
 

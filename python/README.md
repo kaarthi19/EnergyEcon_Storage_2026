@@ -190,7 +190,8 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
 - **Formulation.** [`docs/formulation.md`](docs/formulation.md) states the clearing LP
   (Eq. (1)-(11)) and the planner (Eq. (12)-(23)): the SOC dynamic programme, the value
   model with price impact, the capacity rule, the SOC limits under three conventions with
-  margin, the ramp limit, the event charging ban and the terminal SOC. The matching code
+  margin, the ramp limit, the event charging ban (and its optional overnight exception) and
+  the terminal SOC. The matching code
   lines in `engine.py`, `planner.py`, `soc.py`, `strategy_full.py` and `bids.py` carry
   `# Eq. (n)` comments. Units and signs are in [`docs/units.md`](docs/units.md).
 - **Strategy, results and open questions.** [`docs/strategy.md`](docs/strategy.md) covers
@@ -221,6 +222,8 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   | `[strategy.full] charge_cap_mw`, `discharge_cap_mw`, `event_discharge_cap_mw` | 50, 50, 100 | size caps of the energy actions (MW) |
   | `[strategy.full] guard_margin_mw`, `guard_price` | 300, 400 | charging bans and the lead-2 h charge guard |
   | `[strategy.full] refine` | `"guard"` | `"none"`, `"guard"` or `"lead2"` (gate-time re-optimisation) |
+  | `[strategy.full] event_recharge` | `"none"` | `"overnight"`: allow charging in cheap night periods of the 19-day event windows (`"overnight_all"`: every event window); tested, not adopted (about 0 over Aug-Oct, loses in Sep and Oct; [`docs/strategy.md`](docs/strategy.md)) |
+  | `[strategy.full] event_recharge_hours`, `event_recharge_max_price`, `event_recharge_hurdle` | [0, 7], 350, 0 | night hours, forecast price cap and extra planning cost (S$/MWh) of that exception |
 
 ## Citation
 

@@ -69,6 +69,15 @@ charge_cap_mw = 50.0             # largest charge (MW); charging is banned insid
 discharge_cap_mw = 50.0          # largest discharge outside event windows (MW)
 event_discharge_cap_mw = 100.0   # largest discharge inside event windows (MW)
 no_charge_in_events = true       # ban charging inside calendar event windows
+# Exception to that ban (docs/strategy.md, "Overnight recharge inside events"):
+# "none"; "overnight": charging allowed in the night hours of 19-day stress-cycle windows
+# (not where an 11-day window overlaps); "overnight_all": night hours of every event window.
+# Only where the plan's forecast energy price is <= event_recharge_max_price; the margin ban
+# and the lead-2 h guard (cancel above that same price) still apply.
+event_recharge = "none"
+event_recharge_hours = [0.0, 7.0]   # night hours [start, end) by period start time (wraps past 24)
+event_recharge_max_price = 350.0  # forecast energy price cap for the exception (S$/MWh)
+event_recharge_hurdle = 0.0      # extra planning cost per MWh charged under the exception (S$/MWh)
 guard_margin_mw = 300.0          # ban/cancel charging when the forecast capacity margin is below this (MW)
 guard_price = 400.0              # cancel a planned charge if the lead-2 h energy forecast exceeds this (S$/MWh)
 # "none": day-ahead plan only; "guard": lead-2 h guards at each period's gate;
