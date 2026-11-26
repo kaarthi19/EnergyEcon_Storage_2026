@@ -85,7 +85,7 @@ has these fingerprints, which `generate` writes to the manifest:
 |---|---|
 | `submission.xlsx` | `c6260df22a9262adfc8bc3ea4743f2502b21d0c93e0e070e35d1cc3d831ed1a5` |
 | bid table (`table_sha256`, independent of the xlsx writer) | `2240964c8146686f238c01d686b897774955ed4aaaafd73229675c8c25c2ce30` |
-| `submission.plan.csv` | `15d9dd1a466c3a75c6f70b59fffd3f9d8fa7180d4bed8c04484fe7a61bb3cb7e` |
+| `submission.plan.csv` | `164bbefd51859fe1c9d7512f5c481ecc174318850ab16397d5d558511f3cb3a5` |
 
 Running with `--config config/default.toml` or with no `--config` gives the same bytes.
 
@@ -190,7 +190,8 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
 - **Formulation.** [`docs/formulation.md`](docs/formulation.md) states the clearing LP
   (Eq. (1)-(11)) and the planner (Eq. (12)-(23)): the SOC dynamic programme, the value
   model with price impact, the capacity rule, the SOC limits under three conventions with
-  margin, the ramp limit, the event charging ban and the terminal SOC. The matching code
+  margin, the ramp limit, the event charging ban (and its optional overnight exception) and
+  the terminal SOC. The matching code
   lines in `engine.py`, `planner.py`, `soc.py`, `strategy_full.py` and `bids.py` carry
   `# Eq. (n)` comments. Units and signs are in [`docs/units.md`](docs/units.md).
 - **Strategy, results and open questions.** [`docs/strategy.md`](docs/strategy.md) covers
@@ -221,6 +222,8 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   | `[strategy.full] charge_cap_mw`, `discharge_cap_mw`, `event_discharge_cap_mw` | 50, 50, 100 | size caps of the energy actions (MW) |
   | `[strategy.full] guard_margin_mw`, `guard_price` | 300, 400 | charging bans and the lead-2 h charge guard |
   | `[strategy.full] refine` | `"guard"` | `"none"`, `"guard"` or `"lead2"` (gate-time re-optimisation) |
+  | `[strategy.full] event_recharge` | `"none"` | `"overnight"`: allow charging in cheap night periods of the 19-day event windows (`"overnight_all"`: every event window); tested, not adopted (about 0 over Aug-Oct, loses in Sep and Oct; [`docs/strategy.md`](docs/strategy.md)) |
+  | `[strategy.full] event_recharge_hours`, `event_recharge_max_price`, `event_recharge_hurdle` | [0, 7], 350, 0 | night hours, forecast price cap and extra planning cost (S$/MWh) of that exception |
 
 ## Citation
 

@@ -195,6 +195,23 @@ with ρ = `bess_ramp_mw` = 42 MW (assumption: the generators' 0.42 × 100 MW per
 
 The margin is nominal capacity − (net demand + outage) − reserve requirements.
 
+**Optional overnight recharge exception** (`event_recharge`, default `"none"`, so (19) holds
+as written). With `"overnight"`, the event part of (19) is lifted in period t if
+
+    t ∈ W_19 \ W_11,   hour(t) ∈ [h_0, h_1),   Ê_t(0) ≤ p_rech                              (19a)
+
+where W_19 and W_11 are the windows of the cycle that carries the surge window (19-day) and
+of the other cycles (11-day), [h_0, h_1) = `event_recharge_hours` = [0, 7) by period start,
+Ê_t(0) is the forecast energy price at x = 0 of the ladder the programme is solving with
+(month-ahead or day-ahead, so it is legal at that decision time), and p_rech =
+`event_recharge_max_price` = 350 S$/MWh. `"overnight_all"` drops the "\ W_11". The margin
+ban of (19) still applies. A charge allowed by (19a) costs an extra hurdle
+
+    F_t(a) ← F_t(a) − κ · h · max(−x_a, 0)   for t eligible under (19a)                     (13a)
+
+with κ = `event_recharge_hurdle` (default 0), and the guard (23) cancels it if the lead-2 h
+price is above min(400, p_rech).
+
 ### Terminal SOC
 
 The month ends with SOC ≥ `terminal_soc_frac` × 100 MWh = 50 MWh under every convention:
@@ -207,7 +224,7 @@ With the ramp limit, the state is (Y, previous action a′). The recursion is
 
     V_t(Y, a′) = max_{a ∈ A_t, |x_a − x_a′| ≤ ρ}  F_t(a) + V_{t+1}(Y + ΔY(a), a)            (21)
 
-Here A_t holds the actions allowed by (16), (18) and (19). V_{T+1}(Y, ·) = 0 if Y ≥ y_term,
+Here A_t holds the actions allowed by (16), (18), (19) and (19a). V_{T+1}(Y, ·) = 0 if Y ≥ y_term,
 and −∞ otherwise (20). Ties go to the lowest action index; idle is index 0, so it wins a tie.
 
 The programme runs at two horizons:

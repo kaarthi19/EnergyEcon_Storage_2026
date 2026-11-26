@@ -55,6 +55,15 @@ on the synthetic market and checks:
 - a guard that fires on every charge keeps the month-end SOC target (it used to abort);
 - a planner input issued after its decision time raises `LeakError`.
 
+`test_event_recharge.py` checks the optional overnight recharge exception (`event_recharge`):
+the eligibility mask on a hand-made calendar (night hours only, the 19-day stress cycle
+only, never where an 11-day window overlaps; `"overnight_all"` adds those; hours that wrap
+past midnight), that the price cap and the margin ban still hold in the allowed-action
+matrix, and, on the synthetic market, that charging inside events happens only in eligible
+periods while the capacity, ramp, SOC (three conventions, 2 MWh margin) and terminal rules
+hold, that an exception whose price cap or hurdle can never be met reproduces the default
+bids exactly, and the per-period information cut with the exception switched on.
+
 `test_soc_planner.py` also checks the ramp-limited programme against brute force and that
 it equals the plain programme without a limit. `test_engine.py` checks that non-finite
 inputs raise. `test_writer_cli.py` checks that `generate` stops (exit 1) when the test
