@@ -41,7 +41,7 @@ from .engine import BessOffer, ClearingEngine
 from .periods import month_slots
 from .planner import (LEVELS, NEG, action_values, dp_backward_ramp, dp_forward_ramp, dp_plan, make_action_grid,
                       ramp_active, terminal_values)
-from .soc import check_soc, y_terminal_min
+from .soc import y_terminal_min
 
 __all__ = ["perfect_foresight_plan", "evaluate", "summarize", "CONVENTIONS"]
 
@@ -190,9 +190,3 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         agg.append(d)
     return pd.concat([df, pd.DataFrame(agg)], ignore_index=True)
 
-
-def check_plan_soc(frame: pd.DataFrame, cfg: Config) -> dict:
-    """SOC check of a plan frame's energy column under every convention."""
-    mw = frame["energy_mw"].to_numpy(float)
-    return check_soc(np.clip(mw, 0, None), np.clip(-mw, 0, None), cfg,
-                     terminal_mwh=cfg.terminal_soc_frac * cfg.energy_mwh).to_dict()

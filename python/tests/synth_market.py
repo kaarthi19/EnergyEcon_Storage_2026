@@ -126,8 +126,8 @@ def build(days: int = 70, seed: int = 7) -> dict:
     return dict(clearing=clearing, predispatch=pre, stacks=stacks, nd=nd, out=out)
 
 
-def info_from(world: dict, cfg=None, train_until=None):
-    """InfoSet over the synthetic world (pre-dispatch split: training up to ``train_until``)."""
+def info_from(world: dict, cfg=None):
+    """InfoSet over the synthetic world."""
     from bessbid.config import Config
     from bessbid.infoset import InfoSet
 

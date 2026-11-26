@@ -5,10 +5,15 @@ hackathon specification (100 MW / 100 MWh, SOC 5-95 %, 85 % round trip, initial 
 30-minute periods) and the Phase A findings (strict capacity rule, 65-minute gate closure,
 per-row stack publication times).
 
-Overrides come from an optional TOML or JSON file. The file may be flat
-(``soc_margin_mwh = 3.0``) or grouped in tables (``[bess] soc_margin_mwh = 3.0``); table
-names are ignored and keys are merged. Unknown keys raise ``ValueError`` so typos never
-pass silently.
+Overrides come from an optional TOML or JSON file (``config/default.toml`` lists every key
+with its default). The file may be flat (``soc_margin_mwh = 3.0``) or grouped in tables
+(``[bess] soc_margin_mwh = 3.0``); table names are ignored and keys are merged. Unknown keys
+raise ``ValueError`` so typos never pass silently.
+
+The one reserved table is ``[strategy]``: ``[strategy.<name>]`` holds the parameters of the
+strategy registered as ``<name>`` (``[strategy.full]`` sets
+:class:`bessbid.strategy_full.FullParams`). :func:`load_config` ignores it and
+:func:`load_strategy_options` returns it.
 """
 
 from __future__ import annotations
@@ -20,7 +25,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-__all__ = ["Config", "load_config", "CAPACITY_RULES", "STACK_PUB_RULES"]
+__all__ = [
+    "Config",
+    "load_config",
+    "load_strategy_options",
+    "read_config_file",
+    "config_from_mapping",
+    "coerce_fields",
+    "CAPACITY_RULES",
+    "STACK_PUB_RULES",
+    "STRATEGY_TABLE",
+]
+
+#: Reserved config-file table holding per-strategy parameters (``[strategy.full]``).
+STRATEGY_TABLE = "strategy"
 
 #: Readings of "combined capacity offered across Energy and AS must not exceed 100 MW".
 #: ``strict``: sum |energy band MW| + sum of all AS band MW <= power_mw (our default).
@@ -175,7 +193,27 @@ class Config:
         return d
 
 
-_TUPLE_FIELDS = {"efficiency_conventions", "predispatch_leads"}
+def coerce_fields(cls, values: Mapping[str, Any], what: str) -> dict[str, Any]:
+    """Check ``values`` against the fields of dataclass ``cls`` and convert TOML/JSON types.
+
+    Unknown keys raise ``ValueError``. Whole numbers given for float fields become floats
+    (``50`` -> ``50.0``), so a config file never changes a value's type; lists become
+    tuples for tuple fields (nested lists of numbers become tuples of floats)."""
+    fields = {f.name: str(f.type) for f in dataclasses.fields(cls)}
+    unknown = sorted(set(values) - set(fields))
+    if unknown:
+        raise ValueError(f"unknown {what} keys: {unknown}")
+    out: dict[str, Any] = {}
+    for k, v in values.items():
+        t = fields[k]
+        if t.startswith("tuple") and isinstance(v, (list, tuple)):
+            v = tuple(tuple(float(y) for y in x) if isinstance(x, (list, tuple)) else float(x) for x in v)
+        elif "float" in t and isinstance(v, int) and not isinstance(v, bool):
+            v = float(v)
+        elif t == "int" and isinstance(v, float) and v.is_integer():
+            v = int(v)
+        out[k] = v
+    return out
 
 
 def _flatten(d: Mapping[str, Any]) -> dict[str, Any]:
@@ -194,23 +232,15 @@ def _flatten(d: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def config_from_mapping(d: Mapping[str, Any], base: Config | None = None) -> Config:
-    """Apply a (possibly nested) mapping of overrides to ``base`` (default Config())."""
+    """Apply a (possibly nested) mapping of overrides to ``base`` (default Config()). A
+    top-level ``strategy`` table (strategy parameters) is skipped."""
     base = base or Config()
-    flat = _flatten(d)
-    names = {f.name for f in dataclasses.fields(Config)}
-    unknown = sorted(set(flat) - names)
-    if unknown:
-        raise ValueError(f"unknown config keys: {unknown}")
-    for k in _TUPLE_FIELDS & set(flat):
-        v = flat[k]
-        flat[k] = tuple(tuple(float(y) for y in x) if isinstance(x, (list, tuple)) else float(x) for x in v)
-    return dataclasses.replace(base, **flat)
+    flat = _flatten({k: v for k, v in d.items() if k != STRATEGY_TABLE})
+    return dataclasses.replace(base, **coerce_fields(Config, flat, "config"))
 
 
-def load_config(path: str | Path | None = None) -> Config:
-    """Default Config, with overrides from a ``.toml`` or ``.json`` file if given."""
-    if path is None:
-        return Config()
+def read_config_file(path: str | Path) -> dict[str, Any]:
+    """Parse a ``.toml`` or ``.json`` config file into a dict (no validation)."""
     p = Path(path)
     text = p.read_bytes()
     if p.suffix.lower() == ".json":
@@ -228,4 +258,22 @@ def load_config(path: str | Path | None = None) -> Config:
         raise ValueError(f"config file must be .toml or .json: {p}")
     if not isinstance(data, Mapping):
         raise ValueError("config file must hold a table/object at top level")
-    return config_from_mapping(data)
+    return dict(data)
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    """Default Config, with overrides from a ``.toml`` or ``.json`` file if given."""
+    if path is None:
+        return Config()
+    return config_from_mapping(read_config_file(path))
+
+
+def load_strategy_options(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
+    """The ``[strategy.<name>]`` tables of a config file: {strategy name: {key: value}}.
+    Empty without a file or without a ``[strategy]`` table."""
+    if path is None:
+        return {}
+    tab = read_config_file(path).get(STRATEGY_TABLE, {})
+    if not isinstance(tab, Mapping) or not all(isinstance(v, Mapping) for v in tab.values()):
+        raise ValueError("the [strategy] table must hold one sub-table per strategy, e.g. [strategy.full]")
+    return {str(k): dict(v) for k, v in tab.items()}

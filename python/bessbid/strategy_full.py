@@ -46,12 +46,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
 from .bids import PeriodBid, energy_fixed
-from .config import Config
+from .config import Config, coerce_fields
 from .periods import month_slots, parse_month
 from .planner import (
     LEVELS,
@@ -123,6 +124,12 @@ class FullParams:
         if self.ramp_mw is not None and self.ramp_mw < 0:
             raise ValueError("ramp_mw must be >= 0 (0 = no limit)")
 
+    @classmethod
+    def from_mapping(cls, d: Mapping[str, Any]) -> "FullParams":
+        """FullParams from a ``[strategy.full]`` config table; keys left out keep their
+        defaults, unknown keys raise ``ValueError``."""
+        return cls(**coerce_fields(cls, d, "[strategy.full]"))
+
 
 def _event_masks(cal, Ts: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
     t = Ts.to_numpy(dtype="datetime64[ns]")
@@ -136,14 +143,14 @@ def _allowed(grid, ev: np.ndarray, margin: np.ndarray | None, p: FullParams) -> 
     n = len(ev)
     A = np.ones((n, grid.n_actions), bool)
     chg = mw < 0
-    A[:, chg] = (-mw[chg] <= p.charge_cap_mw + 1e-9)[None, :]
+    A[:, chg] = (-mw[chg] <= p.charge_cap_mw + 1e-9)[None, :]  # Eq. (18): charge cap
     if p.no_charge_in_events:
-        A[np.ix_(ev, chg)] = False
+        A[np.ix_(ev, chg)] = False  # Eq. (19): no charging in event windows
     if margin is not None and p.guard_margin_mw is not None:
-        A[np.ix_(np.asarray(margin) < p.guard_margin_mw, chg)] = False
+        A[np.ix_(np.asarray(margin) < p.guard_margin_mw, chg)] = False  # Eq. (19): thin margin
     dis = mw > 0
     cap = np.where(ev, p.event_discharge_cap_mw, p.discharge_cap_mw)
-    A[:, dis] = mw[dis][None, :] <= cap[:, None] + 1e-9
+    A[:, dis] = mw[dis][None, :] <= cap[:, None] + 1e-9  # Eq. (18): discharge cap
     return A
 
 
@@ -194,7 +201,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     ev, surge = _event_masks(fc.calendar, Ts)
     nodes_da = fc.nd.nodes_da if p.use_nodes else None
     nodes_l2 = fc.nd.nodes_lead if p.use_nodes else None
-    y_term = y_terminal_min(cfg)
+    y_term = y_terminal_min(cfg)  # Eq. (20)
     V_term = terminal_values(grid, y_term)
 
     # ---- month-ahead values: one decision at the first period's gate --------------------
@@ -238,7 +245,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     if abs(grid.y[s] - cfg.initial_soc_mwh) > 1e-9:
         raise ValueError("initial SOC must lie on the planning grid; change y_step")
     zero = int(np.where(grid.mw == 0)[0][0])
-    a_prev = zero  # the month starts from an idle energy schedule
+    a_prev = zero  # Eq. (17): the month starts from an idle energy schedule (x_0 = 0)
     acts = np.zeros(n, dtype=int)
     Y = np.zeros(n)
     tag = np.empty(n, dtype=object)
@@ -267,7 +274,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                                                        inputs_time=inp["input_time"].to_numpy()))
         F = values(lad)
         A = _allowed(grid, ev[idx], lad["margin"], p)
-        V_end = V_ma[idx[-1] + 1]
+        V_end = V_ma[idx[-1] + 1]  # Eq. (22): month-ahead continuation value
 
         def solve(V_end):
             if use_ramp:
@@ -300,6 +307,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 if margin_l2 < p.guard_margin_mw or float(r.E) > p.guard_price or short > 1e-6:
                     # cancel the charge, or cut it as far as the ramp limit and the month-end
                     # SOC target still allow (the least charging such action)
+                    # Eq. (23)
                     ok = (grid.mw <= 0) & (grid.mw >= grid.mw[a]) & R_ok[a_prev] & (nxt_value(V, k, st) > NEG / 2)
                     ok[a] = False
                     if ok.any():
@@ -347,7 +355,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     for i, sl in enumerate(slots):
         x = float(mw[i])
         layer = "regulation" if x == 0 else ("event" if ev[i] else "energy")
-        bids.append(energy_fixed(sl.date, sl.period, x, cfg, regulation_mw="fill",
+        bids.append(energy_fixed(sl.date, sl.period, x, cfg, regulation_mw="fill",  # Eq. (12)
                                  tag=f"full:{layer}:{tag[i]}") if x != 0 else
                     _reg_only(sl, cfg, p))
     frame = pd.DataFrame({"ts": Ts, "date": [s_.date for s_ in slots], "period": [s_.period for s_ in slots]})
@@ -413,6 +421,11 @@ class FullStrategy:
     #: per-period plan of the last ``generate`` call (planned dispatch, SOC, forecasts)
     plan_frame: pd.DataFrame | None = None
     plan_info: dict | None = None
+
+    @classmethod
+    def from_options(cls, options: Mapping[str, Any], **kwargs) -> "FullStrategy":
+        """The strategy with the parameters of a ``[strategy.full]`` config table."""
+        return cls(params=FullParams.from_mapping(options), **kwargs)
 
     def generate(self, month: str, infoset, cfg: Config) -> list[PeriodBid]:
         if infoset is None:

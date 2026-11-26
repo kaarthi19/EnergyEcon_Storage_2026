@@ -44,12 +44,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
-from .bids import PRODUCTS, TABLE_COLUMNS, PeriodBid, to_table
+from .bids import PRODUCTS, TABLE_COLUMNS, to_table
 from .config import Config
 from .engine import BessOffer, ClearingEngine, StackArrays, price_taker_clear
 from .periods import PERIOD, month_slots
@@ -214,11 +214,6 @@ class BacktestResult:
     frame: pd.DataFrame
     summary: dict
     params: dict = field(default_factory=dict)
-
-    def per_day(self) -> pd.DataFrame:
-        f = self.frame
-        cols = ["rev", "rev_E", "rev_P", "rev_C", "rev_R", "dis", "chg"]
-        return f.groupby(f["ts"].dt.normalize())[cols].sum()
 
 
 # --------------------------------------------------------------------------------------

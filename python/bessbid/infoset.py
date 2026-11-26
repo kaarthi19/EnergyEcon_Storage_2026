@@ -23,7 +23,7 @@ from a month-wide frame.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
 import numpy as np
 import pandas as pd

@@ -1,23 +1,25 @@
 """Exact replica of EMA's per-period clearing engine, with optional BESS offers.
 
 Formulation (reverse-engineered in Phase A; reproduces every training period Jul 1 - Oct 31
-to within 0.002 SGD for all four prices). One LP per 30-minute period::
+to within 0.002 SGD for all four prices). One LP per 30-minute period; equation numbers refer
+to ``docs/formulation.md``::
 
     min   sum_fb pE_fb e_fb + sum_f (pP_f p_f + pC_f c_f + pR_f r_f)
           + 750 sP + 1000 sC + 1200 sR + VoLL u
-          + sum_j oD_j d_j - sum_j oC_j g_j + sum_kj oK_kj b_kj           (BESS bands)
-    s.t.  sum e + u + sum d - sum g                = net_demand   -> energy price (dual)
-          sum p + sP + sum b_P                     >= req_P       -> primary price
-          sum c + sC + sum b_C                     >= req_C       -> contingency price
-          sum r + sR + sum b_R                     >= req_R       -> regulation price
-          sum_b e_fb + p_f + c_f + r_f             <= available_mw_f      (joint headroom)
+          + sum_j oD_j d_j - sum_j oC_j g_j + sum_kj oK_kj b_kj           (BESS bands)  (1)
+    s.t.  sum e + u + sum d - sum g                = net_demand   -> energy price (dual)  (2)
+          sum p + sP + sum b_P                     >= req_P       -> primary price        (3)
+          sum c + sC + sum b_C                     >= req_C       -> contingency price    (3)
+          sum r + sR + sum b_R                     >= req_R       -> regulation price     (3)
+          sum_b e_fb + p_f + c_f + r_f             <= available_mw_f   (joint headroom)   (4)
           sum_b e_fb                               <= e_f(t-1) + 0.42 * available_mw_f(t)
-                                                                        (ramp-up, if a state is given)
-          0 <= e_fb <= offered_fb ; 0 <= p_f <= P offered_f (likewise c, r)
-          shortfalls sP, sC, sR, u >= 0 and uncapped
-          BESS:  sum d + sum b_P + sum b_C + sum b_R <= bess_pmax          (discharge side)
-                 sum g + sum b_R                     <= bess_pmax          (charge side)
-                 0 <= d_j, g_j, b_kj <= band MW
+                                                        (ramp-up, if a state is given)    (5)
+          0 <= e_fb <= offered_fb ; 0 <= p_f <= P offered_f (likewise c, r)               (6)
+          shortfalls sP, sC, sR, u >= 0 and uncapped                                      (6)
+          BESS:  sum d + sum b_P + sum b_C + sum b_R <= bess_pmax   (discharge side)      (7)
+                 sum g + sum b_R                     <= bess_pmax   (charge side)         (8)
+                 0 <= d_j, g_j, b_kj <= band MW                                           (9)
+    prices = duals of (2) and (3)                                                         (10)
 
 The ramp limit is applied, as in Phase A, by clipping each unit's band capacities in merit
 order (bands are ascending in price, so this is the same LP as an explicit ramp row).
@@ -42,7 +44,7 @@ warm-started from the previous basis. A call takes about 1-2 ms.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -314,6 +316,7 @@ class ClearResult:
 
 
 def _ramp_clip(e_q: np.ndarray, av: np.ndarray, prev: np.ndarray | None, k: float) -> np.ndarray:
+    """Eq. (5): clip each unit's energy bands in merit order to e(t-1) + k * available."""
     if prev is None:
         return e_q
     cap = prev + k * av
@@ -366,20 +369,20 @@ class _Model:
         for f in range(F):
             for b in range(B):
                 j = f * B + b
-                cols[j] += [(self.rBal, 1.0), (self.rHead + f, 1.0)]
+                cols[j] += [(self.rBal, 1.0), (self.rHead + f, 1.0)]  # Eq. (2), Eq. (4)
             for kk, off in enumerate((self.iP, self.iC, self.iR)):
-                cols[off + f] += [(self.rRes + kk, 1.0), (self.rHead + f, 1.0)]
+                cols[off + f] += [(self.rRes + kk, 1.0), (self.rHead + f, 1.0)]  # Eq. (3), Eq. (4)
         for kk in range(3):
-            cols[self.iS + kk].append((self.rRes + kk, 1.0))
-        cols[self.iS + 3].append((self.rBal, 1.0))
+            cols[self.iS + kk].append((self.rRes + kk, 1.0))  # Eq. (3): reserve shortfall
+        cols[self.iS + 3].append((self.rBal, 1.0))  # Eq. (2): unserved energy
         for j in range(MAX_E_BANDS):
-            cols[self.iD + j] += [(self.rBal, 1.0), (self.rBd, 1.0)]
-            cols[self.iG + j] += [(self.rBal, -1.0), (self.rBc, 1.0)]
+            cols[self.iD + j] += [(self.rBal, 1.0), (self.rBd, 1.0)]  # Eq. (2), Eq. (7): BESS discharge
+            cols[self.iG + j] += [(self.rBal, -1.0), (self.rBc, 1.0)]  # Eq. (2), Eq. (8): BESS charge
         for kk, k in enumerate(RES):
             for j in range(MAX_AS_BANDS):
-                c = [(self.rRes + kk, 1.0), (self.rBd, 1.0)]
+                c = [(self.rRes + kk, 1.0), (self.rBd, 1.0)]  # Eq. (3), Eq. (7): BESS reserve
                 if k == "R":
-                    c.append((self.rBc, 1.0))
+                    c.append((self.rBc, 1.0))  # Eq. (8): Regulation also limits charging
                 cols[self.iB[k] + j] += c
         start, index, value = [0], [], []
         for c in cols:
@@ -398,10 +401,10 @@ class _Model:
         lp.col_upper_ = ub
         rl = np.full(self.nr, -inf)
         ru = np.full(self.nr, inf)
-        rl[self.rBal] = ru[self.rBal] = 0.0
-        rl[self.rRes:self.rRes + 3] = 0.0
-        ru[self.rHead:self.rHead + F] = 0.0
-        ru[self.rBd] = ru[self.rBc] = cfg.power_mw
+        rl[self.rBal] = ru[self.rBal] = 0.0  # Eq. (2): equality row
+        rl[self.rRes:self.rRes + 3] = 0.0  # Eq. (3): >= rows
+        ru[self.rHead:self.rHead + F] = 0.0  # Eq. (4): <= rows
+        ru[self.rBd] = ru[self.rBc] = cfg.power_mw  # Eq. (7), Eq. (8)
         lp.row_lower_ = rl
         lp.row_upper_ = ru
         lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
@@ -424,7 +427,7 @@ class _Model:
         self.ok = highspy.HighsStatus.kOk
         self.all_cols = np.arange(self.nv, dtype=np.int32)
         self.all_rows = np.arange(self.nr, dtype=np.int32)
-        self.cost = np.zeros(self.nv)
+        self.cost = np.zeros(self.nv)  # Eq. (1): shortfall and VoLL terms; offer costs per call
         self.cost[self.iS:self.iS + 3] = (cfg.shortfall_price_primary, cfg.shortfall_price_contingency,
                                           cfg.shortfall_price_regulation)
         self.cost[self.iS + 3] = cfg.voll
@@ -478,8 +481,8 @@ class ClearingEngine:
         _check_finite(stack, net_demand, rq, bess)
         if prev is not None and not np.isfinite(prev).all():
             raise EngineError("non-finite clearing input: prev")
-        eq = _ramp_clip(stack.e_q, stack.av, prev, self.cfg.ramp_up_frac)
-        cost = m.cost.copy()
+        eq = _ramp_clip(stack.e_q, stack.av, prev, self.cfg.ramp_up_frac)  # Eq. (5)
+        cost = m.cost.copy()  # Eq. (1): offer prices; bounds Eq. (6)
         ub = m.ub.copy()
         nE = F * B
         cost[:nE] = stack.e_p.ravel()
@@ -501,7 +504,7 @@ class ClearingEngine:
                 cost[m.iD + j] = p
                 ub[m.iD + j] = q
             for j, (p, q) in enumerate(chg):
-                cost[m.iG + j] = -p
+                cost[m.iG + j] = -p  # Eq. (1): a charge band is a demand bid
                 ub[m.iG + j] = q
             for k in RES:
                 bands = bess.reserve(k)
@@ -511,13 +514,13 @@ class ClearingEngine:
                 for j, (p, q) in enumerate(bands):
                     cost[m.iB[k] + j] = p
                     ub[m.iB[k] + j] = q
-        ub = np.maximum(ub, 0.0)
+        ub = np.maximum(ub, 0.0)  # Eq. (6), Eq. (9)
         rl = m.rl.copy()
         ru = m.ru.copy()
-        rl[m.rBal] = ru[m.rBal] = float(net_demand)
-        rl[m.rRes:m.rRes + 3] = rq
-        ru[m.rHead:m.rHead + F] = stack.av
-        ru[m.rBd] = ru[m.rBc] = self.bess_pmax
+        rl[m.rBal] = ru[m.rBal] = float(net_demand)  # Eq. (2)
+        rl[m.rRes:m.rRes + 3] = rq  # Eq. (3)
+        ru[m.rHead:m.rHead + F] = stack.av  # Eq. (4)
+        ru[m.rBd] = ru[m.rBc] = self.bess_pmax  # Eq. (7), Eq. (8)
         if not self.warm_start:
             h.clearSolver()
         for st in (h.changeColsCost(m.nv, m.all_cols, cost),
@@ -539,7 +542,7 @@ class ClearingEngine:
         x = np.asarray(sol.col_value)
         y = np.asarray(sol.row_dual)
         info = h.getInfo()
-        r = ClearResult(
+        r = ClearResult(  # Eq. (10): prices are the duals of the balance and reserve rows
             E=float(y[m.rBal]), P=float(y[m.rRes]), C=float(y[m.rRes + 1]), R=float(y[m.rRes + 2]),
             sP=float(x[m.iS]), sC=float(x[m.iS + 1]), sR=float(x[m.iS + 2]), unserved=float(x[m.iS + 3]),
             cost=float(info.objective_function_value),
@@ -620,7 +623,7 @@ def _in_money(margin: np.ndarray, tie: str) -> np.ndarray:
 
 def price_taker_clear(bess: BessOffer, prices: Mapping[str, float], tie: str = "strict",
                       pmax: float = 100.0) -> TakerResult:
-    """Awards for fixed clearing prices {E, P, C, R}.
+    """Awards for fixed clearing prices {E, P, C, R} (Eq. (11) of ``docs/formulation.md``).
 
     A discharge band clears if its offer is below the energy price, a charge band if its offer
     is above it, a reserve band if its offer is below that reserve's price. ``tie='strict'``

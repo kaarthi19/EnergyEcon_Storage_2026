@@ -34,14 +34,13 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .periods import PERIOD
-
 __all__ = [
     "DataFiles",
     "Dataset",
     "SchemaError",
     "find_files",
     "find_template",
+    "file_sha256",
     "parse_sgt",
     "load_clearing",
     "load_predispatch",
@@ -77,10 +76,15 @@ class DataFiles:
     ignored: list[Path] = field(default_factory=list)
     duplicates: list[Path] = field(default_factory=list)
 
-    def describe(self) -> dict:
+    def describe(self, hashes: bool = False) -> dict:
+        """File names and sizes per role (and SHA-256 with ``hashes=True``)."""
+
         def info(p: Path) -> dict:
             st = p.stat()
-            return {"name": p.name, "size": st.st_size}
+            d = {"name": p.name, "size": st.st_size}
+            if hashes:
+                d["sha256"] = file_sha256(p)
+            return d
 
         return {
             "clearing": [info(p) for p in self.clearing],
@@ -91,6 +95,15 @@ class DataFiles:
             "ignored": [p.name for p in self.ignored],
             "duplicates": [p.name for p in self.duplicates],
         }
+
+
+def file_sha256(p: str | Path, chunk: int = 1 << 20) -> str:
+    """SHA-256 of a file, read in chunks."""
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
 
 
 def _norm_name(name: str) -> str:

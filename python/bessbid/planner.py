@@ -26,7 +26,7 @@ Two pieces:
     D.19.1.2A): ``|x(t) - x(t-1)| <= ramp_mw``. The state is (Y, previous action).
 
 The planner only ever sees forecast values that the caller computed at a legal decision
-time; it has no data access of its own.
+time; it has no data access of its own. Equation numbers refer to ``docs/formulation.md``.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def make_action_grid(cfg: Config, max_charge_mw: float | None = None, max_discha
     ec = eta_c_range(cfg)[1]
     max_c = cfg.power_mw if max_charge_mw is None else max_charge_mw
     max_d = cfg.power_mw if max_discharge_mw is None else max_discharge_mw
-    c_unit = y_step / (h * ec)  # MW per Y step when charging
+    c_unit = y_step / (h * ec)  # MW per Y step when charging (Eq. (14)-(15) with eta_c_max)
     d_unit = y_step * rte / (h * ec)  # MW per Y step when discharging
     kc = _quantum(c_unit, res)
     if charge_step_mw:
@@ -140,7 +140,7 @@ def make_action_grid(cfg: Config, max_charge_mw: float | None = None, max_discha
         mw.append(round(k * d_unit, 6))
         steps.append(-k)
         k += kd
-    lo, hi = y_bounds(cfg, margin)
+    lo, hi = y_bounds(cfg, margin)  # Eq. (16): the grid spans exactly the allowed Y range
     n = int(np.floor((hi - lo) / y_step + 1e-9))
     y = lo + y_step * np.arange(n + 1)
     return ActionGrid(np.array(mw), np.array(steps, dtype=int), y, y_step)
@@ -163,8 +163,8 @@ def action_values(E: np.ndarray, R: np.ndarray, levels, mw: np.ndarray, cfg: Con
     x = np.asarray(mw, float)
     Ex = np.stack([np.interp(x, lv, e) for e in E])
     Rx = np.stack([np.interp(x, lv, r) for r in R])
-    q = cfg.power_mw - np.abs(x) if reg_mw is None else np.asarray(reg_mw, float)
-    return cfg.period_hours * (x[None, :] * Ex + q[None, :] * Rx)
+    q = cfg.power_mw - np.abs(x) if reg_mw is None else np.asarray(reg_mw, float)  # Eq. (12) with equality
+    return cfg.period_hours * (x[None, :] * Ex + q[None, :] * Rx)  # Eq. (13)
 
 
 class ValueModel:
@@ -240,7 +240,7 @@ class ValueModel:
             req_tot[i] = float(sum(req))
             for j, off in enumerate(offers):
                 acc = np.zeros(5)
-                for e in nodes:
+                for e in nodes:  # Eq. (13): our offer inside LP (1)-(10), mean over error nodes
                     r = self.engine.clear(st, float(nd[i] - e + outage[i]), req, None, off)
                     acc += (r.E, r.P, r.C, r.R, r.sP + r.sC + r.sR)
                 acc /= len(nodes)
@@ -278,11 +278,11 @@ def dp_backward(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = No
     V = np.empty((n + 1, grid.n_states))
     V[n] = 0.0 if V_end is None else V_end
     pol = np.zeros((n, grid.n_states), dtype=np.int32)
-    for t in range(n - 1, -1, -1):
+    for t in range(n - 1, -1, -1):  # Eq. (21) without the ramp limit
         f = F[t]
         if allowed is not None:
-            f = np.where(allowed[t], f, NEG)
-        cand = np.where(valid, f[None, :] + V[t + 1][nxt], NEG)
+            f = np.where(allowed[t], f, NEG)  # Eq. (18)-(19): banned actions
+        cand = np.where(valid, f[None, :] + V[t + 1][nxt], NEG)  # Eq. (16): stay on the Y grid
         a = cand.argmax(1)  # first maximum: idle (index 0) wins ties, then smaller actions
         pol[t] = a
         V[t] = cand[np.arange(grid.n_states), a]
@@ -298,7 +298,7 @@ def ramp_ok(grid: ActionGrid, ramp_mw: float | None) -> np.ndarray:
     """(n_actions, n_actions) bool: action ``a`` may follow action ``a_prev`` (rows)."""
     if ramp_mw is None or ramp_mw <= 0:
         return np.ones((grid.n_actions, grid.n_actions), bool)
-    return np.abs(grid.mw[None, :] - grid.mw[:, None]) <= float(ramp_mw) + 1e-9
+    return np.abs(grid.mw[None, :] - grid.mw[:, None]) <= float(ramp_mw) + 1e-9  # Eq. (17)
 
 
 def dp_backward_ramp(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = None,
@@ -330,12 +330,12 @@ def dp_backward_ramp(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None
             store[t] = v.copy()
 
     put(n, Vn)
-    for t in range(n - 1, -1, -1):
+    for t in range(n - 1, -1, -1):  # Eq. (21)
         f = F[t]
         if allowed is not None:
-            f = np.where(allowed[t], f, NEG)
-        G = np.where(valid, f[None, :] + Vn[nxt, cols], NEG)  # (S, A): take a, land in nxt
-        cand = G[:, None, :] + bias[None, :, :]  # (S, A_prev, A)
+            f = np.where(allowed[t], f, NEG)  # Eq. (18)-(19): banned actions
+        G = np.where(valid, f[None, :] + Vn[nxt, cols], NEG)  # (S, A): take a, land in nxt; Eq. (16)
+        cand = G[:, None, :] + bias[None, :, :]  # (S, A_prev, A); Eq. (17): ramp limit
         a = cand.argmax(2)
         Vt = np.maximum(np.take_along_axis(cand, a[..., None], 2)[..., 0], NEG)
         if pol is not None:
@@ -412,5 +412,5 @@ def terminal_values(grid: ActionGrid, y_min: float | None = None) -> np.ndarray:
     """0 for states with Y >= y_min, NEG below."""
     v = np.zeros(grid.n_states)
     if y_min is not None:
-        v[grid.y < y_min - 1e-9] = NEG
+        v[grid.y < y_min - 1e-9] = NEG  # Eq. (20): terminal SOC
     return v

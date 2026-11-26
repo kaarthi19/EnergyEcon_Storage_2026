@@ -77,3 +77,73 @@ def test_periods():
         period_of(pd.Timestamp("2026-11-03 16:10"))
     with pytest.raises(ValueError):
         period_start(dt.date(2026, 11, 3), 49)
+
+
+# ---- config/default.toml and strategy parameters ------------------------------------------
+
+DEFAULT_TOML = __import__("pathlib").Path(__file__).resolve().parents[1] / "config" / "default.toml"
+
+
+def test_default_toml_equals_defaults():
+    import dataclasses
+    import re
+
+    from bessbid.config import load_strategy_options
+    from bessbid.strategy_full import FullParams
+    from bessbid.strategy_regulation import RegulationOnlyStrategy
+
+    assert load_config(DEFAULT_TOML) == Config()
+    opts = load_strategy_options(DEFAULT_TOML)
+    assert set(opts) == {"full", "regulation"}
+    assert FullParams.from_mapping(opts["full"]) == FullParams()
+    assert opts["regulation"] == {}
+    # every key is documented, set or (for "not set" defaults) commented out
+    text = DEFAULT_TOML.read_text()
+    keys = set(re.findall(r"^#?\s*([a-z_0-9]+)\s*=", text, re.M))
+    for cls in (Config, FullParams):
+        missing = {f.name for f in dataclasses.fields(cls)} - keys
+        assert not missing, f"{cls.__name__} keys missing from default.toml: {missing}"
+    assert {"mw", "price"} <= keys
+    assert {f.name for f in dataclasses.fields(RegulationOnlyStrategy)} - {"name", "needs_data"} == {"mw", "price"}
+
+
+def test_strategy_options(tmp_path):
+    from bessbid.config import load_strategy_options
+    from bessbid.strategy import StrategyError, get_strategy
+    from bessbid.strategy_full import FullParams
+
+    t = tmp_path / "s.toml"
+    t.write_text('soc_margin_mwh = 3.0\n[strategy.full]\ncharge_cap_mw = 40\nlevels = [-50, 0, 50]\n'
+                 'ramp_mw = 30\n[strategy.regulation]\nprice = 0.02\n')
+    assert load_config(t).soc_margin_mwh == 3.0  # the strategy table is not a Config key
+    opts = load_strategy_options(t)
+    p = FullParams.from_mapping(opts["full"])
+    assert p.charge_cap_mw == 40.0 and isinstance(p.charge_cap_mw, float)
+    assert p.levels == (-50.0, 0.0, 50.0) and p.ramp_mw == 30.0
+    assert p.discharge_cap_mw == FullParams().discharge_cap_mw
+    s = get_strategy("full", options=opts["full"])
+    assert s.params == p
+    r = get_strategy("regulation", options=opts["regulation"])
+    assert r.price == 0.02
+    with pytest.raises(ValueError, match="unknown"):
+        FullParams.from_mapping({"charge_cap": 40})
+    with pytest.raises(StrategyError, match="bad options"):
+        get_strategy("full", options={"refine": "sometimes"})
+    with pytest.raises(StrategyError, match="bad options"):
+        get_strategy("regulation", options={"colour": 1})
+    assert load_strategy_options(None) == {}
+    bad = tmp_path / "b.toml"
+    bad.write_text("[strategy]\ncharge_cap_mw = 40\n")
+    with pytest.raises(ValueError, match="sub-table"):
+        load_strategy_options(bad)
+
+
+def test_cli_rejects_unknown_strategy_table(tmp_path, capsys):
+    from bessbid.cli import main
+
+    t = tmp_path / "s.toml"
+    t.write_text("[strategy.fulll]\ncharge_cap_mw = 40\n")
+    rc = main(["generate", "--out", str(tmp_path / "o.xlsx"), "--work-dir", str(tmp_path / "w"),
+               "--strategy", "regulation", "--template", str(tmp_path / "missing.xlsx"), "--config", str(t)])
+    assert rc == 1
+    assert "unknown strategies ['fulll']" in capsys.readouterr().err

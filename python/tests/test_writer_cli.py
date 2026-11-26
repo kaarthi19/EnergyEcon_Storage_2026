@@ -3,7 +3,6 @@ import hashlib
 import json
 import zipfile
 
-import numpy as np
 import openpyxl
 import pandas as pd
 import pytest
@@ -14,7 +13,7 @@ from bessbid.config import Config
 from bessbid.periods import month_slots
 from bessbid.strategy import StrategyError, check_complete, get_strategy, register_strategy
 from bessbid.strategy_regulation import RegulationOnlyStrategy
-from bessbid.validate import errors, format_report, read_workbook_table, validate_xlsx
+from bessbid.validate import format_report, read_workbook_table, validate_xlsx
 from bessbid.writer import WriterError, read_back, write_submission
 
 CFG = Config()
@@ -155,6 +154,12 @@ def test_cli_generate_regulation(template, tmp_path, capsys):
     assert man["rows"] == 5760 and man["validation"]["errors"] == 0 and man["roundtrip_ok"]
     assert man["output_sha256"] == sha(out)
     assert man["offered_mw"]["max_period_offer_mw"] == 100
+    ri = man["run_info"]  # the run record
+    for k in ("started_utc", "runtime_s", "argv", "git", "python", "packages", "highs", "platform"):
+        assert k in ri, k
+    assert set(ri["git"]) == {"commit", "dirty", "branch"}
+    assert ri["packages"]["highspy"] and ri["highs"]
+    assert man["template"]["sha256"] == sha(template)
     back = read_back(out)
     assert (back.loc[back["product"] == "Regulation", "quantity_1"] == 100).all()
     assert back.loc[back["product"] != "Regulation", "quantity_1"].isna().all()

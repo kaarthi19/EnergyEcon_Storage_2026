@@ -313,11 +313,6 @@ class Forecaster:
         self.residuals = lib
         return lib
 
-    def set_residual_library(self, lib: pd.DataFrame) -> None:
-        """Use an existing library (days after the cut are dropped)."""
-        lib = lib[lib["date"] + pd.Timedelta(days=1) <= self.cut]
-        self.residuals = lib.copy()
-
     def _blocks(self, kind: str, day, max_blocks: int | None):
         if self.residuals is None or self.residuals.empty:
             return np.zeros((1, 48, 4)), ["none"]

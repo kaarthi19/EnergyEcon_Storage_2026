@@ -13,7 +13,7 @@ fails when it is asked for.
 from __future__ import annotations
 
 import importlib
-from typing import Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from .bids import PeriodBid
 from .config import Config
@@ -60,7 +60,12 @@ def available_strategies() -> list[str]:
     return sorted(_REGISTRY)
 
 
-def get_strategy(name: str, **kwargs) -> Strategy:
+def get_strategy(name: str, options: Mapping[str, Any] | None = None, **kwargs) -> Strategy:
+    """Instantiate the strategy registered as ``name``.
+
+    ``options``: the strategy's ``[strategy.<name>]`` config table. A factory with a
+    ``from_options(options, **kwargs)`` classmethod gets the table; any other factory gets
+    its keys as keyword arguments. Unknown keys raise :class:`StrategyError`."""
     if name not in _REGISTRY:
         raise StrategyError(f"unknown strategy {name!r}; known: {available_strategies()}")
     target = _REGISTRY[name]
@@ -72,7 +77,14 @@ def get_strategy(name: str, **kwargs) -> Strategy:
             raise StrategyError(f"strategy {name!r} is not available ({target}): {e}") from e
     else:
         factory = target
-    s = factory(**kwargs)
+    try:
+        if options:
+            make = getattr(factory, "from_options", None)
+            s = make(options, **kwargs) if make is not None else factory(**dict(options), **kwargs)
+        else:
+            s = factory(**kwargs)
+    except (TypeError, ValueError) as e:
+        raise StrategyError(f"bad options for strategy {name!r}: {e}") from e
     if not isinstance(s, Strategy):
         raise StrategyError(f"{target} does not implement the Strategy protocol")
     return s

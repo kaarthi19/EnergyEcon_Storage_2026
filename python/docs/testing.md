@@ -1,0 +1,82 @@
+# Tests
+
+```bash
+cd python
+python -m pytest                       # unit tests on small synthetic markets (about 5 min)
+BESSBID_DATA_DIR="/path/to/ema bidding comp" BESSBID_WORK_DIR=/path/to/work python -m pytest
+```
+
+Tests marked `data` run only when `BESSBID_DATA_DIR` is set. They check the following:
+- file discovery;
+- row counts and gap-free series;
+- the shift fix (the kept copy reproduces clearing prices);
+- the November information cut (stacks up to Oct 3 14:30 at Nov 1 00:00; lead 2 h for all
+  1440 periods);
+- a full `generate` run on EMA's real template.
+
+Engine and backtest tests (`test_engine.py`, `test_backtest.py`) run on small synthetic
+markets. They compare the engine with an independent scipy formulation (skipped if scipy
+is absent) and also check the following:
+- BESS monotonicity;
+- the price-taker tie rules;
+- the joint limits;
+- SOC under the three conventions;
+- the clip and reject policies;
+- revenue signs.
+
+The data tests in `test_engine_data.py` check:
+- 200 sampled periods, including the Oct 12 16:30-17:30 scarcity;
+- all 5904 periods;
+- the regulation-only golden numbers;
+- the CLI `backtest`.
+
+Forecast tests (`test_forecast.py`) run on a synthetic market with two outage cycles, a
+surge window and LP-cleared prices. They check that the calendar is learned exactly, the stack
+lags are published and of the right period of day, copy detection, night-solar zeroing, and
+forecast accuracy. They also include a no-leak property test: every stack, pre-dispatch and
+clearing row not legal at the decision time is perturbed, and the lead-2 h, day-ahead and
+scenario forecasts must come out bit-identical. A control test checks that perturbing legal
+rows does change the forecast. `test_forecast_data.py` repeats the calendar and no-leak checks
+on EMA's data and runs an October walk-forward.
+
+Strategy tests: `test_soc_planner.py` checks the SOC formulas under every convention,
+that the binding state Y is the extreme convention, the interval tracker, the exact action
+grid, and the dynamic programme against brute force. `test_strategy_full.py` plans a month
+on the synthetic market and checks:
+- completeness, the capacity rule and always-clearing prices;
+- the event bans and size caps;
+- SOC under every convention with the margin and the terminal target;
+- a replay in the backtest with 0 breaches in both modes;
+- determinism;
+- the information cut: bids for periods up to T are identical when every row not yet legal
+  at T's gate is perturbed, for T on the first, a middle and the last day of the month, and
+  for the gate-time daily plan and the lead-2 h refinement;
+- the ramp limit (every step <= 42 MW from 0 MW at the start) and switching it off;
+- a guard that fires on every charge keeps the month-end SOC target (it used to abort);
+- a planner input issued after its decision time raises `LeakError`.
+
+`test_soc_planner.py` also checks the ramp-limited programme against brute force and that
+it equals the plain programme without a limit. `test_engine.py` checks that non-finite
+inputs raise. `test_writer_cli.py` checks that `generate` stops (exit 1) when the test
+pre-dispatch file is missing or covers only part of the month, that
+`--allow-incomplete-inputs` turns this into a warning, that the coverage counts only legal
+lead-2 h / 3 h vintages, and the Regulation-only fallback when planning fails.
+`test_strategy_full.py` also checks the calendar check (consistent on the synthetic market,
+flagged for a calendar shifted by one day). `test_io.py` checks whole-word and
+folder-based file classification and header trimming.
+
+`test_evaluate.py` checks the walk-forward harness and the perfect-foresight bound.
+`test_strategy_data.py` (data, slow) runs the November `generate` end to end and an October
+pseudo-November that must beat Regulation-only by more than 50k under both modes and all
+conventions with 0 breaches.
+
+Tests marked `slow` (all 5904 periods; Jul-Oct goldens) take about 10 s; deselect them with
+`-m "not slow"`.
+
+`test_config_periods.py` checks the config file handling: overrides in TOML and JSON,
+unknown keys, `config/default.toml` reproducing every default exactly (and naming every key
+of `Config`, `FullParams` and the fallback), the `[strategy.<name>]` tables with type
+conversion, and the CLI refusing a table for an unknown strategy.
+
+`BESSBID_WORK_DIR` reuses the parquet caches. Without it, the tests build the caches in a
+temporary folder.
