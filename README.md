@@ -5,6 +5,8 @@
 This project implements a bilevel optimization model for strategic storage bidding in electricity markets. The upper level optimizes storage bidding decisions, while the lower level solves the economic dispatch problem that clears the market. The repository also contains the Python scripts that reproduce every table and figure in the paper from the model outputs.
 
 > **EMA BESS Bidding Algorithm Hackathon (Nov 2026):** [`hackathon/`](hackathon/README.md) adapts this repository's storage model into a bidding algorithm for the Singapore Wholesale Electricity Market. It covers energy, regulation, primary reserve and contingency reserve, and is written in Julia with JuMP and the open-source HiGHS solver.
+>
+> The Python implementation for the submission (EMA requires Python or R) is in [`python/`](python/README.md): `python -m bessbid generate --data-dir <EMA data> --out <file.xlsx> --work-dir <work>`.
 
 ## Contents
 
