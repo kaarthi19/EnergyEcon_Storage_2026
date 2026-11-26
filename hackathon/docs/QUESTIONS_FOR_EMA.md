@@ -31,11 +31,13 @@ Thank you for releasing the datasets and the submission template. We would be gr
 
 5. **Clearing of individual price bands.** Is a band offered at exactly the clearing price cleared? Can a band clear partially? What are the minimum and maximum offer prices allowed for Energy and for each ancillary service? Are negative offer prices allowed?
 
-6. **Rows without offers.** If we do not wish to offer a product in a period, should we leave its row in the template with all bands blank, or omit the row? Should quantities be given to one decimal place?
+6. **Ramp limits.** Does the simulation apply a ramp-rate limit to the BESS, so that its energy dispatch can change by only a limited number of MW from one trading period to the next? If so, what is the limit? Does it also apply between charging and discharging, and to changes in reserve and regulation awards? If an offered band cannot clear in full because of the limit, is it cleared partially?
 
-7. **Training data as a guide to the test month.** May we assume the test-month market follows the same simulation as the training months? This covers generator outages and their timing, demand patterns and reserve requirements. Will the simulation of the test month continue from the end of the training period, or start fresh on 1 November?
+7. **Rows without offers.** If we do not wish to offer a product in a period, should we leave its row in the template with all bands blank, or omit the row? Should quantities be given to one decimal place?
 
-8. **Intellectual property.** Our algorithm builds on our own pre-existing, MIT-licensed research code. Does the assignment in clause 20 cover only material created for the hackathon, or also pre-existing code and open-source components included in a submission? May participants describe their methodology in academic publications afterwards?
+8. **Training data as a guide to the test month.** May we assume the test-month market follows the same simulation as the training months? This covers generator outages and their timing, demand patterns and reserve requirements. Will the simulation of the test month continue from the end of the training period, or start fresh on 1 November?
+
+9. **Intellectual property.** Our algorithm builds on our own pre-existing, MIT-licensed research code. Does the assignment in clause 20 cover only material created for the hackathon, or also pre-existing code and open-source components included in a submission? May participants describe their methodology in academic publications afterwards?
 
 Thank you for your help.
 
@@ -53,6 +55,7 @@ Kind regards,
 | 3 | Evaluated under both price-maker and price-taker clearing; fixed energy offers clear in either case | If EMA settles against fixed prices, scarcity revenue is higher (no self-relief) |
 | 4 | Strict: T's own lead-2h/lead-3h vintages; stacks published by T − 65 min | The broad reading allows multi-vintage net-demand forecasts (small accuracy gain) |
 | 5 | Ties treated conservatively; offer prices kept inside the observed price range | Offer pricing of the always-clearing bands |
-| 6 | Rows kept, bands blank; MW to 0.1, rounded toward zero | Writer format only |
-| 7 | Same simulation; event calendar learned from training data; no ramp state carried over | If the process changes, the event layer is switched off (regulation plus small arbitrage) |
-| 8 | Unresolved; see the IP note in the README | — |
+| 6 | No ramp limit on the BESS; being changed to a limit of 42 MW per period, the generators' rate in the training clearing | If EMA applies a limit and we exceed it, a band that fails to clear knocks the state-of-charge plan out of range for the rest of the month |
+| 7 | Rows kept, bands blank; MW to 0.1, rounded toward zero | Writer format only |
+| 8 | Same simulation; event calendar learned from training data; no ramp state carried over | If the process changes, the event layer is switched off (regulation plus small arbitrage) |
+| 9 | Unresolved; see the IP note in the README | — |
