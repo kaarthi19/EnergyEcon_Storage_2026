@@ -49,7 +49,6 @@ class Config:
     round_trip_eff: float = 0.85
     initial_soc_frac: float = 0.50
     period_hours: float = 0.5
-    periods_per_day: int = 48
     #: (eta_charge, eta_discharge) pairs the plan must stay feasible under. EMA has not
     #: said how the 85 % loss is split, so SOC must hold for every convention listed.
     efficiency_conventions: tuple[tuple[float, float], ...] = field(
@@ -63,14 +62,13 @@ class Config:
     # ---- Offer prices ---------------------------------------------------------------------
     #: Price of an always-clearing discharge band (clears when offer < clearing price).
     #: 0.01 rather than 0.00: the template's number format shows zero as '-', which a reader
-    #: could take for a blank cell. Training energy prices never fell below 133.
+    #: could take for a blank cell. Far below any energy price seen in training.
     discharge_floor_price: float = 0.01
     #: Price of an always-clearing charge band (clears when offer > clearing price).
-    #: Training energy prices never exceeded 2058.4; 3000 also avoids charging into a
-    #: deeper shortage.
+    #: Well above any energy price seen in training, and below the 4500 price limit.
     charge_cap_price: float = 3000.0
     #: Price used for always-clearing AS bands (0.01, not 0.00, for the same display reason;
-    #: training reserve prices never fell below 1.8).
+    #: below every reserve price seen in training).
     as_floor_price: float = 0.01
     #: Hard bounds the validator accepts for any offer price (SWEM limits, assumption).
     offer_price_min: float = -4500.0
@@ -104,6 +102,11 @@ class Config:
     shortfall_price_regulation: float = 1200.0
     voll: float = 4500.0
     ramp_up_frac: float = 0.42
+    #: Largest change of the BESS energy schedule from one period to the next (MW), the
+    #: ESS up/down ramp constraints of RC383 (D.19.1.1A/D.19.1.2A). EMA has not stated a
+    #: ramp rate for the hypothetical BESS; the default mirrors the generators' ramp in the
+    #: replicated engine (0.42 x 100 MW per period). 0 = no limit.
+    bess_ramp_mw: float = 42.0
 
     # ---- Run ---------------------------------------------------------------------------
     month: str = "2026-11"
@@ -127,6 +130,8 @@ class Config:
                 errs.append(
                     f"efficiency convention ({ec}, {ed}) must have eta_c*eta_d == round_trip_eff"
                 )
+        if self.bess_ramp_mw < 0:
+            errs.append("bess_ramp_mw must be >= 0 (0 = no limit)")
         if self.mw_resolution <= 0:
             errs.append("mw_resolution must be > 0")
         if self.gate_closure_min < 0:

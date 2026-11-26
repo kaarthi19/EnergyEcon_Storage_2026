@@ -2,7 +2,7 @@
 
     python -m bessbid generate --data-dir D --out OUT.xlsx --work-dir W \
         [--template T] [--strategy full|regulation] [--month 2026-11] [--config cfg.toml] \
-        [--plan-out PLAN.csv]
+        [--plan-out PLAN.csv] [--allow-incomplete-inputs]
     python -m bessbid validate OUT.xlsx [--month 2026-11] [--config cfg.toml]
     python -m bessbid inspect --data-dir D --work-dir W
     python -m bessbid evaluate --data-dir D --work-dir W [--month M ...] [--no-pf]
@@ -18,6 +18,15 @@ energy overlay); it also writes the per-period plan (dispatch, SOC under every e
 convention, forecasts) to ``--plan-out`` (default ``<work>/<out stem>.plan.csv``).
 Exit code 0 on success, 2 if the file fails validation.
 Nothing is written into the data dir.
+
+Input checks: a strategy that reads market data stops with exit code 1 when the test-month
+pre-dispatch file is missing or does not give every period of the month a legal vintage
+(lead 2 h / 3 h, issued by the period's gate); the manifest records the coverage
+(``inputs.predispatch_test_coverage``). ``--allow-incomplete-inputs`` turns that into a
+warning (diagnostics only, not for a submission). The full strategy also checks its event
+calendar against the pre-dispatch vintages (manifest ``plan.info.calendar_check``, one line
+on stderr). If the full strategy cannot plan at all, ``generate`` warns loudly and writes the
+Regulation-only fallback instead of nothing (manifest ``fallback``).
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from . import __version__
 from .bids import to_table
@@ -54,6 +64,30 @@ def _tables_equal(a, b) -> bool:
         elif not (x == y).all():
             return False
     return True
+
+
+def predispatch_coverage(ds, cfg, month: str) -> dict:
+    """How many periods of ``month`` have a legal pre-dispatch vintage in the test-month
+    file: a row of the period itself with a configured lead (2 h / 3 h) issued by the
+    period's gate (``T - gate_closure_min``)."""
+    from .periods import month_slots
+
+    Ts = np.array([s.start for s in month_slots(month)], dtype="datetime64[ns]")
+    out = {"periods": int(len(Ts)), "covered": 0, "file": bool(ds.predispatch_test is not None),
+           "first_missing": None}
+    p = ds.predispatch_test
+    covered = np.zeros(len(Ts), bool)
+    if p is not None and len(p):
+        leads = set(float(x) for x in cfg.predispatch_leads)
+        gate = np.timedelta64(int(cfg.gate_closure_min), "m")
+        ts = p["ts"].to_numpy(dtype="datetime64[ns]")
+        it = p["issue_time"].to_numpy(dtype="datetime64[ns]")
+        ok = p["lead_hours"].astype(float).isin(leads).to_numpy() & (it <= ts - gate)
+        covered = np.isin(Ts, ts[ok])
+        out["covered"] = int(covered.sum())
+    if not covered.all():
+        out["first_missing"] = str(pd.Timestamp(Ts[np.argmin(covered)]))
+    return out
 
 
 def cmd_generate(args) -> int:
@@ -85,6 +119,7 @@ def cmd_generate(args) -> int:
         return 1
 
     infoset, files_info = None, None
+    input_warnings: list[str] = []
     if strategy.needs_data:
         if data_dir is None:
             print(f"error: strategy {strategy.name!r} needs --data-dir", file=sys.stderr)
@@ -93,6 +128,26 @@ def cmd_generate(args) -> int:
 
         ds = io.load_all(data_dir, work)
         files_info = ds.files.describe()
+        cov = predispatch_coverage(ds, cfg, month)
+        files_info["predispatch_test_coverage"] = cov
+        if not cov["file"]:
+            input_warnings.append(f"no test-month pre-dispatch file found under {data_dir} (looked for "
+                                  "'*pre_dispatch*.csv' / '*predispatch*.csv' that is not training data "
+                                  "by its name or folder)")
+        elif cov["covered"] < cov["periods"]:
+            input_warnings.append(f"the test-month pre-dispatch file gives a legal lead-2h/3h vintage for only "
+                                  f"{cov['covered']} of {cov['periods']} periods of {month} (first missing: "
+                                  f"{cov['first_missing']})")
+        if input_warnings and not args.allow_incomplete_inputs:
+            for w in input_warnings:
+                print(f"error: {w}", file=sys.stderr)
+            print("error: the November pre-dispatch forecasts are required (each period's lead-2h "
+                  "charge guard uses its own vintage); add the file to --data-dir. "
+                  "--allow-incomplete-inputs runs anyway (diagnostics only).", file=sys.stderr)
+            return 1
+        for w in input_warnings:
+            print(f"WARNING: {w}. The lead-2h charge guard falls back to the day-ahead inputs.",
+                  file=sys.stderr)
         infoset = InfoSet.from_dataset(ds, cfg)
     elif data_dir is not None:
         try:
@@ -100,8 +155,26 @@ def cmd_generate(args) -> int:
         except FileNotFoundError as e:  # the fallback does not need the data
             files_info = {"warning": str(e)}
 
-    bids = strategy.generate(month, infoset, cfg)
+    fallback = None
+    try:
+        bids = strategy.generate(month, infoset, cfg)
+    except (RuntimeError, ValueError) as e:
+        from .infoset import LeakError
+
+        if isinstance(e, LeakError) or strategy.name == "regulation":
+            raise
+        fallback = f"{type(e).__name__}: {e}"
+        print(f"WARNING: strategy {strategy.name!r} failed ({fallback}); writing the Regulation-only "
+              "fallback instead", file=sys.stderr)
+        strategy = get_strategy("regulation")
+        bids = strategy.generate(month, None, cfg)
     check_complete(bids, month)
+    plan_info = getattr(strategy, "plan_info", None) or {}
+    cc = plan_info.get("calendar_check")
+    if cc is not None and cc.get("ok"):
+        print(f"calendar check: {cc['messages'][0]}", file=sys.stderr)
+    for w in plan_info.get("warnings", []):
+        print(f"WARNING: {w}", file=sys.stderr)
     table = to_table(bids)
     write_submission(table, template, out, cfg, month)
 
@@ -131,6 +204,8 @@ def cmd_generate(args) -> int:
         "table_sha256": hashlib.sha256(table.to_csv(index=False, float_format="%.6f").encode()).hexdigest(),
         "template": {"name": template.name, "sha256": _sha256(template)},
         "inputs": files_info,
+        "input_warnings": input_warnings,
+        "fallback": fallback,
         "config": cfg.to_dict(),
         "validation": {"errors": len(errors(vs)), "warnings": len(vs) - len(errors(vs)),
                        "messages": [str(v) for v in vs[:50]]},
@@ -285,6 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--month", default=None, help="YYYY-MM (default from config: 2026-11)")
     g.add_argument("--config", default=None, help="optional .toml/.json overrides")
     g.add_argument("--plan-out", default=None, help="CSV for the per-period plan (strategies that make one)")
+    g.add_argument("--allow-incomplete-inputs", action="store_true",
+                   help="warn instead of failing (exit 1) when the test-month pre-dispatch is missing or "
+                        "partial (diagnostics only; not for a submission)")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("validate", help="validate a bid workbook")

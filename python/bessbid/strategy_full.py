@@ -58,7 +58,11 @@ from .planner import (
     NEG,
     ValueModel,
     dp_backward,
+    dp_backward_ramp,
     make_action_grid,
+    ramp_active,
+    ramp_ok,
+    soften_end_values,
     terminal_values,
 )
 from .soc import binding_soc, check_soc, soc_paths, y_terminal_min
@@ -105,6 +109,9 @@ class FullParams:
     levels: tuple = LEVELS
     #: value actions with our own price impact (False: price-taker values at x = 0)
     price_impact: bool = True
+    #: largest change of the energy schedule between consecutive periods (MW); None:
+    #: ``cfg.bess_ramp_mw``; 0: no limit. The month starts from 0 MW.
+    ramp_mw: float | None = None
 
     def __post_init__(self) -> None:
         if self.refine not in ("none", "guard", "lead2"):
@@ -113,6 +120,8 @@ class FullParams:
             raise ValueError("lead2_scope must be 'all' or 'events'")
         if self.plan_time not in ("midnight", "gate"):
             raise ValueError("plan_time must be 'midnight' or 'gate'")
+        if self.ramp_mw is not None and self.ramp_mw < 0:
+            raise ValueError("ramp_mw must be >= 0 (0 = no limit)")
 
 
 def _event_masks(cal, Ts: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
@@ -172,6 +181,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                             max_discharge_mw=max(p.discharge_cap_mw, p.event_discharge_cap_mw),
                             y_step=p.y_step, charge_step_mw=p.charge_step_mw)
     hurdle = p.hurdle_per_mwh * cfg.period_hours * np.abs(grid.mw)[None, :]
+    ramp = cfg.bess_ramp_mw if p.ramp_mw is None else p.ramp_mw
+    use_ramp = ramp_active(ramp, cfg)
+    R_ok = ramp_ok(grid, ramp if use_ramp else None)  # R_ok[a_prev, a]
     x0 = int(np.argmin(np.abs(vm.levels)))
 
     def values(lad):
@@ -189,10 +201,18 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     dec0 = infoset.cutoff(Ts[0])
     inp0 = fc.da_inputs(Ts, dec0)
     lad_ma = cached("lad_ma", lambda: vm.ladder(Ts, dec0, inp0["nd"].to_numpy(), inp0["outage"].to_numpy(),
-                                                 kind="month_ahead", nodes=nodes_da))
+                                                 kind="month_ahead", nodes=nodes_da,
+                                                 inputs_time=inp0["input_time"].to_numpy()))
     F_ma = values(lad_ma)
     A_ma = _allowed(grid, ev, lad_ma["margin"], p)
-    V_ma, _ = dp_backward(F_ma, grid, A_ma, V_term)
+    days = sorted(set(Ts.normalize()))
+    day_idx = [np.where(Ts.normalize() == D)[0] for D in days]
+    if use_ramp:
+        # only the values at the day boundaries are needed: V_ma[t][s, a_prev]
+        V_ma, _ = dp_backward_ramp(F_ma, grid, A_ma, V_term, ramp, keep=[ix[-1] + 1 for ix in day_idx],
+                                   policy=False)
+    else:
+        V_ma, _ = dp_backward(F_ma, grid, A_ma, V_term)
     if progress:
         progress(f"month-ahead values done ({time.perf_counter() - t0:.1f}s)")
 
@@ -205,7 +225,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
             il2 = np.arange(n) if p.lead2_scope == "all" else np.where(ev)[0]
             decs = [infoset.cutoff(T) for T in Ts[il2]]
             lad_l2 = cached(("lad_l2", p.lead2_scope), lambda: vm.ladder(
-                Ts[il2], decs, l2["nd"].to_numpy()[il2], l2["outage"].to_numpy()[il2], kind="lead2", nodes=nodes_l2))
+                Ts[il2], decs, l2["nd"].to_numpy()[il2], l2["outage"].to_numpy()[il2], kind="lead2", nodes=nodes_l2,
+                inputs_time=pd.to_datetime(l2["issue_time"]).to_numpy()[il2]))
             F_l2 = np.full((n, grid.n_actions), np.nan)
             if len(il2):
                 F_l2[il2] = values(lad_l2)
@@ -216,6 +237,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     s = grid.nearest_state(cfg.initial_soc_mwh)
     if abs(grid.y[s] - cfg.initial_soc_mwh) > 1e-9:
         raise ValueError("initial SOC must lie on the planning grid; change y_step")
+    zero = int(np.where(grid.mw == 0)[0][0])
+    a_prev = zero  # the month starts from an idle energy schedule
     acts = np.zeros(n, dtype=int)
     Y = np.zeros(n)
     tag = np.empty(n, dtype=object)
@@ -223,11 +246,16 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     da_R = np.zeros(n)
     da_margin = np.zeros(n)
     planned = np.zeros(n)
-    nxt_ok = None
-    days = sorted(set(Ts.normalize()))
-    i0 = 0
-    for D in days:
-        idx = np.where(Ts.normalize() == D)[0]
+    warnings_: list[str] = []
+    cols = np.arange(grid.n_actions)
+
+    def nxt_value(V, k, st):
+        """Value-to-go after period k for each action (landing states ``st``, any index)."""
+        stc = np.clip(st, 0, grid.n_states - 1)
+        v = V[k + 1][stc, cols] if use_ramp else V[k + 1][stc]
+        return np.where((st >= 0) & (st < grid.n_states), v, NEG)
+
+    for D, idx in zip(days, day_idx):
         TD = Ts[idx]
         if p.plan_time == "gate":
             dec = max(infoset.cutoff(D), cut)
@@ -235,40 +263,58 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
             dec = max(D - pd.Timedelta(days=p.plan_lead_days), cut)
         inp = fc.da_inputs(TD, dec)
         lad = cached(("lad_da", D), lambda: vm.ladder(TD, dec, inp["nd"].to_numpy(), inp["outage"].to_numpy(),
-                                                       kind="day_ahead", nodes=nodes_da))
+                                                       kind="day_ahead", nodes=nodes_da,
+                                                       inputs_time=inp["input_time"].to_numpy()))
         F = values(lad)
         A = _allowed(grid, ev[idx], lad["margin"], p)
         V_end = V_ma[idx[-1] + 1]
-        V, pol = dp_backward(F, grid, A, V_end)
-        if V[0, s] <= NEG / 2:
-            raise RuntimeError(f"{D.date()}: no feasible plan from Y={grid.y[s]}")
-        zero = int(np.where(grid.mw == 0)[0][0])
+
+        def solve(V_end):
+            if use_ramp:
+                return dp_backward_ramp(F, grid, A, V_end, ramp)
+            return dp_backward(F, grid, A, V_end)
+
+        V, pol = solve(V_end)
+        if (V[0][s, a_prev] if use_ramp else V[0][s]) <= NEG / 2:
+            # the month-ahead target is out of reach (e.g. today's bans differ): plan to the
+            # nearest reachable state instead of giving up
+            V, pol = solve(soften_end_values(V_end, grid))
+            warnings_.append(f"{D.date()}: month-ahead SOC target unreachable from Y={grid.y[s]}; "
+                             "planned to the nearest reachable state")
         for k, i in enumerate(idx):
-            a = int(pol[k, s])
+            a = int(pol[k, s, a_prev]) if use_ramp else int(pol[k, s])
             planned[i] = grid.mw[a]
             tg = "plan"
+            st = s + grid.steps
             if p.refine == "lead2" and (p.lead2_scope == "all" or ev[i]):
                 # one-step re-optimisation on T's lead-2 h values, DA continuation value
-                st = s + grid.steps
-                ok = (st >= 0) & (st < grid.n_states) & A[k]
-                cand = np.where(ok, F_l2[i] + V[k + 1][np.clip(st, 0, grid.n_states - 1)], NEG)
+                ok = A[k] & R_ok[a_prev]
+                cand = np.where(ok, F_l2[i] + nxt_value(V, k, st), NEG)
                 a2 = int(cand.argmax())
-                if a2 != a:
+                if a2 != a and cand[a2] > NEG / 2:
                     a, tg = a2, "lead2"
             if l2 is not None and grid.mw[a] < 0:
                 r = l2.loc[Ts[i]]
                 margin_l2 = float(np.sum(fc.stacks.nom)) - float(r.nd_eff) - float(r.req_P + r.req_C + r.req_R)
                 short = float(r.sP + r.sC + r.sR)
                 if margin_l2 < p.guard_margin_mw or float(r.E) > p.guard_price or short > 1e-6:
-                    a, tg = zero, "guard"
+                    # cancel the charge, or cut it as far as the ramp limit and the month-end
+                    # SOC target still allow (the least charging such action)
+                    ok = (grid.mw <= 0) & (grid.mw >= grid.mw[a]) & R_ok[a_prev] & (nxt_value(V, k, st) > NEG / 2)
+                    ok[a] = False
+                    if ok.any():
+                        a = int(np.flatnonzero(ok)[np.argmax(grid.mw[ok])])
+                        tg = "guard"
+                    else:
+                        tg = "guard_blocked"
             acts[i] = a
             s = s + int(grid.steps[a])
+            a_prev = a
             Y[i] = grid.y[s]
             tag[i] = tg
             da_E[i] = lad["E"][k, x0]
             da_R[i] = lad["R"][k, x0]
             da_margin[i] = lad["margin"][k]
-        i0 += len(idx)
         if progress and D.day % 5 == 0:
             progress(f"planned through {D.date()} ({time.perf_counter() - t0:.1f}s)")
 
@@ -278,10 +324,24 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     chg = np.clip(-mw, 0, None)
     chk = check_soc(dis, chg, cfg, margin=0.0, terminal_mwh=cfg.terminal_soc_frac * cfg.energy_mwh)
     if not chk.ok:
-        raise RuntimeError(f"planned SOC breaks a limit: {chk.to_dict()}")
+        bounds = check_soc(dis, chg, cfg, margin=0.0)
+        if not bounds.ok:  # cannot happen on the planning grid; never write such bids
+            raise RuntimeError(f"planned SOC breaks a limit: {chk.to_dict()}")
+        warnings_.append(f"month-end SOC target missed: final SOC {chk.final_min:.1f} MWh "
+                         f"< {cfg.terminal_soc_frac * cfg.energy_mwh:.1f} MWh")
+    steps_mw = np.abs(np.diff(np.concatenate([[0.0], grid.mw[acts]])))
+    if use_ramp and steps_mw.max() > ramp + 1e-6:
+        raise RuntimeError(f"planned energy schedule breaks the ramp limit {ramp} MW: {steps_mw.max():.1f}")
     Yc = binding_soc(dis, chg, cfg)
     if np.max(np.abs(Yc - Y)) > 1e-6:
         raise RuntimeError("planned Y path does not match the bid quantities")
+
+    # ---- diagnostics (reported, never change a bid) ---------------------------------------
+    from .checks import calendar_consistency
+
+    cal_check = calendar_consistency(fc, Ts)
+    if not cal_check["ok"]:
+        warnings_.extend(f"calendar check: {m}" for m in cal_check["messages"])
 
     bids = []
     for i, sl in enumerate(slots):
@@ -317,6 +377,11 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         "discharge_mwh": float(dis.sum() * cfg.period_hours),
         "charge_mwh": float(chg.sum() * cfg.period_hours),
         "guarded_periods": int((tag == "guard").sum()),
+        "guard_blocked_periods": int((tag == "guard_blocked").sum()),
+        "ramp_mw": float(ramp) if use_ramp else None,
+        "max_ramp_mw": float(steps_mw.max()),
+        "warnings": warnings_,
+        "calendar_check": cal_check,
         "runtime_s": time.perf_counter() - t0,
     }
     return bids, frame, info

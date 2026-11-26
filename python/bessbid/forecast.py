@@ -230,19 +230,28 @@ class Forecaster:
         return self.calendar.calendar_outage(pd.DatetimeIndex(Ts).to_numpy(dtype="datetime64[ns]"))
 
     def da_inputs(self, Ts, decision_time) -> pd.DataFrame:
-        """Net demand and expected outage used by the day-ahead forecast."""
+        """Net demand and expected outage used by the day-ahead forecast, plus
+        ``input_time``: the issue time of T's own pre-dispatch vintage when one was used
+        (NaT otherwise; the history behind the profile is audited at the decision time)."""
         Ts = pd.DatetimeIndex(Ts)
         dec = _ts(decision_time)
         nd = self.nd.profile(Ts, dec)
         K = self._da_outage(Ts, dec)
+        itime = np.full(len(Ts), np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
         # T's own vintage issued by the decision time carries a better outage too
         vin = self.nd._own_vintages_by(Ts, dec)
         if len(vin):
             rows = self.info.predispatch_for_many(vin.index)
             rows = rows[rows["issue_time"] <= dec]
             for T, r in rows.iterrows():
-                K[Ts.get_loc(T)] = self.calendar.expected_outage(T, float(r.known_outage_mw_at_issue), r.issue_time)
-        return pd.DataFrame({"nd": nd, "outage": K}, index=Ts)
+                k = Ts.get_loc(T)
+                K[k] = self.calendar.expected_outage(T, float(r.known_outage_mw_at_issue), r.issue_time)
+                itime[k] = np.datetime64(pd.Timestamp(r.issue_time), "ns")
+            for T in vin.index:  # the profile's own vintage (same rows, same filter)
+                k = Ts.get_loc(T)
+                if pd.isna(itime[k]):
+                    itime[k] = np.datetime64(dec, "ns")
+        return pd.DataFrame({"nd": nd, "outage": K, "input_time": itime}, index=Ts)
 
     def day_ahead_periods(self, Ts, decision_time, chain: bool | None = None) -> pd.DataFrame:
         """Forecasts for any periods ``Ts`` (all after ``decision_time``) made at one
@@ -537,7 +546,7 @@ def evaluate(wf: pd.DataFrame, kinds=("lead2", "day_ahead"), spike_mw: float = S
             if k == "E":
                 dd = d.copy()
                 dd["day"] = dd.index.normalize()
-                r["day_spearman"] = float(dd.groupby("day").apply(
+                r["day_spearman"] = float(dd.groupby("day")[[col, f"actual_{k}"]].apply(
                     lambda g: g[col].rank().corr(g[f"actual_{k}"].rank())).mean())
             q10, q50, q90 = (f"{kind}_ens_{k}_q10", f"{kind}_ens_{k}_q50", f"{kind}_ens_{k}_q90")
             if q90 in wf.columns:

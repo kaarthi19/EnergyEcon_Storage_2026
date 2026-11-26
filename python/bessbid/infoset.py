@@ -7,8 +7,9 @@ EMA's rules (violations can disqualify):
   own rows: lead 2 h, else lead 3 h (lead 1 h and 0.5 h are issued after the gate);
 * an offer-stack row may be used only once published: ``pub <= T - 65 min``
   (``pub`` = assumed_publication_time_sgt = ts + 28 d 8 h, so stacks lag >= 29 days);
-* a training clearing row may be used only once its period has ended
-  (``ts + 30 min <= decision time``).
+* a training clearing row (and a training actual) may be used only once its period has
+  ended before the decision time (``ts + 30 min < decision time``, strict: a period that
+  ends exactly at the decision time is not used).
 
 Every accessor checks the data it hands out against its decision time, raises
 :class:`LeakError` if anything is newer, and appends an :class:`AuditEntry` holding the
@@ -194,15 +195,15 @@ class InfoSet:
     def predispatch_known_at(self, t) -> pd.DataFrame:
         """All pre-dispatch rows (any period) issued at or before ``t``.
 
-        Actual load/solar (training only) are masked to NaN unless their period has ended
-        by ``t``."""
+        Actual load/solar (training only) are masked to NaN unless their period ended
+        before ``t``."""
         p = self._need_pd()
         t = _ts(t)
         k = int(np.searchsorted(self._pd_issue, np.datetime64(t, "ns"), side="right"))
         out = p.iloc[:k].copy()
         max_used = out["issue_time"].max() if k else None
         if self._pd_actual_cols and k:
-            hidden = (out["ts"] + PERIOD) > t
+            hidden = (out["ts"] + PERIOD) >= t
             out.loc[hidden, self._pd_actual_cols] = np.nan
             shown = out.loc[~hidden, "ts"]
             if len(shown):
@@ -302,11 +303,11 @@ class InfoSet:
 
     # ---- clearing ----------------------------------------------------------------------
     def clearing_known_at(self, t) -> pd.DataFrame:
-        """Training clearing rows whose period ended at or before ``t``."""
+        """Training clearing rows whose period ended before ``t`` (strictly)."""
         if self._clr is None:
             raise ValueError("InfoSet has no clearing data")
         t = _ts(t)
-        k = int(np.searchsorted(self._clr_end, np.datetime64(t, "ns"), side="right"))
+        k = int(np.searchsorted(self._clr_end, np.datetime64(t, "ns"), side="left"))
         out = self._clr.iloc[:k]
         self._record("clearing_known_at", t, self._clr_end[k - 1] if k else None, k)
         return out

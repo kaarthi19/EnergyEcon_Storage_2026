@@ -74,7 +74,24 @@ STACK_PRODUCTS = {"Energy": "E", "Primary": "P", "Contingency": "C", "Regulation
 
 
 class EngineError(RuntimeError):
-    """The LP did not solve to optimality."""
+    """The LP did not solve to optimality, or its inputs are not finite."""
+
+
+def _check_finite(stack: "PeriodStack", net_demand: float, rq, bess: "BessOffer | None") -> None:
+    bad = []
+    for name in ("e_q", "e_p", "p_q", "p_p", "c_q", "c_p", "r_q", "r_p", "av"):
+        if not np.isfinite(getattr(stack, name)).all():
+            bad.append(f"stack.{name}")
+    if not np.isfinite(net_demand):
+        bad.append("net_demand")
+    if not np.isfinite(rq).all():
+        bad.append("requirements")
+    if bess is not None:
+        for k in ("energy", "primary", "contingency", "regulation"):
+            if any(not (np.isfinite(p) and np.isfinite(q)) for p, q in getattr(bess, k)):
+                bad.append(f"bess.{k}")
+    if bad:
+        raise EngineError(f"non-finite clearing input: {', '.join(bad)}")
 
 
 # --------------------------------------------------------------------------------------
@@ -404,6 +421,7 @@ class _Model:
         self.h = h
         self.inf = inf
         self.optimal = highspy.HighsModelStatus.kOptimal
+        self.ok = highspy.HighsStatus.kOk
         self.all_cols = np.arange(self.nv, dtype=np.int32)
         self.all_rows = np.arange(self.nr, dtype=np.int32)
         self.cost = np.zeros(self.nv)
@@ -456,6 +474,10 @@ class ClearingEngine:
             rq = (float(req["P"]), float(req["C"]), float(req["R"]))
         else:
             rq = tuple(float(x) for x in req)
+        net_demand = float(net_demand)
+        _check_finite(stack, net_demand, rq, bess)
+        if prev is not None and not np.isfinite(prev).all():
+            raise EngineError("non-finite clearing input: prev")
         eq = _ramp_clip(stack.e_q, stack.av, prev, self.cfg.ramp_up_frac)
         cost = m.cost.copy()
         ub = m.ub.copy()
@@ -498,9 +520,11 @@ class ClearingEngine:
         ru[m.rBd] = ru[m.rBc] = self.bess_pmax
         if not self.warm_start:
             h.clearSolver()
-        h.changeColsCost(m.nv, m.all_cols, cost)
-        h.changeColsBounds(m.nv, m.all_cols, np.zeros(m.nv), ub)
-        h.changeRowsBounds(m.nr, m.all_rows, rl, ru)
+        for st in (h.changeColsCost(m.nv, m.all_cols, cost),
+                   h.changeColsBounds(m.nv, m.all_cols, np.zeros(m.nv), ub),
+                   h.changeRowsBounds(m.nr, m.all_rows, rl, ru)):
+            if st != m.ok:
+                raise EngineError(f"HiGHS rejected the model update: {st}")
         h.run()
         self.n_solves += 1
         status = h.getModelStatus()

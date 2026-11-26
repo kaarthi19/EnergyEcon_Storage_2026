@@ -15,7 +15,7 @@ def test_defaults():
     assert c.soc_min_mwh == pytest.approx(5) and c.soc_max_mwh == pytest.approx(95)
     assert c.initial_soc_mwh == pytest.approx(50)
     assert c.capacity_rule == "strict" and c.gate_closure_min == 65 and c.stack_pub_rule == "column"
-    assert c.discharge_floor_price == 0.01 and c.as_floor_price == 0.01 and c.charge_cap_price > 2058.4
+    assert c.discharge_floor_price == 0.01 and c.as_floor_price == 0.01 and c.charge_cap_price == 3000.0
     convs = c.efficiency_conventions
     assert len(convs) == 3
     assert convs[0] == (1.0, 0.85) and convs[2] == (0.85, 1.0)

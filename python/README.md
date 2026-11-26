@@ -25,16 +25,24 @@ and 3.11. With these pins the output workbook is byte-identical across both sets
 
 ## Run
 
+Run the commands from the `python/` folder (or after `pip install .`, from anywhere).
+
 ```bash
 # November bids -> EMA template -> validated workbook
-python -m bessbid generate \
-    --data-dir "/path/to/ema bidding comp" \
-    --out /path/to/work/submission.xlsx \
-    --work-dir /path/to/work \
-    [--strategy full]                # default; 'regulation' is the fallback
-    [--plan-out /path/to/work/november_plan.csv] \
-    [--template /path/to/BESS_Competition_Template.xlsx] [--month 2026-11] [--config overrides.toml]
+python -m bessbid generate --data-dir "/path/to/ema bidding comp" --out /path/to/work/submission.xlsx --work-dir /path/to/work
+```
 
+Optional `generate` flags:
+
+- `--strategy full|regulation`: `full` (default) is the main submission, `regulation` the fallback;
+- `--plan-out FILE.csv`: where to write the per-period plan (default `<work-dir>/<out-stem>.plan.csv`);
+- `--template FILE.xlsx`: EMA's template, **required if the data folder does not contain
+  `BESS_Competition_Template.xlsx`** (the template is otherwise found there);
+- `--month 2026-11`, `--config overrides.toml` (or `.json`);
+- `--allow-incomplete-inputs`: run even if the November pre-dispatch file is missing or
+  partial (prints a warning instead of stopping; for diagnostics only, not for a submission).
+
+```bash
 # walk-forward pseudo-November evaluation (Aug, Sep, Oct) against the baselines
 python -m bessbid evaluate --data-dir "/path/to/ema bidding comp" --work-dir /path/to/work
 
@@ -48,8 +56,15 @@ python -m bessbid inspect --data-dir "/path/to/ema bidding comp" --work-dir /pat
 `generate` performs these steps:
 
 1. It finds the files by name pattern anywhere under `--data-dir`. Nested folders and names
-   such as `(Part 1) ...` are fine. The template is also found there unless `--template` is
-   given.
+   such as `(Part 1) ...` are fine. Words are matched whole ("constrained" is not "train"),
+   and when a file name does not say train or test, the nearest folder name that does
+   decides (e.g. `train/pre_dispatch_forecasts.csv` vs `test/pre_dispatch_forecasts.csv`).
+   CSV header names are trimmed. The template is also found there unless `--template` is
+   given. **The November pre-dispatch file is required:** if it is missing, or does not give
+   every period of the month a legal vintage (its own lead-2 h or lead-3 h row, issued by
+   T - 65 min), `generate` stops with exit code 1 and says which file or period is missing.
+   The manifest records the coverage (`inputs.predispatch_test_coverage`: periods, covered,
+   first missing).
 2. It runs the strategy. Every market-data read goes through the time-gated `InfoSet`.
 3. It writes the bids into a copy of the template.
 4. It re-reads the file with the independent validator and checks it against every template
@@ -64,7 +79,9 @@ python -m bessbid inspect --data-dir "/path/to/ema bidding comp" --work-dir /pat
    bid table.
 
 The exit code is 0 on success, 2 if validation or the read-back fails, and 1 on usage
-errors. Output and work dirs inside the data dir are refused, and the data dir is never
+errors. If the full strategy cannot produce a plan at all (it is built not to fail, but as a
+last resort), `generate` prints a warning and writes the Regulation-only fallback instead of
+nothing; the manifest then names the error under `fallback`. Output and work dirs inside the data dir are refused, and the data dir is never
 written to.
 
 The full strategy takes about 3 minutes for November (about 340,000 LP solves).
@@ -107,6 +124,14 @@ from EMA. The quantities come from a dynamic programme over SOC (`planner.py`):
   action x is 0.5 h x (x E(x) + (100 - |x|) R(x)).
 - Size limits: charge at most 50 MW; discharge at most 50 MW, or 100 MW inside calendar
   event windows.
+- **Ramp limit.** RC383 adds energy-storage up/down ramp constraints (D.19.1.1A,
+  D.19.1.2A) on the net energy schedule. EMA has not given a ramp rate for the hypothetical
+  BESS, and the bids are open-loop, so a band curtailed by a ramp limit would never be made
+  up and would shift the SOC for the rest of the month. The plan therefore keeps
+  |x(t) - x(t-1)| <= `bess_ramp_mw` = 42 MW (the generators' 0.42 x available MW per period
+  in the replicated engine), starting from 0 MW on Nov 1 period 1. The programme's state is
+  then (Y, previous action) (`planner.dp_backward_ramp`). `bess_ramp_mw = 0` in the config
+  file switches the limit off. Cost: see the results below.
 - Bans: no charging inside 11-day or 19-day event windows, or when the day-ahead forecast
   capacity margin is below 300 MW.
 - SOC: the programme's state is the *binding* SOC `Y = s0 + eta_c_max x N`, where `N` is
@@ -127,19 +152,55 @@ value, and recharges after the event window.
 
 **Guards at each period's gate.** At T - 65 min the lead-2 h forecast for T cancels a
 planned charge if it shows a margin under 300 MW, a reserve shortfall or an energy price
-above 400. The daily policy is defined for every SOC, so the rest of the day continues
-optimally from the new SOC. In Aug-Oct and November the guard never fired.
+above 400. The guard only picks an action from which the month-end SOC target is still
+reachable and that respects the ramp limit (the least charging such action; if the planned
+charge is the only one, it is kept and tagged `guard_blocked`). The daily policy is defined
+for every (SOC, previous action), so the rest of the day continues optimally. If a day's
+plan cannot reach the month-ahead target at all, it plans to the nearest reachable SOC and
+records a warning instead of stopping. In Aug-Oct and November the guard never fired.
+
+**What the November pre-dispatch file does.** The plan is decided from data available on
+Oct 31 (day D's plan at 00:00 of D-1, whose own pre-dispatch vintages are not issued yet),
+so the November pre-dispatch vintages (lead 2 h / 3 h, legal at each period's gate) feed
+only this guard and the calendar check below. Because the guard never fires on the real
+November data, the bids would be the same without that file; `generate` nevertheless
+refuses to run without it (exit 1), so a file that is missing or not recognised in EMA's
+folder layout cannot go unnoticed and the guard is always live. Re-optimising on the
+lead-2 h vintages (`refine='lead2'`) lost money in every backtest month (see the
+investigations), so they are deliberately not used for more.
+
+**Calendar check (reported, never changes a bid).** The plan relies on the event calendar
+learned at the fit cut: it fills the battery before the predicted 19-day surge days and
+bans charging inside event windows. `checks.calendar_consistency` compares that calendar
+with each period's own legal pre-dispatch vintage:
+- outage events: the known outage at the vintage's issue time is above the calendar's
+  threshold exactly when the calendar says an event is active then;
+- surges: in each predicted surge window the vintage net demand must be at least half the
+  learned surge MW above the same time of day one and two weeks earlier and later
+  (non-surge periods); a run of 4+ periods with such an excess outside the predicted
+  windows is reported as unexplained.
+
+The result goes to the manifest (`plan.info.calendar_check`) and one line on stderr; any
+disagreement is printed as a `WARNING` and listed in `plan.info.warnings`. Results: November
+agrees in all 1440 periods (271 event periods observed and predicted), and both predicted
+surge windows are confirmed (Nov 1 00:00-11:30 +639 MW, Nov 19 00:00 - Nov 20 11:30 +747 MW,
+learned surge 669 MW), with no unexplained surge. Aug, Sep and Oct, checked the same way at
+their own fit cuts, also agree in every period with every surge confirmed. A calendar
+shifted by one day is flagged on both counts (tested).
 
 **Information timing.**
 - The forecaster is fitted at 00:00 the day before the month (Oct 31 for November), with
-  net-demand history capped there.
+  net-demand history capped there. Training clearing rows and actuals are used only if
+  their period ended strictly *before* the decision time (the Oct 30 23:30 period, which
+  ends exactly at Oct 31 00:00, is not used).
 - Day D's plan is decided at 00:00 of D-1, using day-ahead forecasts.
 - The guard for period T uses T's own lead-2 h vintage at T - 65 min.
 - Earlier periods' bids always clear and are our own decisions, so the SOC at T is known
   at every earlier decision time.
 
-Every forecast and value call records an audit entry; `generate` ends with
-`assert_no_leak()`. A test perturbs every row not legal at T's gate and checks that bids for
+Every forecast and value call records an audit entry, including the issue time of any
+pre-dispatch vintage behind the planner's net-demand and outage inputs
+(`planner.<kind>.inputs`); `generate` ends with `assert_no_leak()`. A test perturbs every row not legal at T's gate and checks that bids for
 periods up to T come out identical.
 
 **Layer 3 (not used).** `soc.SocIntervalTracker` keeps a worst-case SOC interval for
@@ -158,19 +219,30 @@ because the energy offers always clear.
 
 | Month | Regulation only, maker | Full, maker | Uplift, maker | Uplift, taker | Perfect-foresight uplift (cap 50 MW, maker) |
 |---|---|---|---|---|---|
-| Aug | 1,205,144 | 1,318,037 | +112,894 | +126,994 | +155,998 |
-| Sep | 1,209,195 | 1,329,444 | +120,249 | +127,992 | +158,798 |
-| Oct | 2,126,795 | 2,246,396 | +119,601 | +142,603 | +235,193 |
-| **per 30 days** | 1,480,804 | 1,595,829 | **+115,025** | **+129,649** | +179,344 |
+| Aug | 1,205,144 | 1,315,124 | +109,980 | +126,932 | +153,841 |
+| Sep | 1,209,195 | 1,329,542 | +120,348 | +128,011 | +157,567 |
+| Oct | 2,126,795 | 2,247,849 | +121,054 | +143,123 | +220,019 |
+| **per 30 days** | 1,480,804 | 1,595,385 | **+114,581** | **+129,804** | +173,291 |
+
+(With the 42 MW ramp limit and the strict clearing cut. The perfect-foresight bound obeys
+the same ramp limit.) These are training-month averages; **for November expect about +100k
+(maker), not +115k** (see "What to expect for November" below).
 
 - **Positive in every month** under both modes.
-- The full strategy captures 64 % of the perfect-foresight uplift (maker).
-- **Revenue by product, Aug-Oct, maker:** energy +616,258; Regulation 4,277,619
-  (-263,514 against Regulation only, because the energy MW displace Regulation MW).
+- The full strategy captures 66 % of the perfect-foresight uplift (maker).
+- **Cost of the ramp limit:** none measurable. Without it (`bess_ramp_mw = 0`) the uplift
+  is +114,437 (maker) and +129,815 (taker) per 30 days; with it, +114,581 and +129,804. The
+  plans already ramp in and out over several periods because the price curves are smooth,
+  so the limit mostly reshapes a few steps (e.g. the largest Nov 19 block falls from 74.8
+  to 64.6 MW).
+- **Cost of the strict clearing cut** (not using the period that ends exactly at the fit
+  time): -0.6k maker, +0.2k taker per 30 days against the earlier, inclusive cut.
+- **Revenue by product, Aug-Oct, maker:** energy +614,748; Regulation 4,277,768
+  (-263,365 against Regulation only, because the energy MW displace Regulation MW).
 - **SOC range:** [7.0, 93.0] MWh under the all-loss-on-discharge convention,
   [10.4, 89.6] under sqrt, and [13.4, 86.6] under all-loss-on-charge.
 - **0 breaches** under all three conventions in both modes. Every month ends at >= 50 %.
-- **Runtime:** about 170 s per month to plan.
+- **Runtime:** about 190 s per month to plan.
 - `python -m bessbid evaluate` reproduces this table; `evaluate.perfect_foresight_plan`
   builds the hindsight bound.
 
@@ -200,6 +272,66 @@ per month where stated):
   - deciding the daily plan at the gate of D's first period instead of 00:00 of D-1: -0.3k.
 - *Terminal SOC.* Ending the month at 5 % instead of 50 % would add about 10k per month.
   It is a config option (`terminal_soc_frac`); 50 % is kept until EMA says otherwise.
+- *Wider SOC margin* (`soc_margin_mwh`, with the ramp limit). The bids are open-loop, so a
+  band that failed to clear in one period would shift the SOC for the rest of the month.
+  With the 2 MWh margin, dropping any one energy band of the Aug-Oct plans breaches 5-95 %
+  later in 87-94 % of cases (all-loss-on-discharge convention; the worst path reaches -18
+  and 136 MWh). Making every single miss safe needs a margin of one full ramp step
+  (42 MW x 0.5 h / 0.85 = 24.7 MWh), and that is expensive:
+
+  | `soc_margin_mwh` | Planned Y range | Uplift per 30 days, maker / taker | Single-miss breaches (charge / discharge, all-loss-on-discharge) |
+  |---|---|---|---|
+  | 2 (default) | 7-93 | +114.6k / +129.8k | 417/460, 384/421 |
+  | 12 | 17-83 | +91.6k / +101.2k | 200/381, 189/371 |
+  | 25 | 30-70 | +57.2k / +61.2k | 0/330, 12/255 |
+
+  A 12 MWh margin costs about 23k (maker) / 29k (taker) per 30 days and still leaves half
+  of the single misses breaching; 25 MWh costs about 57k / 69k. The default stays at 2 MWh:
+  every fixed band cleared in full in every backtest and stress scenario (the prices 0.01
+  and 3000 are far outside every observed clearing price), and the ramp limit removes the
+  one known EMA-side reason a band might not clear. How EMA treats an SOC breach is on the
+  list of questions below.
+
+(The investigations above were run before the ramp limit and the strict clearing cut were
+added; both changed the headline by less than 1k per 30 days, so the comparisons stand.)
+
+#### What to expect for November
+
+The headline above is the average of three training months, and the strategy settings
+(caps, margins, guard) were chosen on those same months, so it is in-sample with respect to
+them. November itself has less energy value: no energy on Nov 20 and Nov 26 (event
+windows), little on Nov 4 and 15, a pre-charge on Nov 18 that costs money, and the gain on
+Nov 19. Clearing the November plan against the forecast November market (the forecast stack
+and net demand fitted at the Oct 31 cut, an independent LP) gives:
+
+| November scenario | Uplift, maker | Uplift, taker |
+|---|---|---|
+| Base forecast | +96.7k | +110.5k |
+| Net-demand error drawn from Aug-Oct lead-2 h errors (3 draws) | +93.8k to +105.6k | +110.9k to +121.2k |
+| 19-day event one day early / late | +67.1k / +58.5k | +79.7k / +71.0k |
+| Event MW x 0.7 / x 1.3 | +88.9k / +106.0k | +102.7k / +119.8k |
+
+The same evaluator gave +120.0k (maker) for the earlier October plan against +119.6k
+actual, so it is not biased low. **The realistic November expectation is therefore about +100k (maker range about
+94-106k, taker 110-121k), not the +115k three-month average.** Every energy offer cleared in
+full in every scenario, so the SOC path holds. Possible upside, not adopted: ending the
+month at 5 % SOC if EMA confirms there is no end-of-month requirement (+10k to +16k), and
+a narrow exception to the event charging ban on the 19-day surge nights (an earlier blanket
+test lost 2.5k, so this needs out-of-sample evidence first).
+
+### Assumptions to confirm with EMA
+
+- **BESS ramp rate.** Is an ESS ramp limit applied in the simulation (RC383 D.19.1.1A /
+  D.19.1.2A), and at what rate? The plan assumes 42 MW per period (`bess_ramp_mw`); a
+  faster or no limit costs nothing, a slower one would need a smaller value.
+- **SOC breaches.** If a cleared schedule would leave 5-95 %, is it clipped, rejected or
+  penalised, and is dispatch SOC-checked before clearing? The plan keeps a 2 MWh margin and
+  relies on every fixed band clearing in full (it did in every backtest and stress
+  scenario); a band that did not clear would shift the SOC for the rest of the month. A
+  margin that absorbs any single miss costs about 57k per 30 days (see the investigations).
+- **End-of-month SOC.** Is there a requirement? The plan ends at 50 %.
+- **Folder layout.** If EMA's run folder does not hold the template workbook, pass
+  `--template`.
 
 ## Rules the code enforces
 
@@ -224,11 +356,11 @@ every read:
 |---|---|---|
 | Pre-dispatch | `issue_time <= T - 65 min`. Strict default: only T's own rows, lead 2 h, else lead 3 h | `predispatch_for(T)`, `predispatch_for_many(Ts)`, `predispatch_known_at(t)` |
 | Offer stacks | `assumed_publication_time_sgt <= T - 65 min` (= ts + 28 d 8 h, so stacks lag >= 29 days) | `stacks_for(T)`, `stacks_known_at(t)` |
-| Training clearing | the period has ended: `ts + 30 min <= T - 65 min` | `clearing_for(T)`, `clearing_known_at(t)` |
+| Training clearing | the period ended before the decision time: `ts + 30 min < T - 65 min` | `clearing_for(T)`, `clearing_known_at(t)` |
 
 Compute every per-period feature with that period's own cutoff (`infoset.cutoff(T)`), never
 from a month-wide frame. `predispatch_known_at` hides training actuals until their period
-has ended. `infoset.assert_no_leak()` and `infoset.audit_frame()` provide the proof for the
+ended before `t`. `infoset.assert_no_leak()` and `infoset.audit_frame()` provide the proof for the
 manifest.
 
 **Data fixes (`io.py`).**
@@ -261,9 +393,10 @@ manifest.
 | `netdemand.py` | `NetDemandModel`: legal lead-2 h/3 h net demand (night solar zeroed), day-ahead profile + surge, error nodes |
 | `stackmodel.py` | `StackModel`: offer-price factor model, legal 7-lag stack blend (`forecast_stack(T, decision_time, outage)`) |
 | `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`; `walk_forward`, `evaluate`, `month_forecasts`; `python -m bessbid.forecast` |
-| `_clearlp.py` | small reference clearing LP (cross-checked against `engine.py` in the tests) |
-| `soc.py` | SOC under every efficiency convention: `soc_paths`, `binding_soc` (the convention-free state Y), `check_soc`, `y_bounds`, `y_terminal_min`, `SocIntervalTracker` (worst-case interval for offers that may not clear) |
-| `planner.py` | `ValueModel` (forecast stack cleared with our own offer at a ladder of energy levels, averaged over net-demand error nodes), `make_action_grid` (exact SOC steps), `action_values`, `dp_backward` / `dp_forward` / `dp_plan` |
+| `_clearlp.py` | small reference clearing LP (cross-checked against `engine.py` in the tests; reference code, used only via `Forecaster(solver='private')`) |
+| `soc.py` | SOC under every efficiency convention: `soc_paths`, `binding_soc` (the convention-free state Y), `check_soc`, `y_bounds`, `y_terminal_min`, `SocIntervalTracker` (worst-case interval for offers that may not clear; tested, not used by the shipped strategy) |
+| `planner.py` | `ValueModel` (forecast stack cleared with our own offer at a ladder of energy levels, averaged over net-demand error nodes), `make_action_grid` (exact SOC steps), `action_values`, `dp_backward` / `dp_forward` / `dp_plan`, the ramp-limited `dp_backward_ramp` / `dp_forward_ramp` (state = SOC and previous action), `soften_end_values` (fallback when a target is unreachable) |
+| `checks.py` | `calendar_consistency(fc, Ts)`: the learned event calendar against each period's legal pre-dispatch vintage (outage events, surge windows); reported only |
 | `strategy_full.py` | `FullParams`, `plan_month(month, infoset, cfg, params) -> (bids, plan frame, info)`, `FullStrategy` (registered as `full`, the CLI default) |
 | `evaluate.py` | `evaluate(ds, cfg, months)`: walk-forward pseudo-Novembers in maker/taker mode and every convention against Regulation-only and `perfect_foresight_plan` |
 
@@ -298,6 +431,9 @@ One LP per 30-minute period, solved with HiGHS (`highspy`) directly:
 - Per unit: e + p + c + r <= `available_mw`. Reserve caps are the reserve `offered_mw`.
 - Energy ramp-up: e(t) <= e(t-1) + 0.42 x `available_mw`(t). It is applied by clipping bands
   in merit order, which is the same LP as an explicit ramp row.
+- Inputs must be finite: a NaN or infinite stack value, net demand, requirement or BESS
+  band raises `EngineError`, as does any model update HiGHS rejects (a NaN used to be
+  ignored silently, leaving the previous period's bounds in place).
 
 **BESS offers** enter as RC383 bands:
 - discharge (MW > 0) is supply at its offer price;
@@ -360,7 +496,7 @@ Every run also reports the SOC path of the realised dispatch under all three con
 - Energy: price x (discharge - charge) x 0.5 h, so charging costs money.
 - Reserves: price x MW x 0.5 h.
 
-**Golden numbers** (regulation-only, 100 MW at 0.00, sqrt convention):
+**Golden numbers** (regulation-only, 100 MW at 0.01 (identical at 0.00), sqrt convention):
 
 | Window | Maker (re-cleared) | Taker (actual prices) |
 |---|---|---|
@@ -486,8 +622,21 @@ on the synthetic market and checks:
 - a replay in the backtest with 0 breaches in both modes;
 - determinism;
 - the information cut: bids for periods up to T are identical when every row not yet legal
-  at T's gate is perturbed, for the default plan, the gate-time daily plan and the lead-2 h
-  refinement.
+  at T's gate is perturbed, for T on the first, a middle and the last day of the month, and
+  for the gate-time daily plan and the lead-2 h refinement;
+- the ramp limit (every step <= 42 MW from 0 MW at the start) and switching it off;
+- a guard that fires on every charge keeps the month-end SOC target (it used to abort);
+- a planner input issued after its decision time raises `LeakError`.
+
+`test_soc_planner.py` also checks the ramp-limited programme against brute force and that
+it equals the plain programme without a limit. `test_engine.py` checks that non-finite
+inputs raise. `test_writer_cli.py` checks that `generate` stops (exit 1) when the test
+pre-dispatch file is missing or covers only part of the month, that
+`--allow-incomplete-inputs` turns this into a warning, that the coverage counts only legal
+lead-2 h / 3 h vintages, and the Regulation-only fallback when planning fails.
+`test_strategy_full.py` also checks the calendar check (consistent on the synthetic market,
+flagged for a calendar shifted by one day). `test_io.py` checks whole-word and
+folder-based file classification and header trimming.
 
 `test_evaluate.py` checks the walk-forward harness and the perfect-foresight bound.
 `test_strategy_data.py` (data, slow) runs the November `generate` end to end and an October

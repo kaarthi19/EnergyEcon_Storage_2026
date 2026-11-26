@@ -21,6 +21,10 @@ Two pieces:
     exactly by the bid quantities. Banned actions are masked per period; a terminal value
     (or terminal minimum Y) closes the horizon.
 
+:func:`dp_backward_ramp`
+    The same programme with a ramp limit on the BESS energy schedule (RC383 D.19.1.1A /
+    D.19.1.2A): ``|x(t) - x(t-1)| <= ramp_mw``. The state is (Y, previous action).
+
 The planner only ever sees forecast values that the caller computed at a legal decision
 time; it has no data access of its own.
 """
@@ -43,7 +47,12 @@ __all__ = [
     "ValueModel",
     "action_values",
     "dp_backward",
+    "dp_backward_ramp",
     "dp_forward",
+    "dp_forward_ramp",
+    "ramp_ok",
+    "ramp_active",
+    "soften_end_values",
     "dp_plan",
     "NEG",
     "terminal_values",
@@ -187,13 +196,19 @@ class ValueModel:
         r = ((self.reg_price, q),) if q > 0 else ()
         return BessOffer(energy=e, regulation=r)
 
-    def ladder(self, Ts, decision_times, nd, outage, kind: str = "plan", nodes=None) -> dict:
+    def ladder(self, Ts, decision_times, nd, outage, kind: str = "plan", nodes=None,
+               inputs_time=None) -> dict:
         """Clear every T in ``Ts`` at each ladder level. ``decision_times``: one timestamp or
         one per T. ``nodes``: net-demand forecast-error nodes (forecast - actual, MW); the
         prices are then the equally weighted mean over ``nd - node``, which turns the step
         function of a single merit order into an expected price curve. Returns dict of
         (n, n_levels) arrays E, P, C, R, short (mean reserve shortfall MW) plus the margin
-        ``nominal capacity - (nd + outage) - requirements``."""
+        ``nominal capacity - (nd + outage) - requirements``.
+
+        ``inputs_time``: per T, the latest data time behind ``nd`` and ``outage`` (e.g. the
+        issue time of T's own pre-dispatch vintage; NaT if none). The audit entry of each T
+        records the later of that and the newest stack time, so an input that was not yet
+        available at the decision time raises :class:`bessbid.infoset.LeakError`."""
         nodes = np.zeros(1) if nodes is None else np.asarray(nodes, float)
         Ts = pd.DatetimeIndex(Ts)
         n, L = len(Ts), len(self.levels)
@@ -201,6 +216,16 @@ class ValueModel:
             else [pd.Timestamp(d) for d in decision_times]
         nd = np.asarray(nd, float)
         outage = np.asarray(outage, float)
+        if inputs_time is None:
+            itimes = [None] * n
+        else:
+            itimes = [None if pd.isna(x) else pd.Timestamp(x) for x in pd.DatetimeIndex(np.asarray(inputs_time))]
+            if len(itimes) != n:
+                raise ValueError("inputs_time must have one entry per period")
+        for i, d in enumerate(decs):  # check the inputs before spending any solves
+            if itimes[i] is not None:
+                info_ = self.fc.info
+                info_.record(f"planner.{kind}.inputs", d, itimes[i], 1, Ts[i])
         out = {k: np.zeros((n, L)) for k in ("E", "P", "C", "R", "short")}
         req_tot = np.zeros(n)
         nominal = float(np.sum(self.fc.stacks.nom))
@@ -221,7 +246,8 @@ class ValueModel:
                 acc /= len(nodes)
                 out["E"][i, j], out["P"][i, j], out["C"][i, j], out["R"][i, j], out["short"][i, j] = acc
             self.n_solves += L * len(nodes)
-            info.record(f"planner.{kind}", d, sf.newest_avail, 1, T)
+            used = sf.newest_avail if itimes[i] is None else max(pd.Timestamp(sf.newest_avail), itimes[i])
+            info.record(f"planner.{kind}", d, used, 1, T)
         out["margin"] = nominal - (nd + outage) - req_tot
         out["ts"] = Ts
         return out
@@ -261,6 +287,99 @@ def dp_backward(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = No
         pol[t] = a
         V[t] = cand[np.arange(grid.n_states), a]
     return V, pol
+
+
+def ramp_active(ramp_mw: float | None, cfg: Config) -> bool:
+    """True if ``ramp_mw`` restricts anything (None, <= 0 or >= 2 * power: no limit)."""
+    return ramp_mw is not None and 0 < float(ramp_mw) < 2 * cfg.power_mw - 1e-9
+
+
+def ramp_ok(grid: ActionGrid, ramp_mw: float | None) -> np.ndarray:
+    """(n_actions, n_actions) bool: action ``a`` may follow action ``a_prev`` (rows)."""
+    if ramp_mw is None or ramp_mw <= 0:
+        return np.ones((grid.n_actions, grid.n_actions), bool)
+    return np.abs(grid.mw[None, :] - grid.mw[:, None]) <= float(ramp_mw) + 1e-9
+
+
+def dp_backward_ramp(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = None,
+                     V_end: np.ndarray | None = None, ramp_mw: float | None = None,
+                     keep=None, policy: bool = True) -> tuple[dict | np.ndarray, np.ndarray | None]:
+    """:func:`dp_backward` with a ramp limit between consecutive actions.
+
+    State: (Y index, index of the previous action). ``V_end``: (n_states,) or
+    (n_states, n_actions). Returns ``V`` with ``V[t][s, a_prev]`` (an array (n+1, S, A), or,
+    with ``keep`` = iterable of t, a dict holding only those t) and the policy
+    ``pol[t, s, a_prev]`` (None with ``policy=False``). Ties go to the lowest action index,
+    as in :func:`dp_backward`."""
+    n = F.shape[0]
+    S, A = grid.n_states, grid.n_actions
+    nxt, valid = _transitions(grid)
+    bias = np.where(ramp_ok(grid, ramp_mw), 0.0, NEG)  # (A_prev, A)
+    cols = np.arange(A)[None, :]
+    Vn = np.zeros((S, A)) if V_end is None else np.asarray(V_end, float)
+    if Vn.ndim == 1:
+        Vn = np.repeat(Vn[:, None], A, axis=1)
+    keep = None if keep is None else set(int(k) for k in keep)
+    store = {} if keep is not None else np.empty((n + 1, S, A))
+    pol = np.zeros((n, S, A), dtype=np.int16) if policy else None
+
+    def put(t, v):
+        if keep is None:
+            store[t] = v
+        elif t in keep:
+            store[t] = v.copy()
+
+    put(n, Vn)
+    for t in range(n - 1, -1, -1):
+        f = F[t]
+        if allowed is not None:
+            f = np.where(allowed[t], f, NEG)
+        G = np.where(valid, f[None, :] + Vn[nxt, cols], NEG)  # (S, A): take a, land in nxt
+        cand = G[:, None, :] + bias[None, :, :]  # (S, A_prev, A)
+        a = cand.argmax(2)
+        Vt = np.maximum(np.take_along_axis(cand, a[..., None], 2)[..., 0], NEG)
+        if pol is not None:
+            pol[t] = a
+        Vn = Vt
+        put(t, Vn)
+    return store, pol
+
+
+def dp_forward_ramp(pol: np.ndarray, grid: ActionGrid, s0: int, a0: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Follow a ramp policy ``pol[t, s, a_prev]`` from state ``s0`` and previous action ``a0``."""
+    n = pol.shape[0]
+    acts = np.zeros(n, dtype=int)
+    states = np.zeros(n, dtype=int)
+    s, ap = int(s0), int(a0)
+    for t in range(n):
+        a = int(pol[t, s, ap])
+        acts[t] = a
+        s = s + int(grid.steps[a])
+        if not 0 <= s < grid.n_states:
+            raise RuntimeError("policy left the SOC grid")
+        states[t] = s
+        ap = a
+    return acts, states
+
+
+def soften_end_values(V_end: np.ndarray, grid: ActionGrid, penalty_per_mwh: float = 1e7) -> np.ndarray:
+    """Replace forbidden (``NEG``) end values by a large penalty growing with the distance
+    (in Y) to the nearest allowed end state, so a programme that cannot reach an allowed
+    state still returns the plan that gets closest (used only as a fallback)."""
+    V = np.asarray(V_end, float)
+    two_d = V.ndim == 2
+    Vs = V.max(axis=1) if two_d else V
+    ok = Vs > NEG / 2
+    if not ok.any():
+        soft = -penalty_per_mwh * np.zeros_like(Vs)
+    else:
+        best = float(Vs[ok].min())
+        dist = np.abs(grid.y[:, None] - grid.y[ok][None, :]).min(axis=1)
+        soft = np.where(ok, Vs, best - penalty_per_mwh * dist)
+    if not two_d:
+        return soft
+    # within an allowed Y, a forbidden previous action costs a smaller penalty
+    return np.where(V > NEG / 2, V, soft[:, None] - (0.1 * penalty_per_mwh) * ok[:, None])
 
 
 def dp_forward(pol: np.ndarray, grid: ActionGrid, s0: int, n: int | None = None) -> tuple[np.ndarray, np.ndarray]:

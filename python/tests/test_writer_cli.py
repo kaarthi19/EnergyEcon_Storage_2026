@@ -8,7 +8,7 @@ import openpyxl
 import pandas as pd
 import pytest
 
-from bessbid import cli
+from bessbid import cli, io
 from bessbid.bids import energy_curve, energy_fixed, regulation_only, to_table
 from bessbid.config import Config
 from bessbid.periods import month_slots
@@ -180,3 +180,94 @@ def test_cli_errors(template, tmp_path, capsys):
                    "--work-dir", str(tmp_path / "w")])
     assert rc == 1  # no template in the data dir
     capsys.readouterr()
+
+
+class _NeedsData(RegulationOnlyStrategy):
+    pass
+
+
+class _Broken:
+    name = "broken_planner"
+    needs_data = True
+
+    def generate(self, month, infoset, cfg):
+        raise RuntimeError("no feasible plan")
+
+
+@pytest.fixture()
+def synth_data(tmp_path, template):
+    from synth import write_dataset
+
+    root = write_dataset(tmp_path / "data", with_test=False)
+    import shutil
+
+    shutil.copy(template, root / "BESS_Competition_Template.xlsx")
+    return root
+
+
+def test_cli_fails_when_test_predispatch_is_missing(synth_data, tmp_path, capsys):
+    """A data strategy must not run silently without the test-month pre-dispatch file."""
+    register_strategy("needsdata2", lambda: _NeedsData(name="needsdata2", needs_data=True))
+    work = tmp_path / "w"
+    rc = cli.main(["generate", "--data-dir", str(synth_data), "--out", str(tmp_path / "o.xlsx"),
+                   "--work-dir", str(work), "--strategy", "needsdata2"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "error" in err and "pre-dispatch" in err and not (tmp_path / "o.xlsx").exists()
+    rc = cli.main(["generate", "--data-dir", str(synth_data), "--out", str(tmp_path / "o2.xlsx"),
+                   "--work-dir", str(work), "--strategy", "needsdata2", "--allow-incomplete-inputs"])
+    err = capsys.readouterr().err
+    assert rc == 0 and "WARNING" in err and "pre-dispatch" in err
+    man = json.loads((work / "o2.manifest.json").read_text())
+    cov = man["inputs"]["predispatch_test_coverage"]
+    assert man["input_warnings"] and cov["covered"] == 0 and not cov["file"] and cov["first_missing"]
+
+
+def test_cli_fails_when_test_predispatch_is_partial(tmp_path, template, capsys):
+    """The synthetic test file covers one day only: generate for the month must stop."""
+    from synth import write_dataset
+    import shutil
+
+    root = write_dataset(tmp_path / "data", with_test=True)
+    shutil.copy(template, root / "BESS_Competition_Template.xlsx")
+    register_strategy("needsdata3", lambda: _NeedsData(name="needsdata3", needs_data=True))
+    rc = cli.main(["generate", "--data-dir", str(root), "--out", str(tmp_path / "o.xlsx"),
+                   "--work-dir", str(tmp_path / "w"), "--strategy", "needsdata3", "--month", "2026-07"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "only 48 of 1488 periods" in err and "2026-07-01 00:00" in err
+
+
+def test_predispatch_coverage_counts_only_legal_vintages(tmp_path):
+    from types import SimpleNamespace
+
+    from synth import predispatch_frame
+
+    from bessbid.cli import predispatch_coverage
+    from bessbid.config import Config
+
+    def cov(frame):
+        p = tmp_path / "november_pre_dispatch_forecasts.csv"
+        frame.to_csv(p, index=False)
+        ds = SimpleNamespace(predispatch_test=io.load_predispatch([p], kind="test"))
+        return predispatch_coverage(ds, Config(), "2026-07")
+
+    full = predispatch_frame("2026-07-01 00:00", 31 * 48, train=False)
+    c = cov(full)
+    assert c["covered"] == c["periods"] == 1488 and c["first_missing"] is None
+    c = cov(full[full["period_sgt"] != full["period_sgt"].iloc[400]])  # one period dropped
+    assert c["covered"] == 1487 and c["first_missing"] is not None
+    c = cov(predispatch_frame("2026-07-01 00:00", 31 * 48, train=False, leads=(1.0, 0.5)))
+    assert c["covered"] == 0  # lead 1 h / 0.5 h are issued after the gate
+
+
+def test_cli_falls_back_to_regulation_when_planning_fails(synth_data, tmp_path, capsys):
+    register_strategy("broken_planner", lambda: _Broken())
+    work = tmp_path / "w"
+    out = tmp_path / "o.xlsx"
+    rc = cli.main(["generate", "--data-dir", str(synth_data), "--out", str(out), "--work-dir", str(work),
+                   "--strategy", "broken_planner", "--allow-incomplete-inputs"])
+    err = capsys.readouterr().err
+    assert rc == 0 and "fallback" in err
+    man = json.loads((work / "o.manifest.json").read_text())
+    assert man["fallback"].startswith("RuntimeError") and man["strategy"] == "regulation"
+    back = read_back(out)
+    assert (back.loc[back["product"] == "Regulation", "quantity_1"] == 100).all()

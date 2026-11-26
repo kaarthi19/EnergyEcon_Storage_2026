@@ -34,10 +34,18 @@ def test_generate_full_november(data_dir, data_work_dir, tmp_path):
     assert man["validation"]["errors"] == 0 and man["roundtrip_ok"] and man["rows"] == 5760
     assert man["information_audit"]["leaks"] == 0
     assert man["plan"]["info"]["soc_check"]["ok"]
+    assert man["plan"]["info"]["warnings"] == [] and man["fallback"] is None
+    assert man["input_warnings"] == []  # the November pre-dispatch file is found and complete
+    assert man["inputs"]["predispatch_test_coverage"]["covered"] == 1440
+    cc = man["plan"]["info"]["calendar_check"]
+    assert cc["ok"] and cc["outage"]["mismatch_periods"] == 0 and not cc["surge"]["unexplained_windows"]
+    assert len(cc["surge"]["predicted_windows"]) >= 1
     p = pd.read_csv(plan)
     assert len(p) == 1440
     for c in [c for c in p.columns if c.startswith("soc_c")]:
         assert p[c].min() >= 5.0 and p[c].max() <= 95.0 and p[c].iloc[-1] >= 50.0 - 1e-6
+    steps = np.abs(np.diff(np.concatenate([[0.0], p["energy_mw"].to_numpy()])))
+    assert steps.max() <= Config().bess_ramp_mw + 1e-9  # RC383 ESS ramp constraints
     back = read_back(out)
     e = back[back["product"] == "Energy"]
     assert e["quantity_1"].notna().sum() > 100  # the overlay is active
