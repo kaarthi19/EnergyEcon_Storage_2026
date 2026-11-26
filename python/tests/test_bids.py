@@ -50,7 +50,7 @@ def test_round_mw_toward_zero():
 
 def test_regulation_only():
     pb = regulation_only(D, 1)
-    assert pb.regulation == (Band(0.0, 100.0),)
+    assert pb.regulation == (Band(CFG.as_floor_price, 100.0),)
     assert pb.energy == () and pb.primary == () and pb.contingency == ()
     assert offered_capacity(pb) == 100
     assert [r.product for r in pb.rows()] == list(PRODUCTS)
@@ -67,16 +67,16 @@ def test_regulation_only():
 def test_energy_fixed():
     d = energy_fixed(D, 30, 40)
     assert d.energy == (Band(CFG.discharge_floor_price, 40.0),)
-    assert d.regulation == (Band(0.0, 60.0),)
+    assert d.regulation == (Band(CFG.as_floor_price, 60.0),)
     c = energy_fixed(D, 8, -33.33)
     assert c.energy == (Band(CFG.charge_cap_price, -33.3),)
-    assert c.regulation == (Band(0.0, 66.7),)
+    assert c.regulation == (Band(CFG.as_floor_price, 66.7),)
     assert offered_capacity(c) == pytest.approx(100.0)
     assert c.charge_mw == pytest.approx(33.3) and c.discharge_mw == 0
     n = energy_fixed(D, 8, -50, regulation_mw=None)
     assert n.regulation == ()
     z = energy_fixed(D, 8, 0)
-    assert z.energy == () and z.regulation == (Band(0.0, 100.0),)
+    assert z.energy == () and z.regulation == (Band(CFG.as_floor_price, 100.0),)
     with pytest.raises(BidError):
         energy_fixed(D, 8, -50, regulation_mw=60)
 
