@@ -321,6 +321,10 @@ Why this is the fallback:
 
 ## Assumptions to confirm with EMA
 
+For every likely answer there is a ready config in `config/scenarios/`; the decision table,
+with each config's Aug-Oct gain against the default under the same assumption, is
+[`../config/scenarios/README.md`](../config/scenarios/README.md).
+
 - **BESS ramp rate.** Is an ESS ramp limit applied in the simulation (RC383 D.19.1.1A /
   D.19.1.2A), and at what rate? The plan assumes 42 MW per period (`bess_ramp_mw`); a
   faster or no limit costs nothing, a slower one would need a smaller value.
