@@ -212,6 +212,27 @@ ban of (19) still applies. A charge allowed by (19a) costs an extra hurdle
 with κ = `event_recharge_hurdle` (default 0), and the guard (23) cancels it if the lead-2 h
 price is above min(400, p_rech).
 
+**Optional event-window bias correction** (`event_bias`, default `"none"`). The day-ahead
+energy forecast is biased low inside the 19-day surge window and slightly high elsewhere in
+event windows ([`strategy.md`](strategy.md)). With `"residual"`, every ladder (month-ahead,
+day-ahead and, with `refine = "lead2"`, lead-2 h) is shifted by a bucket correction δ_t at
+every level before the values (13) are formed:
+
+    Ē_t(x) ← Ē_t(x) + δ_{b(t)},   δ_b = n_b / (n_b + k) · mean_{s ∈ S_b} clip(π_E(s) − Ê_s, ±c)     (13b)
+
+Here b(t) is the bucket of period t: the event cycle whose window holds t, the calendar day
+of t counted from the event's onset day (0, 1, 2), whether t is in the learned surge window,
+and the `event_bias_hours` (3 h) block of t's start time; δ = 0 outside event windows, where
+two cycles' windows overlap, and in buckets without residuals. S_b holds the periods of past
+event days in bucket b whose clearing ended before the fit cut, π_E(s) is their actual
+price and Ê_s the node-averaged forecast price of the stack *without* our offer, backcast
+from the inputs as of that day's own day-ahead decision time (00:00 of the day before) with
+the forecaster fitted at the cut; c = `event_bias_clip` = 500 S$/MWh and k =
+`event_bias_shrink` = 0. The guard (23) compares the lead-2 h price plus δ_t with its
+threshold, and (19a) uses the corrected Ê_t(0). Because δ is the same at every level, our
+price impact (the slope of Ē_t in x) is unchanged; (13b) adds h · x · δ to the value of an
+action.
+
 ### Terminal SOC
 
 The month ends with SOC ≥ `terminal_soc_frac` × 100 MWh = 50 MWh under every convention:
@@ -253,7 +274,9 @@ October and in November the guard never fired.
 
 ### Information timing
 
-Every input to (13) and (23) is read through `InfoSet` at its decision time. Pre-dispatch
+Every input to (13) and (23) is read through `InfoSet` at its decision time. The
+corrections δ of (13b) are computed at the fit cut (before every decision time of the month)
+from clearing periods that ended before it, and recorded as `eventbias.fit`. Pre-dispatch
 rows must be issued by T − 65 min, offer-stack rows published by T − 65 min, and training
 clearing rows must belong to periods that ended before the decision time. The planner audits
 the issue time of its own inputs (`planner.<kind>.inputs`). `generate` ends with
