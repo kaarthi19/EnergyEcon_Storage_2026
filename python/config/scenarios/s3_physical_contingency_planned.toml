@@ -1,0 +1,8 @@
+# S3: as s3_physical_contingency.toml, and the SOC programme also counts the Contingency
+# that charging carries (forecast Contingency price), so it may charge more. See README.md.
+[rules]
+capacity_rule = "physical"
+
+[strategy.full]
+reserve_fill = "contingency"
+reserve_value = true

@@ -1,0 +1,7 @@
+# S9: EMA limits offer prices to [-1000, 1000] S$/MWh. The always-clearing charge band is
+# then priced at the cap (1000); it fails to clear only when the energy price is above
+# 1000 (32 of 5904 training periods, none in a period the plan charges). See README.md.
+[offers]
+charge_cap_price = 1000.0
+offer_price_min = -1000.0
+offer_price_max = 1000.0
