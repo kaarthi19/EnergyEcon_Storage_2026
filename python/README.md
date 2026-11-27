@@ -35,7 +35,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt -r requirements-figures.txt
 
-# unit tests on small synthetic markets; no EMA data needed (about 7-8 minutes)
+# unit tests on small synthetic markets; no EMA data needed (239 passed, 25 skipped; about 10 minutes)
 # (env -u keeps the slower data tests off even if BESSBID_DATA_DIR is set in your shell)
 env -u BESSBID_DATA_DIR python -m pytest -q
 

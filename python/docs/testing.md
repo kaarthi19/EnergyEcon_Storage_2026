@@ -2,8 +2,8 @@
 
 ```bash
 cd python
-python -m pytest                       # unit tests on small synthetic markets (about 5 min)
-BESSBID_DATA_DIR="/path/to/ema bidding comp" BESSBID_WORK_DIR=/path/to/work python -m pytest
+env -u BESSBID_DATA_DIR python -m pytest   # synthetic markets only: 239 passed, 25 skipped (about 10 min)
+BESSBID_DATA_DIR="/path/to/ema bidding comp" BESSBID_WORK_DIR=/path/to/work python -m pytest   # 264 passed (about 20 min)
 ```
 
 Tests marked `data` run only when `BESSBID_DATA_DIR` is set. They check the following:
