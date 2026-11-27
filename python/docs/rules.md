@@ -1,8 +1,11 @@
 # Rules the code enforces, and what `generate` does
 
 **Capacity (strict reading).** In every period, sum |energy band MW| + sum of all AS band MW
-<= 100. The alternative reading, `max_side` (max(charge, discharge) + AS), can be selected in
-the config, but `strict` is the default.
+<= 100. Two alternative readings can be selected in the config, but `strict` is the default:
+`max_side` (max(charge, discharge) + all AS <= 100) and `physical` (the clearing engine's
+BESS rows: discharge + all AS <= 100 and charge + Regulation <= 100, so Primary or
+Contingency may sit on top of charging). Ready-made configs for each reading of EMA's answer
+are in [`../config/scenarios/README.md`](../config/scenarios/README.md).
 
 **Offers.** These rules come from the template and RC383 s3.1.2:
 - Energy has up to 10 bands and each AS product up to 5 (bands 6-10 stay blank).

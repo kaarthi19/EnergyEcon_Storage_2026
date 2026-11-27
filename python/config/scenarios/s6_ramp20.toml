@@ -1,0 +1,3 @@
+# S6: EMA applies a slower BESS ramp limit, 20 MW per period (default 42). See README.md.
+[market]
+bess_ramp_mw = 20.0

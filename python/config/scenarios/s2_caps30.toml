@@ -1,0 +1,6 @@
+# S2: EMA penalises SOC breaches -> smaller energy bands (30 MW everywhere, also inside event
+# windows; default 50 / 50 / 100), so one missed band moves the SOC less. See README.md.
+[strategy.full]
+charge_cap_mw = 30.0
+discharge_cap_mw = 30.0
+event_discharge_cap_mw = 30.0

@@ -74,6 +74,20 @@ lead-2 h / 3 h vintages, and the Regulation-only fallback when planning fails.
 flagged for a calendar shifted by one day). `test_io.py` checks whole-word and
 folder-based file classification and header trimming.
 
+`test_contingency.py` checks the options behind the scenario configs
+(`config/scenarios/`): the `physical` capacity reading in the builders and the validator;
+`regulation_cap` against brute force; that `soc.DeviationTracker` keeps a planned path and
+the month-end target feasible when any subset of the extra bands clears; that the SOC
+programme gives the same result for state-dependent values that do not depend on the state;
+`single_miss_exposure` on a hand-made path; and, on the synthetic market, that with no
+option set the `physical` reading gives the default bids, that `reserve_fill` puts
+Contingency exactly on the charging MW, that both Regulation sustainability rules keep every
+period's Regulation within the cap, that price-responsive bands leave the planned schedule
+untouched (tracker mode: 0 breaches with no SOC policy, both modes, every convention; local
+mode: 0 breaches under clip and reject) and respect the information cut, the evaluator's
+`soc_policy` and capped Regulation baseline, and that every scenario file loads with the
+initial SOC on the planning grid.
+
 `test_evaluate.py` checks the walk-forward harness and the perfect-foresight bound.
 `test_strategy_data.py` (data, slow) runs the November `generate` end to end and an October
 pseudo-November that must beat Regulation-only by more than 50k under both modes and all

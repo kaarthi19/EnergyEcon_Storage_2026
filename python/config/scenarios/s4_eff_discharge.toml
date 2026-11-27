@@ -1,0 +1,5 @@
+# S4: EMA confirms all of the 85 % loss is on discharge (eta_c = 1, eta_d = 0.85).
+# Plan SOC under this convention only. It is already the binding convention of the default
+# plan, so the bids are the same as the default's. See README.md.
+[bess]
+efficiency_conventions = [[1.0, 0.85]]

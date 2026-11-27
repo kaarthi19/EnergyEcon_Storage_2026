@@ -1,0 +1,5 @@
+# S9: EMA limits offer prices to the training maximum (about 2058 S$/MWh). The always-
+# clearing charge band is priced at 2058. See README.md.
+[offers]
+charge_cap_price = 2058.0
+offer_price_max = 2058.0

@@ -1,0 +1,4 @@
+# S5: EMA allows the broad pre-dispatch reading: any pre-dispatch row issued by T - 65 min,
+# including rows for other periods, may be used for period T. See README.md.
+[information]
+strict_predispatch = false

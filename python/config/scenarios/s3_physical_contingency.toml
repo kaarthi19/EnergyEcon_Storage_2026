@@ -1,0 +1,9 @@
+# S3: EMA reads the capacity rule as the engine's physical rows: discharge + all AS <= 100 and
+# charge + Regulation <= 100. Contingency (at the AS floor price) then fills the MW that
+# charging frees on the discharge side: a 50 MW charge carries 50 MW Regulation and 50 MW
+# Contingency. See README.md.
+[rules]
+capacity_rule = "physical"
+
+[strategy.full]
+reserve_fill = "contingency"

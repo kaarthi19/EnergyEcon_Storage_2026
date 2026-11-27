@@ -19,7 +19,12 @@ under each convention separately.
 
 :class:`SocIntervalTracker` keeps a worst-case [N_lo, N_hi] interval for offers whose
 clearing is not known in advance (price-responsive bands): every band may clear or not,
-and a band is only allowed if the whole interval stays feasible.
+and a band is only allowed if the whole interval stays feasible. :class:`DeviationTracker`
+does the same around a *planned* path: extra bands may only move the SOC so far that every
+later planned step, and the month-end target, stay feasible in the worst case.
+
+:func:`regulation_cap` is the largest Regulation MW that the stored energy can sustain for a
+given time in both directions (an RC386-style SOC check on Regulation; scenario option).
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ __all__ = [
     "y_bounds",
     "y_terminal_min",
     "SocIntervalTracker",
+    "DeviationTracker",
+    "regulation_cap",
 ]
 
 _TOL = 1e-9
@@ -194,3 +201,78 @@ class SocIntervalTracker:
         n_max = (cap_y - self.s0) / self._ec_hi if cap_y > self.s0 else (cap_y - self.s0) / self._ec_lo
         room = n_max - self.n_hi - h * committed_chg
         return max(0.0, room / h)
+
+
+def regulation_cap(y_start, x, cfg: Config, hours: float | None = None, s0: float | None = None) -> np.ndarray:
+    """Largest Regulation MW sustainable for ``hours`` (default one period) in each direction.
+
+    ``y_start``: binding SOC Y (MWh, :func:`binding_soc`) at the start of the period; ``x``:
+    the period's energy schedule (MW, + discharge); both broadcast. Up-regulation means the
+    BESS output is ``x + R`` for ``hours``, down-regulation ``x - R``; the SOC must stay in
+    [soc_min, soc_max] in both cases under every configured efficiency convention:
+
+        R <= (SOC_c - soc_min) * eta_d / hours - x,   R <= (soc_max - SOC_c) / (hours * eta_c) + x
+
+    The result is clipped to [0, power_mw - |x|] (the strict capacity rule).
+    """
+    h = cfg.period_hours if hours is None else float(hours)
+    s0 = cfg.initial_soc_mwh if s0 is None else s0
+    y = np.asarray(y_start, float)
+    x = np.asarray(x, float)
+    n = (y - s0) / eta_c_range(cfg)[1]  # Eq. (15) inverted: N from Y
+    cap = np.full(np.broadcast(y, x).shape, np.inf)
+    for ec, ed in cfg.efficiency_conventions:
+        soc = s0 + ec * n
+        up = (soc - cfg.soc_min_mwh) * ed / h - x
+        down = (cfg.soc_max_mwh - soc) / (h * ec) + x
+        cap = np.minimum(cap, np.minimum(up, down))
+    return np.clip(cap, 0.0, cfg.power_mw - np.abs(x))
+
+
+class DeviationTracker:
+    """Worst-case deviation from a planned path caused by bands that may or may not clear.
+
+    ``n_plan``: the planned grid-side net stored energy N_t (MWh, end of each period; see
+    :func:`net_stored`). The deviation D (MWh of N) lies in [d_lo, d_hi]: an extra discharge
+    band of q MW adds [-h q / rte, 0], an extra charge band [0, h q]. A band in period t is
+    allowed only if, for every later t' >= t, SOC = s0 + eta_c (N_t' + D) stays inside
+    [soc_min + margin, soc_max - margin] under every convention for the whole interval, and
+    the month-end SOC stays >= ``terminal_mwh`` (default ``cfg.terminal_soc_frac``) under
+    every convention. The planned path itself is then always executable."""
+
+    def __init__(self, n_plan, cfg: Config, margin: float | None = None, terminal_mwh: float | None = None,
+                 s0: float | None = None):
+        self.cfg = cfg
+        self.s0 = cfg.initial_soc_mwh if s0 is None else s0
+        m = cfg.soc_margin_mwh if margin is None else margin
+        ec_hi = eta_c_range(cfg)[1]
+        n = np.asarray(n_plan, float)
+        lo_n = (cfg.soc_min_mwh + m - self.s0) / ec_hi
+        hi_n = (cfg.soc_max_mwh - m - self.s0) / ec_hi
+        dmin = lo_n - n
+        dmax = hi_n - n
+        if len(n):
+            y_t = y_terminal_min(cfg, terminal_mwh, self.s0)
+            dmin[-1] = max(dmin[-1], (y_t - self.s0) / ec_hi - n[-1])
+        # suffix bounds: a deviation at t persists to the end of the month
+        self.lb = np.maximum.accumulate(dmin[::-1])[::-1] if len(n) else dmin
+        self.ub = np.minimum.accumulate(dmax[::-1])[::-1] if len(n) else dmax
+        self.d_lo = 0.0
+        self.d_hi = 0.0
+
+    def max_discharge(self, t: int) -> float:
+        """Largest extra discharge MW in period ``t`` that keeps every later step feasible."""
+        h, r = self.cfg.period_hours, self.cfg.round_trip_eff
+        return max(0.0, (self.d_lo - self.lb[t]) * r / h)
+
+    def max_charge(self, t: int) -> float:
+        h = self.cfg.period_hours
+        return max(0.0, (self.ub[t] - self.d_hi) / h)
+
+    def step(self, t: int, q_dis: float = 0.0, q_chg: float = 0.0) -> tuple[float, float]:
+        h, r = self.cfg.period_hours, self.cfg.round_trip_eff
+        if q_dis > self.max_discharge(t) + 1e-9 or q_chg > self.max_charge(t) + 1e-9:
+            raise ValueError(f"period {t}: extra bands would make a planned step infeasible")
+        self.d_lo -= h * q_dis / r
+        self.d_hi += h * q_chg
+        return self.d_lo, self.d_hi

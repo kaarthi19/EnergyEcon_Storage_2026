@@ -1,0 +1,4 @@
+# S2: EMA penalises SOC breaches -> 25 MWh SOC margin (default 2): absorbs one missed
+# charge band of any size and most missed discharge bands. See README.md.
+[bess]
+soc_margin_mwh = 25.0
