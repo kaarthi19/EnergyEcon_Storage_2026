@@ -80,6 +80,14 @@ event_recharge = "none"
 event_recharge_hours = [0.0, 7.0]   # night hours [start, end) by period start time (wraps past 24)
 event_recharge_max_price = 350.0  # forecast energy price cap for the exception (S$/MWh)
 event_recharge_hurdle = 0.0      # extra planning cost per MWh charged under the exception (S$/MWh)
+# Event-window bias correction of the planning energy price (docs/strategy.md, "Event-window
+# forecast bias"): "none", or "residual" = add to the energy price of every period inside a
+# single event window the mean residual (actual - day-ahead backcast) of its bucket (cycle,
+# day of the event, surge flag, hour block), learned at the fit cut from past event days only.
+event_bias = "none"
+event_bias_hours = 3.0           # hour-of-day block of the buckets (h; must divide 24)
+event_bias_clip = 500.0          # each residual is clipped to +- this before averaging (S$/MWh)
+event_bias_shrink = 0.0          # bucket correction = mean * n / (n + shrink), n = residual periods
 guard_margin_mw = 300.0          # ban/cancel charging when the forecast capacity margin is below this (MW)
 guard_price = 400.0              # cancel a planned charge if the lead-2 h energy forecast exceeds this (S$/MWh)
 # "none": day-ahead plan only; "guard": lead-2 h guards at each period's gate;

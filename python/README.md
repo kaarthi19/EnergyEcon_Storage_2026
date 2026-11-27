@@ -35,7 +35,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt -r requirements-figures.txt
 
-# unit tests on small synthetic markets; no EMA data needed (about 6 minutes)
+# unit tests on small synthetic markets; no EMA data needed (about 7-8 minutes)
 # (env -u keeps the slower data tests off even if BESSBID_DATA_DIR is set in your shell)
 env -u BESSBID_DATA_DIR python -m pytest -q
 
@@ -173,7 +173,8 @@ python/
 | `calendar.py` | `learn_calendar(infoset, cut) -> EventCalendar` (outage cycles, contingency and surge windows learned from data) |
 | `netdemand.py` | `NetDemandModel`: legal lead-2 h / 3 h net demand, day-ahead profile plus surge, error nodes |
 | `stackmodel.py` | `StackModel`: offer-price factor model and the blend of the legal stacks (`forecast_stack(T, decision_time, outage)`) |
-| `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`; `walk_forward`, `evaluate`, `month_forecasts` |
+| `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`, `.backcast()`; `walk_forward`, `evaluate`, `month_forecasts` |
+| `eventbias.py` | `event_keys`, `backcast_residuals`, `fit_event_bias -> EventBias`: the optional event-window bias correction of the planning energy price (`event_bias`) |
 | `_clearlp.py` | small reference clearing LP, cross-checked against `engine.py` in the tests |
 | `checks.py` | `calendar_consistency(fc, Ts)`: the learned event calendar against each period's legal pre-dispatch vintage (reported only) |
 | `backtest.py` | `simulate(bids, month, data, mode, convention, soc_policy, ...)`, `run_months`, `MarketData`, `soc_path` |
@@ -194,7 +195,7 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   (Eq. (1)-(11)) and the planner (Eq. (12)-(23)): the SOC dynamic programme, the value
   model with price impact, the capacity rule, the SOC limits under three conventions with
   margin, the ramp limit, the event charging ban (and its optional overnight exception) and
-  the terminal SOC. The matching code
+  the terminal SOC, and the optional event-window bias correction (13b). The matching code
   lines in `engine.py`, `planner.py`, `soc.py`, `strategy_full.py` and `bids.py` carry
   `# Eq. (n)` comments. Units and signs are in [`docs/units.md`](docs/units.md).
 - **Strategy, results and open questions.** [`docs/strategy.md`](docs/strategy.md) covers
@@ -227,6 +228,8 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   | `[strategy.full] refine` | `"guard"` | `"none"`, `"guard"` or `"lead2"` (gate-time re-optimisation) |
   | `[strategy.full] event_recharge` | `"none"` | `"overnight"`: allow charging in cheap night periods of the 19-day event windows (`"overnight_all"`: every event window); tested, not adopted (about 0 over Aug-Oct, loses in Sep and Oct; [`docs/strategy.md`](docs/strategy.md)) |
   | `[strategy.full] event_recharge_hours`, `event_recharge_max_price`, `event_recharge_hurdle` | [0, 7], 350, 0 | night hours, forecast price cap and extra planning cost (S$/MWh) of that exception |
+  | `[strategy.full] event_bias` | `"none"` | `"residual"`: correct the planning energy price inside event windows by the mean residual of the same event bucket (cycle, event day, surge flag, 3-h block), learned at the fit cut from backcasts of past event days. Cuts the Aug-Oct event-window forecast MAE from 44 to 31 S$/MWh (surge nights: bias +68 -> +18), but the plan's value does not change (+0.2k maker, -0.3k taker per 30 days, losing in Aug and Oct), so it is not adopted ([`docs/strategy.md`](docs/strategy.md)) |
+  | `[strategy.full] event_bias_hours`, `event_bias_clip`, `event_bias_shrink` | 3, 500, 0 | hour block of the buckets, residual clip (S$/MWh) and shrinkage (periods) of that correction |
 
 ## If EMA answers our questions differently
 

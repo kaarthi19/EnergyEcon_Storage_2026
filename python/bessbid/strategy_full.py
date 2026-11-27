@@ -11,7 +11,9 @@ Layers
    any feedback from EMA. Quantities come from an SOC dynamic programme
    (:mod:`bessbid.planner`) on forecast values that include our own price impact (the
    forecast stack is cleared with our offer inside the LP, averaged over net-demand error
-   nodes).
+   nodes). An optional correction (``event_bias``, off by default) shifts the forecast
+   energy price inside event windows by the mean residual of past events
+   (:mod:`bessbid.eventbias`); it cut the forecast error but did not add value.
 2. **Events.** The same programme covers the 19-day stress event: the month-ahead values
    (one decision at the first period's gate) see the calendar's event days, so the
    continuation value makes the battery arrive full; inside event windows discharge may go
@@ -99,6 +101,17 @@ class FullParams:
     #: extra cost (S$/MWh charged) of a charge allowed by the exception, for the forecast's
     #: low bias on stress nights (actual minus day-ahead forecast: median +55 to +87 in Aug-Oct)
     event_recharge_hurdle: float = 0.0
+    #: event-window bias correction of the planning energy price (:mod:`bessbid.eventbias`):
+    #: 'none', or 'residual' = add, in every period of a single event window, the mean
+    #: residual (actual - forecast) of the same event bucket (cycle, day of the event,
+    #: surge flag, hour block) backcast on the past event days before the fit cut
+    event_bias: str = "none"
+    #: hour-of-day block of the buckets (h)
+    event_bias_hours: float = 3.0
+    #: each residual is clipped to +- this before averaging (S$/MWh)
+    event_bias_clip: float = 500.0
+    #: shrinkage: a bucket's correction is mean * n / (n + shrink), n = residual periods
+    event_bias_shrink: float = 0.0
     #: ban charging when the forecast capacity margin is below this (MW)
     guard_margin_mw: float = 300.0
     #: lead-2 h guard: cancel a planned charge if the lead-2 h energy forecast exceeds this
@@ -175,6 +188,12 @@ class FullParams:
             raise ValueError("ramp_mw must be >= 0 (0 = no limit)")
         if self.event_recharge not in ("none", "overnight", "overnight_all"):
             raise ValueError("event_recharge must be 'none', 'overnight' or 'overnight_all'")
+        if self.event_bias not in ("none", "residual"):
+            raise ValueError("event_bias must be 'none' or 'residual'")
+        if not (0 < self.event_bias_hours <= 24 and (24.0 / self.event_bias_hours).is_integer()):
+            raise ValueError("event_bias_hours must divide 24")
+        if self.event_bias_clip <= 0 or self.event_bias_shrink < 0:
+            raise ValueError("event_bias_clip must be > 0 and event_bias_shrink >= 0")
         if self.event_recharge_hurdle < 0:
             raise ValueError("event_recharge_hurdle must be >= 0")
         if self.pr_bands not in ("none", "tracker", "local"):
@@ -326,10 +345,32 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
 
     def minus(F, c):
         return F - (c[:, None, :] if F.ndim == 3 else c)
+
     ev, surge = _event_masks(fc.calendar, Ts)
     rech = _recharge_mask(fc.calendar, Ts, p) & ev
     nodes_da = fc.nd.nodes_da if p.use_nodes else None
     nodes_l2 = fc.nd.nodes_lead if p.use_nodes else None
+
+    # ---- event-window bias correction, learned at the fit cut (Eq. (13b)) -----------------
+    eb = None
+    dE = np.zeros(n)
+    if p.event_bias == "residual":
+        from .eventbias import fit_event_bias
+
+        eb = cached(("event_bias", p.event_bias_hours, p.event_bias_clip, p.event_bias_shrink),
+                    lambda: fit_event_bias(fc, cut, block_hours=p.event_bias_hours, clip=p.event_bias_clip,
+                                           shrink=p.event_bias_shrink, nodes=nodes_da))
+        dE = eb.delta(fc.calendar, Ts)
+
+    def corrected(lad, rows):
+        """The ladder with the bucket correction added to the energy price at every level
+        (a new dict; cached ladders are never changed)."""
+        d = dE[rows]
+        if not np.any(d):
+            return lad
+        out = dict(lad)
+        out["E"] = lad["E"] + d[:, None]  # Eq. (13b)
+        return out
     chg_mwh = cfg.period_hours * np.clip(-grid.mw, 0, None)
 
     def rech_cost(mask):
@@ -345,8 +386,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     lad_ma = cached("lad_ma", lambda: vm.ladder(Ts, dec0, inp0["nd"].to_numpy(), inp0["outage"].to_numpy(),
                                                  kind="month_ahead", nodes=nodes_da,
                                                  inputs_time=inp0["input_time"].to_numpy()))
-    F_ma = minus(values(lad_ma), rech_cost(rech))
-    A_ma = _allowed(grid, ev, lad_ma["margin"], p, rech, lad_ma["E"][:, x0])
+    lad_ma_c = corrected(lad_ma, np.arange(n))
+    F_ma = minus(values(lad_ma_c), rech_cost(rech))
+    A_ma = _allowed(grid, ev, lad_ma["margin"], p, rech, lad_ma_c["E"][:, x0])
     days = sorted(set(Ts.normalize()))
     day_idx = [np.where(Ts.normalize() == D)[0] for D in days]
     if use_ramp:
@@ -371,7 +413,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 inputs_time=pd.to_datetime(l2["issue_time"]).to_numpy()[il2]))
             F_l2 = np.full((n, grid.n_actions), np.nan)
             if len(il2):
-                F_l2[il2] = minus(values(lad_l2), rech_cost(rech[il2]))
+                F_l2[il2] = minus(values(corrected(lad_l2, il2)), rech_cost(rech[il2]))
         if progress:
             progress(f"lead-2h forecasts done ({time.perf_counter() - t0:.1f}s)")
 
@@ -407,8 +449,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         lad = cached(("lad_da", D), lambda: vm.ladder(TD, dec, inp["nd"].to_numpy(), inp["outage"].to_numpy(),
                                                        kind="day_ahead", nodes=nodes_da,
                                                        inputs_time=inp["input_time"].to_numpy()))
-        F = minus(values(lad), rech_cost(rech[idx]))
-        A = _allowed(grid, ev[idx], lad["margin"], p, rech[idx], lad["E"][:, x0])
+        lad_c = corrected(lad, idx)
+        F = minus(values(lad_c), rech_cost(rech[idx]))
+        A = _allowed(grid, ev[idx], lad["margin"], p, rech[idx], lad_c["E"][:, x0])
         V_end = V_ma[idx[-1] + 1]  # Eq. (22): month-ahead continuation value
 
         def solve(V_end):
@@ -440,7 +483,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 margin_l2 = float(np.sum(fc.stacks.nom)) - float(r.nd_eff) - float(r.req_P + r.req_C + r.req_R)
                 short = float(r.sP + r.sC + r.sR)
                 gp = min(p.guard_price, p.event_recharge_max_price) if (ev[i] and rech[i]) else p.guard_price
-                if margin_l2 < p.guard_margin_mw or float(r.E) > gp or short > 1e-6:
+                if margin_l2 < p.guard_margin_mw or float(r.E) + dE[i] > gp or short > 1e-6:
                     # cancel the charge, or cut it as far as the ramp limit and the month-end
                     # SOC target still allow (the least charging such action)
                     # Eq. (23)
@@ -517,6 +560,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     frame["fc_day_ahead_R"] = da_R
     frame["fc_day_ahead_margin"] = da_margin
     frame["fc_month_ahead_E"] = lad_ma["E"][:, int(np.argmin(np.abs(vm.levels)))]
+    if eb is not None:  # the forecast columns stay uncorrected; this is the correction added
+        frame["fc_event_bias_E"] = dE
     if l2 is not None:
         frame["fc_lead2_E"] = l2["E"].reindex(Ts).to_numpy()
         frame["fc_lead2_R"] = l2["R"].reindex(Ts).to_numpy()
@@ -537,6 +582,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         "max_ramp_mw": float(steps_mw.max()),
         "warnings": warnings_,
         "calendar_check": cal_check,
+        **({"event_bias": {**eb.to_dict(), "corrected_periods": int(np.count_nonzero(dE)),
+                           "mean_correction": float(dE[dE != 0].mean()) if np.any(dE) else 0.0}}
+           if eb is not None else {}),
         "runtime_s": time.perf_counter() - t0,
     }
     if overlay is not None:

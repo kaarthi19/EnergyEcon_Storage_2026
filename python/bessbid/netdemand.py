@@ -78,6 +78,8 @@ class NetDemandModel:
         self.nodes_lead: np.ndarray = np.zeros(NQ)
         self.nodes_da: np.ndarray = np.zeros(NQ)
         self.stats: dict = {}
+        #: set only inside :meth:`bessbid.forecast.Forecaster.backcast`
+        self.backcast_ok = False
 
     # ---- fit ---------------------------------------------------------------------------------
     def fit(self, cut) -> "NetDemandModel":
@@ -197,7 +199,7 @@ class NetDemandModel:
         """Day-ahead net-demand forecast for periods ``Ts`` made at ``decision_time``."""
         Ts = pd.DatetimeIndex(Ts)
         d = pd.Timestamp(decision_time)
-        if self.cut is not None and d < self.cut:
+        if self.cut is not None and d < self.cut and not self.backcast_ok:
             raise ValueError(f"decision time {d} is before the fit cut {self.cut}")
         h = self._history(d)
         h = h[~self.cal.is_surge(h.index.to_numpy(dtype="datetime64[ns]"))]

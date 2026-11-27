@@ -27,7 +27,10 @@ every read:
 | Training clearing | the period ended before the decision time: `ts + 30 min < T - 65 min` | `clearing_for(T)`, `clearing_known_at(t)` |
 
 Compute every per-period feature with that period's own cutoff (`infoset.cutoff(T)`), never
-from a month-wide frame. `predispatch_known_at` hides training actuals until their period
+from a month-wide frame. The one month-wide feature, the optional event-window bias
+correction (`event_bias`), is fitted at the month's fit cut, which precedes every period's
+gate, from clearing periods that ended before that cut (audit entry `eventbias.fit`); its
+backcasts read each input at the backcast day's own decision time. `predispatch_known_at` hides training actuals until their period
 ended before `t`. `infoset.assert_no_leak()` and `infoset.audit_frame()` provide the proof for the
 manifest.
 
