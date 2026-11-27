@@ -2,8 +2,8 @@
 
 ```bash
 cd python
-python -m pytest                       # unit tests on small synthetic markets (about 5 min)
-BESSBID_DATA_DIR="/path/to/ema bidding comp" BESSBID_WORK_DIR=/path/to/work python -m pytest
+env -u BESSBID_DATA_DIR python -m pytest   # synthetic markets only: 239 passed, 25 skipped (about 10 min)
+BESSBID_DATA_DIR="/path/to/ema bidding comp" BESSBID_WORK_DIR=/path/to/work python -m pytest   # 264 passed (about 20 min)
 ```
 
 Tests marked `data` run only when `BESSBID_DATA_DIR` is set. They check the following:
@@ -64,6 +64,25 @@ periods while the capacity, ramp, SOC (three conventions, 2 MWh margin) and term
 hold, that an exception whose price cap or hurdle can never be met reproduces the default
 bids exactly, and the per-period information cut with the exception switched on.
 
+`test_event_bias.py` checks the optional event-window bias correction (`event_bias`): the
+bucket labels on a hand-made calendar (event day counted from the onset day, surge flag,
+hour block, `"overlap"` where two windows overlap), the estimator (mean, clip, shrinkage; no
+correction outside events, in overlaps or in buckets without residuals), that the
+forecaster's backcast mode is scoped to its `with` block, and on the synthetic market (a
+September plan, since the synthetic stacks start on Jul 1): the residuals use only periods
+that ended before the fit cut and are audited as `eventbias.fit`; perturbing every
+clearing, pre-dispatch and stack row not known at the cut leaves the corrections
+bit-identical, while changing a known clearing price changes them; the corrected plan keeps
+the capacity, ramp, SOC (three conventions, 2 MWh margin), terminal and event-ban rules;
+a zero correction reproduces the default bids exactly; and bids up to T are identical when
+every row not legal at T's gate is perturbed (T on the first day and inside an event).
+`test_event_bias_data.py` (data) fits the correction at the November cut on EMA's data:
+one audit entry at the cut, upward corrections in the surge nights and downward ones in the
+11-day windows and on the onset afternoon, five July-October events behind the X+1
+surge-night buckets, and a correction in exactly the 267 November event periods; and at the
+August cut, that perturbing every row not known at Jul 31 00:00 leaves the July-only
+correction bit-identical.
+
 `test_soc_planner.py` also checks the ramp-limited programme against brute force and that
 it equals the plain programme without a limit. `test_engine.py` checks that non-finite
 inputs raise. `test_writer_cli.py` checks that `generate` stops (exit 1) when the test
@@ -73,6 +92,20 @@ lead-2 h / 3 h vintages, and the Regulation-only fallback when planning fails.
 `test_strategy_full.py` also checks the calendar check (consistent on the synthetic market,
 flagged for a calendar shifted by one day). `test_io.py` checks whole-word and
 folder-based file classification and header trimming.
+
+`test_contingency.py` checks the options behind the scenario configs
+(`config/scenarios/`): the `physical` capacity reading in the builders and the validator;
+`regulation_cap` against brute force; that `soc.DeviationTracker` keeps a planned path and
+the month-end target feasible when any subset of the extra bands clears; that the SOC
+programme gives the same result for state-dependent values that do not depend on the state;
+`single_miss_exposure` on a hand-made path; and, on the synthetic market, that with no
+option set the `physical` reading gives the default bids, that `reserve_fill` puts
+Contingency exactly on the charging MW, that both Regulation sustainability rules keep every
+period's Regulation within the cap, that price-responsive bands leave the planned schedule
+untouched (tracker mode: 0 breaches with no SOC policy, both modes, every convention; local
+mode: 0 breaches under clip and reject) and respect the information cut, the evaluator's
+`soc_policy` and capped Regulation baseline, and that every scenario file loads with the
+initial SOC on the planning grid.
 
 `test_evaluate.py` checks the walk-forward harness and the perfect-foresight bound.
 `test_strategy_data.py` (data, slow) runs the November `generate` end to end and an October

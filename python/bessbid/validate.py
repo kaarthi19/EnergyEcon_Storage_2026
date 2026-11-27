@@ -137,7 +137,7 @@ def validate_table(df: pd.DataFrame, cfg: Config | None = None, month: str | Non
     keys: list[tuple | None] = []
     n_order = 0
     period_cap: dict[tuple, float] = defaultdict(float)
-    period_side: dict[tuple, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
+    period_side: dict[tuple, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])
     for i, r in enumerate(rows):
         rn = first_row + i
         # ---- keys ------------------------------------------------------------------------
@@ -224,6 +224,8 @@ def validate_table(df: pd.DataFrame, cfg: Config | None = None, month: str | Non
                 side[1] += sum(q for _, _, q in filled if q > 0)
             else:
                 side[2] += tot_row
+                if prod == "Regulation":
+                    side[3] += tot_row
 
     if n_order > 5:
         vs.append(Violation("order", f"{n_order} rows out of the expected order in total"))
@@ -248,8 +250,13 @@ def validate_table(df: pd.DataFrame, cfg: Config | None = None, month: str | Non
             seen[k] = first_row + i
     # capacity rule
     for pk, tot in period_cap.items():
-        ch, ds, asm = period_side[pk]
-        used = tot if cfg.capacity_rule == "strict" else max(ch, ds) + asm
+        ch, ds, asm, reg = period_side[pk]
+        if cfg.capacity_rule == "strict":
+            used = tot
+        elif cfg.capacity_rule == "physical":
+            used = max(ds + asm, ch + reg)
+        else:
+            used = max(ch, ds) + asm
         if used > cfg.power_mw + 1e-6:
             vs.append(Violation("capacity", f"{pk[0]} P{pk[1]}: offered {used:.3f} MW > {cfg.power_mw} MW ({cfg.capacity_rule} rule)"))
     return vs

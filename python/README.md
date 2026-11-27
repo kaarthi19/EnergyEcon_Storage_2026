@@ -35,7 +35,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt -r requirements-figures.txt
 
-# unit tests on small synthetic markets; no EMA data needed (about 6 minutes)
+# unit tests on small synthetic markets; no EMA data needed (239 passed, 25 skipped; about 10 minutes)
 # (env -u keeps the slower data tests off even if BESSBID_DATA_DIR is set in your shell)
 env -u BESSBID_DATA_DIR python -m pytest -q
 
@@ -102,7 +102,8 @@ python -m bessbid generate --data-dir D --work-dir W --out W/submission.xlsx \
     [--month 2026-11] [--config FILE.toml] [--allow-incomplete-inputs]
 python -m bessbid validate W/submission.xlsx [--month 2026-11] [--config FILE.toml]
 python -m bessbid inspect --data-dir D --work-dir W        # find and load the data, print a summary
-python -m bessbid evaluate --data-dir D --work-dir W [--month 2026-08 ...] [--no-pf] [--config FILE.toml]
+python -m bessbid evaluate --data-dir D --work-dir W [--month 2026-08 ...] [--no-pf] [--config FILE.toml] \
+    [--soc-policy none|clip|reject]
 python -m bessbid backtest --data-dir D --work-dir W (--bids X.xlsx | --strategy NAME) \
     [--month 2026-10 ...] [--mode maker|taker|both] [--convention sqrt|charge|discharge|all] \
     [--soc-policy none|clip|reject] [--tie strict|inclusive] [--config FILE.toml]
@@ -141,10 +142,12 @@ and everything in `data/` except its two README files.
 python/
 ├── README.md                  this file
 ├── run_all.sh                 tests -> generate -> validate -> figures
+├── scripts/scenario_matrix.sh every scenario config -> workbook (+ walk-forward) and fingerprints
 ├── requirements.txt           pinned runtime and test dependencies
 ├── requirements-figures.txt   pinned matplotlib (figures only)
 ├── pyproject.toml             package metadata (pip install .)
 ├── config/default.toml        every configuration key with its default value
+├── config/scenarios/          one config per likely EMA answer, and the decision table
 ├── bessbid/                   the package (modules below)
 ├── plots/                     figure scripts and labstyle.py (lab figure style)
 ├── tests/                     pytest; data tests run only with BESSBID_DATA_DIR set
@@ -166,15 +169,16 @@ python/
 | `strategy_full.py` | `FullParams` (`from_mapping`), `plan_month(month, infoset, cfg, params) -> (bids, plan frame, info)`, `FullStrategy` (registered as `full`, the CLI default) |
 | `engine.py` | EMA-replica clearing LP: `ClearingEngine`, `clear`, `clear_period`, `price_taker_clear`, `replicate`; `StackArrays`, `PeriodStack`, `BessOffer`, `ClearResult` |
 | `planner.py` | `ValueModel` (forecast stack cleared with our own offer), `make_action_grid`, `action_values`, `dp_backward` / `dp_forward` / `dp_plan`, `dp_backward_ramp` / `dp_forward_ramp`, `soften_end_values` |
-| `soc.py` | SOC under every efficiency convention: `soc_paths`, `binding_soc`, `check_soc`, `y_bounds`, `y_terminal_min`, `SocIntervalTracker` (tested, not used by the shipped strategy) |
+| `soc.py` | SOC under every efficiency convention: `soc_paths`, `binding_soc`, `check_soc`, `y_bounds`, `y_terminal_min`, `SocIntervalTracker` (tested, not used by the shipped strategy); for the scenario configs `DeviationTracker` (extra bands around a planned path) and `regulation_cap` (Regulation sustainable from stored energy) |
 | `calendar.py` | `learn_calendar(infoset, cut) -> EventCalendar` (outage cycles, contingency and surge windows learned from data) |
 | `netdemand.py` | `NetDemandModel`: legal lead-2 h / 3 h net demand, day-ahead profile plus surge, error nodes |
 | `stackmodel.py` | `StackModel`: offer-price factor model and the blend of the legal stacks (`forecast_stack(T, decision_time, outage)`) |
-| `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`; `walk_forward`, `evaluate`, `month_forecasts` |
+| `forecast.py` | `Forecaster(data, cfg).fit(cut)`: `.lead2`, `.lead2_many`, `.day_ahead`, `.scenarios`, `.backcast()`; `walk_forward`, `evaluate`, `month_forecasts` |
+| `eventbias.py` | `event_keys`, `backcast_residuals`, `fit_event_bias -> EventBias`: the optional event-window bias correction of the planning energy price (`event_bias`) |
 | `_clearlp.py` | small reference clearing LP, cross-checked against `engine.py` in the tests |
 | `checks.py` | `calendar_consistency(fc, Ts)`: the learned event calendar against each period's legal pre-dispatch vintage (reported only) |
 | `backtest.py` | `simulate(bids, month, data, mode, convention, soc_policy, ...)`, `run_months`, `MarketData`, `soc_path` |
-| `evaluate.py` | `evaluate(ds, cfg, months, params)`: walk-forward pseudo-Novembers, against Regulation-only and `perfect_foresight_plan` |
+| `evaluate.py` | `evaluate(ds, cfg, months, params, soc_policy=...)`: walk-forward pseudo-Novembers, against Regulation-only and `perfect_foresight_plan`; `single_miss_exposure` (SOC breaches if one energy band fails to clear) |
 | `runinfo.py` | `run_info`: git commit and dirty flag, Python, package and HiGHS versions, platform, runtime (the manifest's `run_info`) |
 | `cli.py` | `python -m bessbid generate \| validate \| inspect \| backtest \| evaluate` |
 
@@ -191,7 +195,7 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   (Eq. (1)-(11)) and the planner (Eq. (12)-(23)): the SOC dynamic programme, the value
   model with price impact, the capacity rule, the SOC limits under three conventions with
   margin, the ramp limit, the event charging ban (and its optional overnight exception) and
-  the terminal SOC. The matching code
+  the terminal SOC, and the optional event-window bias correction (13b). The matching code
   lines in `engine.py`, `planner.py`, `soc.py`, `strategy_full.py` and `bids.py` carry
   `# Eq. (n)` comments. Units and signs are in [`docs/units.md`](docs/units.md).
 - **Strategy, results and open questions.** [`docs/strategy.md`](docs/strategy.md) covers
@@ -214,7 +218,7 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
 
   | Key | Default | Meaning |
   |---|---|---|
-  | `capacity_rule` | `"strict"` | sum of \|energy MW\| + all AS MW <= 100 per period (`"max_side"`: the looser reading) |
+  | `capacity_rule` | `"strict"` | sum of \|energy MW\| + all AS MW <= 100 per period (`"max_side"`, `"physical"`: looser readings) |
   | `soc_margin_mwh` | 2.0 | SOC margin inside 5-95 MWh kept by the planner |
   | `terminal_soc_frac` | 0.5 | minimum SOC at the end of the month, under every convention |
   | `bess_ramp_mw` | 42.0 | largest change of the energy schedule per period (0 = no limit) |
@@ -224,6 +228,20 @@ enforce rounding and the capacity rule. `write_submission` refuses tables that f
   | `[strategy.full] refine` | `"guard"` | `"none"`, `"guard"` or `"lead2"` (gate-time re-optimisation) |
   | `[strategy.full] event_recharge` | `"none"` | `"overnight"`: allow charging in cheap night periods of the 19-day event windows (`"overnight_all"`: every event window); tested, not adopted (about 0 over Aug-Oct, loses in Sep and Oct; [`docs/strategy.md`](docs/strategy.md)) |
   | `[strategy.full] event_recharge_hours`, `event_recharge_max_price`, `event_recharge_hurdle` | [0, 7], 350, 0 | night hours, forecast price cap and extra planning cost (S$/MWh) of that exception |
+  | `[strategy.full] event_bias` | `"none"` | `"residual"`: correct the planning energy price inside event windows by the mean residual of the same event bucket (cycle, event day, surge flag, 3-h block), learned at the fit cut from backcasts of past event days. Cuts the Aug-Oct event-window forecast MAE from 44 to 31 S$/MWh (surge nights: bias +68 -> +18), but the plan's value does not change (+0.2k maker, -0.3k taker per 30 days, losing in Aug and Oct), so it is not adopted ([`docs/strategy.md`](docs/strategy.md)) |
+  | `[strategy.full] event_bias_hours`, `event_bias_clip`, `event_bias_shrink` | 3, 500, 0 | hour block of the buckets, residual clip (S$/MWh) and shrinkage (periods) of that correction |
+
+## If EMA answers our questions differently
+
+[`config/scenarios/README.md`](config/scenarios/README.md) is a decision table: for each
+likely answer from EMA (capacity reading, SOC breaches, efficiency split, pre-dispatch
+reading, ramp limit, Regulation SOC rules, offer price limits) it names a ready config in
+`config/scenarios/`, its Aug-Oct gain against the default under the same assumption, its
+risk and its November workbook fingerprint. Switching means passing that file to
+`run_all.sh --config`. `scripts/scenario_matrix.sh` regenerates every scenario's workbook
+(and, with `--evaluate`, its walk-forward). The options behind them (`pr_bands`,
+`reserve_fill`, `regulation_soc_rule`, the `physical` capacity reading, `evaluate
+--soc-policy`) all default to the submitted behaviour, so the default workbook is unchanged.
 
 ## Citation
 

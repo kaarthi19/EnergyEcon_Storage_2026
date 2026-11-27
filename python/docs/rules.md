@@ -1,8 +1,11 @@
 # Rules the code enforces, and what `generate` does
 
 **Capacity (strict reading).** In every period, sum |energy band MW| + sum of all AS band MW
-<= 100. The alternative reading, `max_side` (max(charge, discharge) + AS), can be selected in
-the config, but `strict` is the default.
+<= 100. Two alternative readings can be selected in the config, but `strict` is the default:
+`max_side` (max(charge, discharge) + all AS <= 100) and `physical` (the clearing engine's
+BESS rows: discharge + all AS <= 100 and charge + Regulation <= 100, so Primary or
+Contingency may sit on top of charging). Ready-made configs for each reading of EMA's answer
+are in [`../config/scenarios/README.md`](../config/scenarios/README.md).
 
 **Offers.** These rules come from the template and RC383 s3.1.2:
 - Energy has up to 10 bands and each AS product up to 5 (bands 6-10 stay blank).
@@ -20,11 +23,14 @@ every read:
 | Data | Usable for a period starting at T when | Accessors |
 |---|---|---|
 | Pre-dispatch | `issue_time <= T - 65 min`. Strict default: only T's own rows, lead 2 h, else lead 3 h | `predispatch_for(T)`, `predispatch_for_many(Ts)`, `predispatch_known_at(t)` |
-| Offer stacks | `assumed_publication_time_sgt <= T - 65 min` (= ts + 28 d 8 h, so stacks lag >= 29 days) | `stacks_for(T)`, `stacks_known_at(t)` |
+| Offer stacks | `assumed_publication_time_sgt <= T - 65 min` (= ts + 28 d 8 h, so a stack is usable at least 28 d 9 h 05 min after its period, and at the same time of day only from 29 days back) | `stacks_for(T)`, `stacks_known_at(t)` |
 | Training clearing | the period ended before the decision time: `ts + 30 min < T - 65 min` | `clearing_for(T)`, `clearing_known_at(t)` |
 
 Compute every per-period feature with that period's own cutoff (`infoset.cutoff(T)`), never
-from a month-wide frame. `predispatch_known_at` hides training actuals until their period
+from a month-wide frame. The one month-wide feature, the optional event-window bias
+correction (`event_bias`), is fitted at the month's fit cut, which precedes every period's
+gate, from clearing periods that ended before that cut (audit entry `eventbias.fit`); its
+backcasts read each input at the backcast day's own decision time. `predispatch_known_at` hides training actuals until their period
 ended before `t`. `infoset.assert_no_leak()` and `infoset.audit_frame()` provide the proof for the
 manifest.
 

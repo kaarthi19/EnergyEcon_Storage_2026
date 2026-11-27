@@ -43,7 +43,9 @@ STRATEGY_TABLE = "strategy"
 #: Readings of "combined capacity offered across Energy and AS must not exceed 100 MW".
 #: ``strict``: sum |energy band MW| + sum of all AS band MW <= power_mw (our default).
 #: ``max_side``: max(total charge MW, total discharge MW) + sum AS MW <= power_mw.
-CAPACITY_RULES = ("strict", "max_side")
+#: ``physical``: the clearing engine's BESS rows, discharge MW + sum AS MW <= power_mw and
+#: charge MW + Regulation MW <= power_mw (Primary/Contingency may sit on top of charging).
+CAPACITY_RULES = ("strict", "max_side", "physical")
 
 #: When does an offer-stack row become usable?
 #: ``column``: the file's assumed_publication_time_sgt (= ts + 28 d 8 h), the default.

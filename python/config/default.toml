@@ -35,6 +35,8 @@ offer_price_max = 4500.0         # highest offer price the validator accepts (S$
 [rules]
 # "strict": sum |energy band MW| + sum of all AS band MW <= power_mw in every period.
 # "max_side": max(total charge MW, total discharge MW) + sum AS MW <= power_mw.
+# "physical": the clearing engine's BESS rows, discharge + all AS <= power_mw and
+#             charge + Regulation <= power_mw (config/scenarios/README.md, S3).
 capacity_rule = "strict"
 mw_resolution = 0.1              # MW are rounded toward zero to this step
 max_energy_bands = 10            # template limit for Energy
@@ -78,6 +80,14 @@ event_recharge = "none"
 event_recharge_hours = [0.0, 7.0]   # night hours [start, end) by period start time (wraps past 24)
 event_recharge_max_price = 350.0  # forecast energy price cap for the exception (S$/MWh)
 event_recharge_hurdle = 0.0      # extra planning cost per MWh charged under the exception (S$/MWh)
+# Event-window bias correction of the planning energy price (docs/strategy.md, "Event-window
+# forecast bias"): "none", or "residual" = add to the energy price of every period inside a
+# single event window the mean residual (actual - day-ahead backcast) of its bucket (cycle,
+# day of the event, surge flag, hour block), learned at the fit cut from past event days only.
+event_bias = "none"
+event_bias_hours = 3.0           # hour-of-day block of the buckets (h; must divide 24)
+event_bias_clip = 500.0          # each residual is clipped to +- this before averaging (S$/MWh)
+event_bias_shrink = 0.0          # bucket correction = mean * n / (n + shrink), n = residual periods
 guard_margin_mw = 300.0          # ban/cancel charging when the forecast capacity margin is below this (MW)
 guard_price = 400.0              # cancel a planned charge if the lead-2 h energy forecast exceeds this (S$/MWh)
 # "none": day-ahead plan only; "guard": lead-2 h guards at each period's gate;
@@ -93,6 +103,27 @@ plan_time = "midnight"           # day D's plan: "midnight" = 00:00 of D-1; "gat
 # Signed energy levels (MW, + = discharge) at which the forecast market is cleared with our offer.
 levels = [-100.0, -75.0, -50.0, -35.0, -20.0, -10.0, 0.0, 10.0, 20.0, 35.0, 50.0, 75.0, 100.0]
 price_impact = true              # value actions with our own price impact
+# Contingency options for EMA's answers (config/scenarios/README.md); these defaults change nothing.
+# Price-responsive energy bands on top of the planned schedule (S1): "none"; "tracker" (sized so
+# every later planned step and the month-end target stay feasible if all such bands clear);
+# "local" (sized only to keep the period itself inside the SOC limits; for an EMA that clips
+# or rejects SOC-breaching dispatch).
+pr_bands = "none"
+pr_mw = 10.0                     # size of each extra band before capacity and SOC sizing (MW)
+pr_discharge_premium = 100.0     # extra discharge band at T's lead-2 h energy forecast + this (S$/MWh)
+pr_charge_discount = 100.0       # extra charge band at T's lead-2 h energy forecast - this (S$/MWh)
+pr_periods = "idle"              # "idle" (planned 0 MW), "all" or "events" (calendar event windows)
+pr_sides = "both"                # "both", "discharge" or "charge"
+# pr_soc_margin_mwh = 2.0        # SOC margin of the band sizing (MWh); default: soc_margin_mwh
+# Fill the headroom the capacity rule leaves after energy and Regulation with a reserve band at
+# the AS floor price (S3; with capacity_rule = "physical" this is reserve on top of charging):
+reserve_fill = "none"            # "none", "contingency" or "primary"
+reserve_value = false            # the SOC programme counts that reserve (forecast reserve price at x = 0)
+# Regulation sustainable from stored energy in both directions (S7, RC386-style): "none";
+# "posthoc" (cap each period's Regulation MW after planning); "planned" (the SOC programme
+# values the capped Regulation).
+regulation_soc_rule = "none"
+regulation_sustain_h = 0.5       # hours of full activation the stored energy must sustain
 # Keys whose default is "not set" (TOML has no null); uncomment to set them:
 # regulation_price = 0.01        # Regulation band price (S$/MWh); default: as_floor_price
 # ramp_mw = 42.0                 # ramp limit for this strategy (MW); default: bess_ramp_mw; 0 = no limit

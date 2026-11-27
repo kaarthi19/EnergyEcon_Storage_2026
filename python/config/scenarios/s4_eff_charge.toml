@@ -1,0 +1,10 @@
+# S4: EMA confirms all of the 85 % loss is on charge (eta_c = 0.85, eta_d = 1).
+# Plan SOC under this convention only. The SOC grid step is 0.85 MWh so that charge steps
+# are 2 MW and discharge steps 1.7 MW, and the margin (2.5 MWh) puts the initial 50 MWh on
+# the grid. See README.md.
+[bess]
+efficiency_conventions = [[0.85, 1.0]]
+soc_margin_mwh = 2.5
+
+[strategy.full]
+y_step = 0.85

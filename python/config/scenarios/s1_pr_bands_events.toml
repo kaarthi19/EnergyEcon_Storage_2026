@@ -1,0 +1,12 @@
+# S1: EMA enforces SOC by clipping or rejecting dispatch (no penalty), so price-responsive
+# energy bands cannot cause a breach. This variant keeps the planned always-clearing schedule
+# and adds an extra discharge band of up to 20 MW at T's lead-2 h energy forecast + 300 S$/MWh
+# in calendar event windows, sized so the period stays inside the SOC limits on the planned
+# path ("local"). It LOSES money against the default (README.md): every MW of such a band
+# displaces a MW of Regulation under the strict capacity rule. Kept for reference only.
+[strategy.full]
+pr_bands = "local"
+pr_periods = "events"
+pr_sides = "discharge"
+pr_mw = 20.0
+pr_discharge_premium = 300.0

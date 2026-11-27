@@ -5,7 +5,8 @@
         [--plan-out PLAN.csv] [--allow-incomplete-inputs]
     python -m bessbid validate OUT.xlsx [--month 2026-11] [--config cfg.toml]
     python -m bessbid inspect --data-dir D --work-dir W
-    python -m bessbid evaluate --data-dir D --work-dir W [--month M ...] [--no-pf]
+    python -m bessbid evaluate --data-dir D --work-dir W [--month M ...] [--no-pf] \
+        [--soc-policy none|clip|reject]
     python -m bessbid backtest --data-dir D --work-dir W (--bids X.xlsx | --strategy NAME) \
         [--month 2026-10 ...] [--mode maker|taker|both] [--convention sqrt|charge|discharge|all] \
         [--soc-policy none|clip|reject] [--tie strict|inclusive]
@@ -356,16 +357,28 @@ def cmd_evaluate(args) -> int:
     ds = io.load_all(args.data_dir, work)
     caps = () if args.no_pf else (50.0, 100.0)
     res, plans = evaluate(ds, cfg, months=args.month, params=params, perfect_foresight=caps,
-                          progress=lambda msg: print(msg, flush=True))
+                          progress=lambda msg: print(msg, flush=True), soc_policy=args.soc_policy)
     out = work / "evaluation_full.csv"
     res.to_csv(out, index=False, float_format="%.4f")
+    from .evaluate import single_miss_exposure
+
+    miss = []
     for m, f in plans.items():
         f.to_csv(work / f"evaluation_plan_{m}.csv", index=False, float_format="%.4f",
                  date_format="%Y-%m-%d %H:%M:%S")
+        sm = single_miss_exposure(f["energy_mw"].to_numpy(), cfg.replace(month=m))
+        sm.insert(0, "month", m)
+        miss.append(sm)
     cols = ["policy", "month", "mode", "convention", "revenue", "revenue_per_30d", "uplift", "uplift_per_30d",
-            "rev_E", "rev_R", "soc_min", "soc_max", "breach_periods"]
+            "rev_E", "rev_C", "rev_R", "soc_min", "soc_max", "breach_periods"]
+    cols += [c for c in ("clipped_periods", "rejected_periods") if c in res.columns]
     with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_rows", 500):
         print(res[cols].round(1).to_string(index=False))
+        if miss:
+            mf = pd.concat(miss, ignore_index=True)
+            mf.to_csv(work / "evaluation_single_miss.csv", index=False, float_format="%.4f")
+            print("single missed band (one energy band fails to clear, all others clear):")
+            print(mf.round(2).to_string(index=False))
     print(f"summary -> {out}")
     full = res[(res["policy"] == "full") & (res["month"] != "ALL")]
     return 0 if int(full["breach_periods"].sum()) == 0 else 2
@@ -423,6 +436,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--work-dir", required=True)
     e.add_argument("--month", nargs="+", default=["2026-08", "2026-09", "2026-10"])
     e.add_argument("--no-pf", action="store_true", help="skip the perfect-foresight bounds")
+    e.add_argument("--soc-policy", choices=["none", "clip", "reject"], default="none",
+                   help="how the evaluator treats an award that would leave the SOC limits (default none)")
     e.add_argument("--config", default=None)
     e.set_defaults(func=cmd_evaluate)
     return ap

@@ -43,12 +43,14 @@ from .planner import (LEVELS, NEG, action_values, dp_backward_ramp, dp_forward_r
                       ramp_active, terminal_values)
 from .soc import y_terminal_min
 
-__all__ = ["perfect_foresight_plan", "evaluate", "summarize", "CONVENTIONS"]
+__all__ = ["perfect_foresight_plan", "evaluate", "summarize", "single_miss_exposure", "CONVENTIONS"]
 
 CONVENTIONS = ("discharge", "sqrt", "charge")
 _SCALARS = ("revenue", "revenue_per_30d", "rev_E", "rev_P", "rev_C", "rev_R", "dis_mwh", "chg_mwh",
             "energy_periods", "soc_min", "soc_max", "soc_final", "breach_periods", "breach_max_mwh",
             "price_impact_E_mean", "price_impact_R_mean", "days", "runtime_s")
+#: reported only when a run uses an SOC policy other than 'none'
+_POLICY_SCALARS = ("clipped_periods", "clipped_mwh", "rejected_periods", "rejected_mwh")
 
 
 def _offer(x: float, cfg: Config) -> BessOffer:
@@ -116,20 +118,28 @@ def _row(policy: str, month: str, summary: dict, cv, cfg: Config) -> dict:
     d = {"policy": policy, "month": month, "mode": summary["mode"],
          "convention": convention_label(_resolve_conv(cv, cfg))}
     d.update({k: summary[k] for k in _SCALARS})
+    if summary.get("soc_policy", "none") != "none":
+        d["soc_policy"] = summary["soc_policy"]
+        d.update({k: summary[k] for k in _POLICY_SCALARS})
     return d
 
 
 def evaluate(ds, cfg: Config | None = None, months: Sequence[str] = PSEUDO_MONTHS, params=None,
              modes: Sequence[str] = ("maker", "taker"), conventions: Sequence = CONVENTIONS,
              perfect_foresight: Sequence[float] = (50.0, 100.0), data: MarketData | None = None,
-             info_factory=None, progress=None) -> tuple[pd.DataFrame, dict]:
+             info_factory=None, progress=None, soc_policy: str = "none") -> tuple[pd.DataFrame, dict]:
     """Walk-forward evaluation. ``ds``: a loaded :class:`bessbid.io.Dataset` (or None when
     ``data`` and ``info_factory`` are given). Returns (summary frame, {month: plan frame}).
     ``perfect_foresight``: energy caps (MW) of the hindsight bounds to compute (empty to
     skip). ``info_factory(cfg) -> InfoSet``: a fresh information set per month (default
-    ``InfoSet.from_dataset(ds, cfg)``)."""
+    ``InfoSet.from_dataset(ds, cfg)``). ``soc_policy``: how the evaluator treats an award
+    that would leave the SOC limits (:func:`bessbid.backtest.simulate`; 'none', 'clip' or
+    'reject'), applied to the full strategy under each convention.
+
+    The Regulation-only baseline offers the full rating, or, when ``params`` caps Regulation
+    by the sustainability rule (``regulation_soc_rule``), the MW the initial SOC sustains."""
     from .infoset import InfoSet
-    from .strategy_full import FullParams, plan_month
+    from .strategy_full import FullParams, baseline_regulation_mw, plan_month
 
     cfg = cfg or Config()
     params = params or FullParams()
@@ -145,12 +155,14 @@ def evaluate(ds, cfg: Config | None = None, months: Sequence[str] = PSEUDO_MONTH
         gen_s = time.perf_counter() - t0
         plans[m] = frame
         tb = to_table(bids)
-        reg = to_table([regulation_only(s.date, s.period, mcfg) for s in month_slots(m)])
+        reg_mw = baseline_regulation_mw(mcfg, params)
+        reg = to_table([regulation_only(s.date, s.period, mcfg, mw=reg_mw) for s in month_slots(m)])
         for mode in modes:
             base = simulate(reg, m, md, mode=mode, cfg=mcfg, engine=eng).summary
             rows.append(_row("regulation", m, base, "sqrt", mcfg))
             for cv in conventions:
-                s = simulate(tb, m, md, mode=mode, convention=cv, cfg=mcfg, engine=eng).summary
+                s = simulate(tb, m, md, mode=mode, convention=cv, cfg=mcfg, engine=eng,
+                             soc_policy=soc_policy).summary
                 r = _row("full", m, s, cv, mcfg)
                 r["generate_s"] = gen_s
                 r["max_ramp_mw"] = pinfo.get("max_ramp_mw")
@@ -176,7 +188,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     for (pol, mode, cv), g in df.groupby(["policy", "mode", "convention"], sort=False):
         d = {"policy": pol, "month": "ALL", "mode": mode, "convention": cv}
         for k in ("revenue", "rev_E", "rev_P", "rev_C", "rev_R", "dis_mwh", "chg_mwh", "energy_periods",
-                  "breach_periods", "days", "runtime_s", "uplift"):
+                  "breach_periods", "days", "runtime_s", "uplift") + tuple(c for c in _POLICY_SCALARS if c in g):
             d[k] = g[k].sum()
         d["soc_min"], d["soc_max"] = g["soc_min"].min(), g["soc_max"].max()
         d["breach_max_mwh"] = g["breach_max_mwh"].max()
@@ -190,3 +202,39 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         agg.append(d)
     return pd.concat([df, pd.DataFrame(agg)], ignore_index=True)
 
+
+
+def single_miss_exposure(energy_mw, cfg: Config, conventions: Sequence = CONVENTIONS,
+                         margin: float = 0.0) -> pd.DataFrame:
+    """Breach exposure of an open-loop schedule if exactly one energy band fails to clear.
+
+    ``energy_mw``: the planned energy schedule (MW, + discharge) of a month. For each period
+    with a non-zero band, the SOC path is recomputed without that band (all other bands
+    clear); a case breaches if the path then leaves [soc_min + margin, soc_max - margin]
+    anywhere from that period on (a missed band shifts every later SOC by the same amount).
+    Returns one row per (convention, side): cases, breaching cases, their share, the worst
+    SOC reached and the largest breach (MWh)."""
+    from .backtest import soc_path
+
+    x = np.asarray(energy_mw, float)
+    dis, chg = np.clip(x, 0, None), np.clip(-x, 0, None)
+    lo, hi = cfg.soc_min_mwh + margin, cfg.soc_max_mwh - margin
+    rows = []
+    for cv in conventions:
+        ec, ed = _resolve_conv(cv, cfg)
+        soc = soc_path(dis, chg, (ec, ed), cfg)
+        smin = np.minimum.accumulate(soc[::-1])[::-1]  # lowest SOC from t on
+        smax = np.maximum.accumulate(soc[::-1])[::-1]
+        h = cfg.period_hours
+        for side, mask, shift in (("discharge", dis > 0, h * dis / ed), ("charge", chg > 0, -h * ec * chg)):
+            idx = np.flatnonzero(mask)
+            new_min = smin[idx] + shift[idx]
+            new_max = smax[idx] + shift[idx]
+            br = np.maximum(lo - new_min, 0.0) + np.maximum(new_max - hi, 0.0)
+            rows.append({"convention": convention_label((ec, ed)), "side": side, "cases": int(len(idx)),
+                         "breach_cases": int((br > 1e-9).sum()),
+                         "breach_share": float((br > 1e-9).mean()) if len(idx) else 0.0,
+                         "worst_soc_min": float(new_min.min()) if len(idx) else float("nan"),
+                         "worst_soc_max": float(new_max.max()) if len(idx) else float("nan"),
+                         "breach_max_mwh": float(br.max()) if len(idx) else 0.0})
+    return pd.DataFrame(rows)

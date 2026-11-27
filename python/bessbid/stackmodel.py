@@ -176,6 +176,9 @@ class StackModel:
         self.typ: dict[str, np.ndarray] = {}
         self.fit_index: np.ndarray | None = None
         self.copied: np.ndarray | None = None
+        #: set only inside :meth:`bessbid.forecast.Forecaster.backcast` (decision times
+        #: before the fit cut; the stack rows used are still gated at each decision time)
+        self.backcast_ok = False
 
     # ---- fitting -------------------------------------------------------------------------
     def _copies(self, idx: np.ndarray) -> np.ndarray:
@@ -237,7 +240,7 @@ class StackModel:
     def _check(self, decision_time: pd.Timestamp) -> None:
         if self.cut is None:
             raise RuntimeError("StackModel.fit() first")
-        if decision_time < self.cut:
+        if decision_time < self.cut and not self.backcast_ok:
             raise ValueError(f"decision time {decision_time} is before the fit cut {self.cut}")
 
     def lag_indices(self, T, decision_time) -> np.ndarray:

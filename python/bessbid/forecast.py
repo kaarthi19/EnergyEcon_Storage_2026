@@ -28,6 +28,7 @@ earliest day-ahead decision of the month) and returns forecasts next to actual p
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -118,6 +119,7 @@ class Forecaster:
         self.nd: NetDemandModel | None = None
         self.stacks: StackModel | None = None
         self.residuals: pd.DataFrame | None = None
+        self._backcast_ok = False
         self._solver_name, self._solve = _make_solver(solver, self.cfg)
 
     # ---- fitting ---------------------------------------------------------------------------
@@ -139,10 +141,28 @@ class Forecaster:
             self.build_residual_library(residual_start)
         return self
 
+    @contextmanager
+    def backcast(self):
+        """Allow decision times *before* the fit cut inside the ``with`` block.
+
+        Used only by :mod:`bessbid.eventbias` to backcast past days with the model fitted at
+        the cut: every input is still read through the InfoSet at the backcast's own
+        decision time (stack rows published by then, net-demand history ended by then),
+        while the model parameters come from data known at the cut. The result is
+        therefore legal only for decisions at or after the cut, and is recorded as such."""
+        if self.cut is None:
+            raise RuntimeError("Forecaster.fit() first")
+        old = (self._backcast_ok, self.stacks.backcast_ok, self.nd.backcast_ok)
+        self._backcast_ok = self.stacks.backcast_ok = self.nd.backcast_ok = True
+        try:
+            yield self
+        finally:
+            self._backcast_ok, self.stacks.backcast_ok, self.nd.backcast_ok = old
+
     def _check(self, decision_time: pd.Timestamp) -> None:
         if self.cut is None:
             raise RuntimeError("Forecaster.fit() first")
-        if decision_time < self.cut:
+        if decision_time < self.cut and not self._backcast_ok:
             raise ValueError(f"decision time {decision_time} is before the fit cut {self.cut}")
 
     def summary(self) -> dict:

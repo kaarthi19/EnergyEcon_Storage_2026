@@ -1,0 +1,10 @@
+# S7: EMA applies RC386-style SOC constraints to Regulation: the MW offered must be
+# sustainable from stored energy for 30 min in each direction (every efficiency convention).
+# This variant keeps the default plan and cuts each period's Regulation to what the planned
+# SOC sustains. The fallback offers the 76.5 MW that 50 % SOC sustains. See README.md.
+[strategy.full]
+regulation_soc_rule = "posthoc"
+regulation_sustain_h = 0.5
+
+[strategy.regulation]
+mw = 76.5

@@ -175,6 +175,8 @@ per month where stated):
   - allowing charging inside event windows: -2.5k (+14k in Aug, -16k in Sep-Oct);
   - the narrower overnight exception (`event_recharge`): 0k over Aug-Oct, -6k to -7k in
     Sep and Oct (see the next section);
+  - correcting the event-window forecast bias (`event_bias`): +0.2k maker, -0.3k taker per
+    30 days, losing in Aug and Oct (see "Event-window forecast bias" below);
   - lead-2 h re-optimisation in all periods: -21k; only inside event windows: -3.3k;
   - deciding the daily plan at the gate of D's first period instead of 00:00 of D-1: -0.3k.
 - *Terminal SOC.* Ending the month at 5 % instead of 50 % would add about 10k per month.
@@ -279,6 +281,127 @@ is about zero. The option stays in the code and in `config/default.toml`, tested
 team that wants to take the Nov 20 bet (`event_recharge = "overnight"`,
 `event_recharge_hurdle = 60`).
 
+### Event-window forecast bias (option, off by default)
+
+The bias above is not limited to stress nights. Over Aug-Oct (walk-forward, the day-ahead
+energy price at x = 0 averaged over the net-demand nodes, without our offer) the forecast
+is unbiased outside events, 5-15 S$/MWh *too high* on the onset afternoon of the 19-day
+event, on the afternoon of day X+2 and in the 11-day windows, and too low throughout the
+surge window: by a mean of +63 in the X+1 surge night (00:00-05:30), +110 at X+1 midday
+(12:00-17:30) and +77 in the X+2 surge night. Part of it is structural: the forecast adds
+one flat surge MW to the net-demand profile, while the actual surge is larger at night and
+midday (in surge windows night net demand is under-forecast by 36-67 MW, against 20-33 MW
+on ordinary nights); the rest comes from the stack side and was not decomposed.
+
+`[strategy.full] event_bias = "residual"` (`bessbid/eventbias.py`, Eq. (13b) in
+[`formulation.md`](formulation.md)) learns an additive correction per event bucket and
+adds it to every level of the planner's energy-price ladders:
+
+- buckets: the event cycle, the day of the event counted from its onset day (X, X+1, X+2),
+  the surge flag and a 3-hour block of the day (`event_bias_hours`); no correction outside
+  events or where an 11-day window overlaps the 19-day one (the overlap residual changed
+  sign between July, September and October);
+- the correction is the mean residual of the bucket (each clipped to +-500), learned at the
+  plan's fit cut from backcasts of the past event days: the forecaster fitted at the cut
+  forecasts each past event day from the inputs as of that day's own day-ahead decision
+  time, and the residual is the actual training price of periods that ended before the cut.
+  So August learns from July only, September from Jul-Aug, and November from Jul-Oct. The
+  backcasts are in-sample for the model parameters, but their bucket pattern matches the
+  true walk-forward residuals (X+1 00:00-05:30: +55 backcast, +63 walk-forward);
+- an audit entry `eventbias.fit` records the cut and the newest clearing period used; the
+  per-period information test (bids up to T unchanged when every row not legal at T's gate
+  is perturbed) and a test that perturbs everything after the cut both pass;
+- capacity, ramp, SOC (three conventions, 2 MWh margin), terminal SOC and the event
+  charging ban are unchanged; the shift only changes the values. Runtime +5 to +12 s.
+
+**Forecast error, Aug-Oct walk-forward** (each month corrected with what was known at its
+own cut; event windows without overlaps; S$/MWh):
+
+| Periods | n | MAE before | MAE after | Mean error (actual - forecast) before | after |
+|---|---|---|---|---|---|
+| all event windows | 750 | 44.0 | 30.9 | +17.3 | +4.9 |
+| - Aug / Sep / Oct | 219 / 306 / 225 | 45.6 / 44.2 / 42.2 | 27.6 / 29.7 / 35.9 | +31.9 / +10.7 / +12.1 | +17.3 / -2.2 / +2.4 |
+| surge window | 303 | 88.6 | 59.0 | +57.2 | +9.2 |
+| surge nights (00:00-06:30) | 112 | 68.5 | 23.5 | +68.2 (median +64.9) | +18.4 (median +10.4) |
+| - Aug / Sep / Oct | 28 / 56 / 28 | 102.3 / 52.1 / 67.3 | 49.6 / 12.9 / 18.7 | +102.3 / +51.7 / +67.3 | +49.6 / +3.9 / +16.3 |
+| event windows outside the surge | 447 | 13.8 | 11.9 | -9.7 | +1.9 |
+| ordinary periods (unchanged) | 3633 | 14.1 | 14.1 | +0.1 | +0.1 |
+| overlaps (not corrected) | 33 | 427.2 | 427.2 | +242.9 | +242.9 |
+
+**Decision value, Aug-Oct walk-forward** (uplift over Regulation only, SGD; same evaluator
+as the main table):
+
+| Option | Aug maker | Sep maker | Oct maker | Per 30 d maker | Aug taker | Sep taker | Oct taker | Per 30 d taker |
+|---|---|---|---|---|---|---|---|---|
+| default (`event_bias = "none"`) | 109,980 | 120,348 | 121,054 | 114,581 | 126,932 | 128,011 | 143,123 | 129,804 |
+| `"residual"` | 109,573 | 121,644 | 120,862 | 114,808 | 126,387 | 129,434 | 141,455 | 129,546 |
+| difference | -407 | +1,297 | -192 | +227 | -544 | +1,423 | -1,669 | -258 |
+| `"residual"` + `event_recharge = "overnight"` | 112,632 | 115,897 | 120,862 | 113,932 | 129,439 | 123,797 | 141,455 | 128,703 |
+| difference to the default | +2,651 | -4,451 | -192 | -650 | +2,507 | -4,214 | -1,669 | -1,101 |
+| difference to `"overnight"` alone | -10,692 | +2,496 | +6,233 | -640 | -11,084 | +2,672 | +4,648 | -1,228 |
+
+All variants: SOC range [7.0, 93.0] / [10.4, 89.6] / [13.4, 86.6] MWh, 0 breaches in both
+modes, month-end SOC 50 %, largest ramp step 42 MW.
+
+Why a better forecast does not plan better:
+
+- *Without the recharge exception* the correction changes only 22, 19 and 8 periods in Aug,
+  Sep and Oct. Charging is banned inside events and the battery already arrives full (Y =
+  93 MWh, the top of the planning range, at every Aug-Oct event onset), so all
+  the corrected periods can change is *when* inside the window the stored energy is sold and
+  how the 11-day evenings are shaped. The bias is roughly common to the hours the planner
+  chooses between, so the order barely changes, and what does change is spike timing: Aug 16
+  +12.8k and Aug 17 -13.0k (taker), Sep 4 +1.1k, Oct 31 -1.7k.
+- *With the recharge exception* the correction does what the hurdle was meant to do: the
+  stress-night charge falls from 86 / 139 / 86 MWh to 21 / 107 / 0 MWh, which removes the
+  October loss (+6.2k against `"overnight"`) and part of September's (+2.5k). But it also
+  removes most of the profitable August refill (-10.7k), and the September 24 refill still
+  loses 5.1k: there the forecast morning peak did not happen, which a level correction
+  cannot fix.
+
+**Forecast-market stress tests** (the plan cleared by the independent LP against each
+month's forecast market; difference to the default, maker, k SGD; every energy band
+cleared in full in every case):
+
+| Market | Option | Base | Shift -1 d | Shift +1 d | MW x 0.7 | MW x 1.3 |
+|---|---|---|---|---|---|---|
+| Aug | `"residual"` | -0.8 | 0.0 | -5.1 | -0.5 | -0.8 |
+| Sep | `"residual"` | -0.4 | -0.3 | -0.5 | -0.2 | -0.2 |
+| Oct | `"residual"` | -2.2 | -0.1 | +0.1 | +0.1 | -0.1 |
+| Nov | `"residual"` | -0.1 | 0.0 | 0.0 | -10.9 | 0.0 |
+| Aug | `"residual"` + overnight | +2.1 | -0.2 | -10.6 | -1.3 | -1.4 |
+| Sep | `"residual"` + overnight | +11.4 | +0.4 | +11.4 | -3.0 | -2.3 |
+| Oct | `"residual"` + overnight | -2.2 | -0.1 | +0.1 | +0.1 | -0.1 |
+| Nov | `"residual"` + overnight | +1.8 | +2.0 | -1.1 | -12.1 | -1.5 |
+
+November net-demand noise draws: -0.1 / -0.1 / 0.0 (`"residual"`), +1.8 to +2.0 (with
+overnight). Taker differences are within 3.5k of these except November x 0.7 (-2.6k and
+-3.7k taker). The forecast markets share the uncorrected bias, so they understate the
+corrected plan's surge-hour sales; they mainly show that the option does not create a new
+downside, except in a smaller-than-expected November event (MW x 0.7, -10.9k maker,
+-2.6k taker: the corrected plan moves discharge into larger 18:00 and Nov 19 13:30-14:30
+blocks, whose price impact is bigger in a weak event). The worst shifted-calendar case of
+November is unchanged (+58.5k for both the default and `"residual"`; 57.4k with overnight).
+
+With `"residual"` the November plan changes in 18 periods on 4 days (MW, default -> option):
+Nov 3 15:00 10.2 -> 3.4, 16:00 10.2 -> 0, 18:00 66.3 -> 74.8, 18:30 25.5 -> 34.0; Nov 14
+16:30 25.5 -> 3.4, 17:00 1.7 -> 0, 17:30 37.4 -> 34.0, 18:00 61.2 -> 74.8, 18:30 20.4 -> 34.0;
+Nov 19 13:30 23.8 -> 34.0, 14:00 64.6 -> 74.8, 14:30 23.8 -> 37.4, 18:00 34.0 -> 0; Nov 25
+15:00 40.8 -> 35.7, 15:30 23.8 -> 13.6, 17:30 40.8 -> 35.7, 18:00 40.8 -> 51.0, 18:30 0 -> 10.2.
+Expected November effect on the forecast market: -0.1k (maker), 0.0k (taker). With the
+overnight exception as well, the only event charge left is 40 MW at Nov 19 02:30 (20 MWh,
+against 155 MWh for `"overnight"` alone), and the Nov 20 recharge disappears.
+
+**Decision:** the default stays `"none"`. The adoption rule was a gain in every month in
+both modes without a breach or a worse shifted-calendar downside; `"residual"` loses in Aug
+and Oct in both modes and its three-month total is +0.2k (maker) / -0.3k (taker) per 30
+days, which is noise. Combined with the overnight exception it loses in Sep and Oct. The
+November workbook is therefore unchanged (`c6260df2...`); with `event_bias = "residual"` it
+would be `2023c8a93eff3629317098d5b8390be942130437e04df407baec00c54fd74a77`. The option
+stays in the code and in `config/default.toml`, tested: the corrected forecast is the better
+input for any future use that charges inside events or values event hours against ordinary
+ones (e.g. a stochastic programme over calendar scenarios).
+
 ### What to expect for November
 
 The headline above is the average of three training months, and the strategy settings
@@ -302,7 +425,9 @@ full in every scenario, so the SOC path holds. Possible upside, not adopted: end
 month at 5 % SOC if EMA confirms there is no end-of-month requirement (+10k to +16k). The
 narrow exception to the event charging ban on the 19-day surge nights has now been tested
 (`event_recharge`, above): about zero over Aug-Oct and negative in Sep and Oct, so it is
-not adopted.
+not adopted. Correcting the event-window forecast bias (`event_bias`, above) cuts the
+event-window forecast error by 30 % but leaves the plan's value unchanged (-0.1k on the
+November forecast market), so it is not adopted either.
 
 ## Fallback submission: `--strategy regulation`
 
@@ -321,6 +446,10 @@ Why this is the fallback:
 
 ## Assumptions to confirm with EMA
 
+For every likely answer there is a ready config in `config/scenarios/`; the decision table,
+with each config's Aug-Oct gain against the default under the same assumption, is
+[`../config/scenarios/README.md`](../config/scenarios/README.md).
+
 - **BESS ramp rate.** Is an ESS ramp limit applied in the simulation (RC383 D.19.1.1A /
   D.19.1.2A), and at what rate? The plan assumes 42 MW per period (`bess_ramp_mw`); a
   faster or no limit costs nothing, a slower one would need a smaller value.
@@ -328,7 +457,8 @@ Why this is the fallback:
   penalised, and is dispatch SOC-checked before clearing? The plan keeps a 2 MWh margin and
   relies on every fixed band clearing in full (it did in every backtest and stress
   scenario); a band that did not clear would shift the SOC for the rest of the month. A
-  margin that absorbs any single miss costs about 57k per 30 days (see the investigations).
+  config that makes every single miss safe (`s2_robust_c20_m12.toml`) costs about 27k / 38k
+  per 30 days; see `config/scenarios/README.md`, row S2b.
 - **End-of-month SOC.** Is there a requirement? The plan ends at 50 %.
 - **Folder layout.** If EMA's run folder does not hold the template workbook, pass
   `--template`.

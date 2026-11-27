@@ -46,6 +46,7 @@ __all__ = [
     "make_action_grid",
     "ValueModel",
     "action_values",
+    "action_prices",
     "dp_backward",
     "dp_backward_ramp",
     "dp_forward",
@@ -149,6 +150,15 @@ def make_action_grid(cfg: Config, max_charge_mw: float | None = None, max_discha
 # --------------------------------------------------------------------------------------
 # Values
 # --------------------------------------------------------------------------------------
+
+
+def action_prices(E: np.ndarray, R: np.ndarray, levels, mw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Ladder prices interpolated at the actions: (Ex, Rx), each (n_periods, n_actions)."""
+    lv = np.asarray(levels, float)
+    x = np.asarray(mw, float)
+    E = np.atleast_2d(np.asarray(E, float))
+    R = np.atleast_2d(np.asarray(R, float))
+    return np.stack([np.interp(x, lv, e) for e in E]), np.stack([np.interp(x, lv, r) for r in R])
 
 
 def action_values(E: np.ndarray, R: np.ndarray, levels, mw: np.ndarray, cfg: Config,
@@ -269,7 +279,8 @@ def _transitions(grid: ActionGrid):
 
 def dp_backward(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = None,
                 V_end: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Value-to-go ``V`` (n+1, n_states) and policy (n, n_states) for values F (n, n_actions).
+    """Value-to-go ``V`` (n+1, n_states) and policy (n, n_states) for values F (n, n_actions),
+    or state-dependent values F (n, n_states, n_actions).
 
     ``allowed``: (n, n_actions) bool. ``V_end``: terminal value per state (default 0; use
     ``NEG`` entries to forbid end states)."""
@@ -282,7 +293,8 @@ def dp_backward(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None = No
         f = F[t]
         if allowed is not None:
             f = np.where(allowed[t], f, NEG)  # Eq. (18)-(19): banned actions
-        cand = np.where(valid, f[None, :] + V[t + 1][nxt], NEG)  # Eq. (16): stay on the Y grid
+        fs = f if f.ndim == 2 else f[None, :]  # (S, A) for state-dependent values
+        cand = np.where(valid, fs + V[t + 1][nxt], NEG)  # Eq. (16): stay on the Y grid
         a = cand.argmax(1)  # first maximum: idle (index 0) wins ties, then smaller actions
         pol[t] = a
         V[t] = cand[np.arange(grid.n_states), a]
@@ -306,7 +318,8 @@ def dp_backward_ramp(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None
                      keep=None, policy: bool = True) -> tuple[dict | np.ndarray, np.ndarray | None]:
     """:func:`dp_backward` with a ramp limit between consecutive actions.
 
-    State: (Y index, index of the previous action). ``V_end``: (n_states,) or
+    State: (Y index, index of the previous action). ``F``: (n, n_actions), or (n, n_states,
+    n_actions) for state-dependent values. ``V_end``: (n_states,) or
     (n_states, n_actions). Returns ``V`` with ``V[t][s, a_prev]`` (an array (n+1, S, A), or,
     with ``keep`` = iterable of t, a dict holding only those t) and the policy
     ``pol[t, s, a_prev]`` (None with ``policy=False``). Ties go to the lowest action index,
@@ -334,7 +347,8 @@ def dp_backward_ramp(F: np.ndarray, grid: ActionGrid, allowed: np.ndarray | None
         f = F[t]
         if allowed is not None:
             f = np.where(allowed[t], f, NEG)  # Eq. (18)-(19): banned actions
-        G = np.where(valid, f[None, :] + Vn[nxt, cols], NEG)  # (S, A): take a, land in nxt; Eq. (16)
+        fs = f if f.ndim == 2 else f[None, :]  # (S, A) for state-dependent values
+        G = np.where(valid, fs + Vn[nxt, cols], NEG)  # (S, A): take a, land in nxt; Eq. (16)
         cand = G[:, None, :] + bias[None, :, :]  # (S, A_prev, A); Eq. (17): ramp limit
         a = cand.argmax(2)
         Vt = np.maximum(np.take_along_axis(cand, a[..., None], 2)[..., 0], NEG)

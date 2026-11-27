@@ -1,0 +1,8 @@
+# S7: as s7_regulation_sustain_posthoc.toml, but the SOC programme values the capped
+# Regulation, so it keeps the SOC where Regulation is sustainable. See README.md.
+[strategy.full]
+regulation_soc_rule = "planned"
+regulation_sustain_h = 0.5
+
+[strategy.regulation]
+mw = 76.5

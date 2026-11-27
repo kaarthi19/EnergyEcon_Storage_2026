@@ -193,6 +193,10 @@ def offered_capacity(pb: PeriodBid, rule: str = "strict") -> float:
         return sum(abs(b.mw) for b in pb.energy) + pb.as_mw
     if rule == "max_side":
         return max(pb.charge_mw, pb.discharge_mw) + pb.as_mw
+    if rule == "physical":
+        # the engine's BESS rows: discharge + all AS <= P and charge + Regulation <= P
+        reg = sum(b.mw for b in pb.regulation)
+        return max(pb.discharge_mw + pb.as_mw, pb.charge_mw + reg)
     raise ValueError(f"unknown capacity rule {rule!r}")
 
 

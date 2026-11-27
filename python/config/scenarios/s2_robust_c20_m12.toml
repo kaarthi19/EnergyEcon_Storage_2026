@@ -1,0 +1,10 @@
+# S2: EMA disqualifies for any SOC breach -> no single missed band can breach: bands of at
+# most 20 MW (a missed 20 MW discharge leaves 20 x 0.5 / 0.85 = 11.8 MWh more SOC) and a
+# 12 MWh SOC margin. See README.md.
+[bess]
+soc_margin_mwh = 12.0
+
+[strategy.full]
+charge_cap_mw = 20.0
+discharge_cap_mw = 20.0
+event_discharge_cap_mw = 20.0

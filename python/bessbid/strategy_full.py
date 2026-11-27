@@ -11,7 +11,9 @@ Layers
    any feedback from EMA. Quantities come from an SOC dynamic programme
    (:mod:`bessbid.planner`) on forecast values that include our own price impact (the
    forecast stack is cleared with our offer inside the LP, averaged over net-demand error
-   nodes).
+   nodes). An optional correction (``event_bias``, off by default) shifts the forecast
+   energy price inside event windows by the mean residual of past events
+   (:mod:`bessbid.eventbias`); it cut the forecast error but did not add value.
 2. **Events.** The same programme covers the 19-day stress event: the month-ahead values
    (one decision at the first period's gate) see the calendar's event days, so the
    continuation value makes the battery arrive full; inside event windows discharge may go
@@ -53,13 +55,14 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from .bids import PeriodBid, energy_fixed
+from .bids import PeriodBid, energy_fixed, make_period_bid, offered_capacity, round_mw
 from .config import Config, coerce_fields
 from .periods import month_slots, parse_month
 from .planner import (
     LEVELS,
     NEG,
     ValueModel,
+    action_prices,
     dp_backward,
     dp_backward_ramp,
     make_action_grid,
@@ -68,9 +71,10 @@ from .planner import (
     soften_end_values,
     terminal_values,
 )
-from .soc import binding_soc, check_soc, soc_paths, y_terminal_min
+from .soc import (DeviationTracker, binding_soc, check_soc, net_stored, regulation_cap, soc_paths,
+                  y_terminal_min)
 
-__all__ = ["FullParams", "FullStrategy", "plan_month"]
+__all__ = ["FullParams", "FullStrategy", "plan_month", "baseline_regulation_mw", "uses_overlay"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,17 @@ class FullParams:
     #: extra cost (S$/MWh charged) of a charge allowed by the exception, for the forecast's
     #: low bias on stress nights (actual minus day-ahead forecast: median +55 to +87 in Aug-Oct)
     event_recharge_hurdle: float = 0.0
+    #: event-window bias correction of the planning energy price (:mod:`bessbid.eventbias`):
+    #: 'none', or 'residual' = add, in every period of a single event window, the mean
+    #: residual (actual - forecast) of the same event bucket (cycle, day of the event,
+    #: surge flag, hour block) backcast on the past event days before the fit cut
+    event_bias: str = "none"
+    #: hour-of-day block of the buckets (h)
+    event_bias_hours: float = 3.0
+    #: each residual is clipped to +- this before averaging (S$/MWh)
+    event_bias_clip: float = 500.0
+    #: shrinkage: a bucket's correction is mean * n / (n + shrink), n = residual periods
+    event_bias_shrink: float = 0.0
     #: ban charging when the forecast capacity margin is below this (MW)
     guard_margin_mw: float = 300.0
     #: lead-2 h guard: cancel a planned charge if the lead-2 h energy forecast exceeds this
@@ -129,6 +144,38 @@ class FullParams:
     #: largest change of the energy schedule between consecutive periods (MW); None:
     #: ``cfg.bess_ramp_mw``; 0: no limit. The month starts from 0 MW.
     ramp_mw: float | None = None
+    # ---- contingency options (config/scenarios/README.md); the defaults change nothing ----
+    #: price-responsive energy bands on top of the planned schedule: 'none'; 'tracker': sized
+    #: so that every later planned step and the month-end target stay feasible even if every
+    #: such band clears (soc.DeviationTracker); 'local': sized only so that the period itself
+    #: stays inside the SOC limits on the planned path (for an EMA that clips or rejects
+    #: dispatch that would breach SOC)
+    pr_bands: str = "none"
+    #: size of each extra band (MW), before the capacity rule and the SOC sizing
+    pr_mw: float = 10.0
+    #: extra discharge band price = T's lead-2 h energy forecast + this (S$/MWh)
+    pr_discharge_premium: float = 100.0
+    #: extra charge band price = T's lead-2 h energy forecast - this (S$/MWh)
+    pr_charge_discount: float = 100.0
+    #: where extra bands go: 'idle' (planned 0 MW), 'all' periods, or calendar 'events' only
+    pr_periods: str = "idle"
+    #: which extra bands: 'both', 'discharge' or 'charge'
+    pr_sides: str = "both"
+    #: SOC margin (MWh) of the band sizing; None: cfg.soc_margin_mwh
+    pr_soc_margin_mwh: float | None = None
+    #: fill the headroom the capacity rule leaves after energy and Regulation with a reserve
+    #: band at the AS floor price: 'none', 'contingency' or 'primary' (under
+    #: capacity_rule = 'physical' this puts reserve on top of charging)
+    reserve_fill: str = "none"
+    #: the SOC programme counts the reserve that ``reserve_fill`` adds on top of charging
+    #: (capacity_rule = 'physical'), at the forecast reserve price at x = 0
+    reserve_value: bool = False
+    #: Regulation must be sustainable from stored energy for ``regulation_sustain_h`` in both
+    #: directions (RC386-style; soc.regulation_cap): 'none'; 'posthoc': plan as usual, then cap
+    #: each period's Regulation MW; 'planned': the SOC programme values the capped Regulation
+    regulation_soc_rule: str = "none"
+    #: hours of full activation the stored energy must sustain (with regulation_soc_rule)
+    regulation_sustain_h: float = 0.5
 
     def __post_init__(self) -> None:
         if self.refine not in ("none", "guard", "lead2"):
@@ -141,8 +188,30 @@ class FullParams:
             raise ValueError("ramp_mw must be >= 0 (0 = no limit)")
         if self.event_recharge not in ("none", "overnight", "overnight_all"):
             raise ValueError("event_recharge must be 'none', 'overnight' or 'overnight_all'")
+        if self.event_bias not in ("none", "residual"):
+            raise ValueError("event_bias must be 'none' or 'residual'")
+        if not (0 < self.event_bias_hours <= 24 and (24.0 / self.event_bias_hours).is_integer()):
+            raise ValueError("event_bias_hours must divide 24")
+        if self.event_bias_clip <= 0 or self.event_bias_shrink < 0:
+            raise ValueError("event_bias_clip must be > 0 and event_bias_shrink >= 0")
         if self.event_recharge_hurdle < 0:
             raise ValueError("event_recharge_hurdle must be >= 0")
+        if self.pr_bands not in ("none", "tracker", "local"):
+            raise ValueError("pr_bands must be 'none', 'tracker' or 'local'")
+        if self.pr_periods not in ("idle", "all", "events"):
+            raise ValueError("pr_periods must be 'idle', 'all' or 'events'")
+        if self.pr_sides not in ("both", "discharge", "charge"):
+            raise ValueError("pr_sides must be 'both', 'discharge' or 'charge'")
+        if self.pr_mw < 0 or self.pr_discharge_premium < 0 or self.pr_charge_discount < 0:
+            raise ValueError("pr_mw, pr_discharge_premium and pr_charge_discount must be >= 0")
+        if self.reserve_fill not in ("none", "contingency", "primary"):
+            raise ValueError("reserve_fill must be 'none', 'contingency' or 'primary'")
+        if self.regulation_soc_rule not in ("none", "posthoc", "planned"):
+            raise ValueError("regulation_soc_rule must be 'none', 'posthoc' or 'planned'")
+        if self.regulation_sustain_h <= 0:
+            raise ValueError("regulation_sustain_h must be > 0")
+        if self.regulation_soc_rule == "planned" and self.refine == "lead2":
+            raise ValueError("regulation_soc_rule='planned' does not support refine='lead2'")
         h = tuple(self.event_recharge_hours)
         if len(h) != 2 or not all(0.0 <= float(x) <= 24.0 for x in h):
             raise ValueError("event_recharge_hours must be [start, end] with hours in 0..24")
@@ -248,15 +317,60 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     R_ok = ramp_ok(grid, ramp if use_ramp else None)  # R_ok[a_prev, a]
     x0 = int(np.argmin(np.abs(vm.levels)))
 
+    reg_planned = p.regulation_soc_rule == "planned"
+    if reg_planned:
+        # Regulation MW per (start state, action) under the sustainability rule (S7)
+        Qreg = _floor_mw(regulation_cap(grid.y[:, None], grid.mw[None, :], cfg, p.regulation_sustain_h), cfg)
+
+    res_key = {"contingency": "C", "primary": "P"}.get(p.reserve_fill)
+    res_planned = p.reserve_value and res_key is not None and cfg.capacity_rule == "physical"
+    if res_planned:
+        res_mw = np.clip(-grid.mw, 0, None)  # reserve MW freed on the discharge side by charging
+
     def values(lad):
-        if p.price_impact:
-            return vm.values(lad, grid) - hurdle
-        flat = {k: np.repeat(lad[k][:, [x0]], len(vm.levels), axis=1) for k in ("E", "R")}
-        return vm.values(flat, grid) - hurdle
+        if res_planned:
+            extra = cfg.period_hours * lad[res_key][:, [x0]] * res_mw[None, :]
+            return _values(lad) + (extra[:, None, :] if reg_planned else extra)
+        return _values(lad)
+
+    def _values(lad):
+        if not p.price_impact:
+            lad = {k: np.repeat(lad[k][:, [x0]], len(vm.levels), axis=1) for k in ("E", "R")}
+        if reg_planned:
+            Ex, Rx = action_prices(lad["E"], lad["R"], vm.levels, grid.mw)
+            h_ = cfg.period_hours
+            return (h_ * (grid.mw[None, :] * Ex))[:, None, :] + h_ * Qreg[None] * Rx[:, None, :] \
+                - hurdle[:, None, :]
+        return vm.values(lad, grid) - hurdle
+
+    def minus(F, c):
+        return F - (c[:, None, :] if F.ndim == 3 else c)
+
     ev, surge = _event_masks(fc.calendar, Ts)
     rech = _recharge_mask(fc.calendar, Ts, p) & ev
     nodes_da = fc.nd.nodes_da if p.use_nodes else None
     nodes_l2 = fc.nd.nodes_lead if p.use_nodes else None
+
+    # ---- event-window bias correction, learned at the fit cut (Eq. (13b)) -----------------
+    eb = None
+    dE = np.zeros(n)
+    if p.event_bias == "residual":
+        from .eventbias import fit_event_bias
+
+        eb = cached(("event_bias", p.event_bias_hours, p.event_bias_clip, p.event_bias_shrink),
+                    lambda: fit_event_bias(fc, cut, block_hours=p.event_bias_hours, clip=p.event_bias_clip,
+                                           shrink=p.event_bias_shrink, nodes=nodes_da))
+        dE = eb.delta(fc.calendar, Ts)
+
+    def corrected(lad, rows):
+        """The ladder with the bucket correction added to the energy price at every level
+        (a new dict; cached ladders are never changed)."""
+        d = dE[rows]
+        if not np.any(d):
+            return lad
+        out = dict(lad)
+        out["E"] = lad["E"] + d[:, None]  # Eq. (13b)
+        return out
     chg_mwh = cfg.period_hours * np.clip(-grid.mw, 0, None)
 
     def rech_cost(mask):
@@ -272,8 +386,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     lad_ma = cached("lad_ma", lambda: vm.ladder(Ts, dec0, inp0["nd"].to_numpy(), inp0["outage"].to_numpy(),
                                                  kind="month_ahead", nodes=nodes_da,
                                                  inputs_time=inp0["input_time"].to_numpy()))
-    F_ma = values(lad_ma) - rech_cost(rech)
-    A_ma = _allowed(grid, ev, lad_ma["margin"], p, rech, lad_ma["E"][:, x0])
+    lad_ma_c = corrected(lad_ma, np.arange(n))
+    F_ma = minus(values(lad_ma_c), rech_cost(rech))
+    A_ma = _allowed(grid, ev, lad_ma["margin"], p, rech, lad_ma_c["E"][:, x0])
     days = sorted(set(Ts.normalize()))
     day_idx = [np.where(Ts.normalize() == D)[0] for D in days]
     if use_ramp:
@@ -298,7 +413,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 inputs_time=pd.to_datetime(l2["issue_time"]).to_numpy()[il2]))
             F_l2 = np.full((n, grid.n_actions), np.nan)
             if len(il2):
-                F_l2[il2] = values(lad_l2) - rech_cost(rech[il2])
+                F_l2[il2] = minus(values(corrected(lad_l2, il2)), rech_cost(rech[il2]))
         if progress:
             progress(f"lead-2h forecasts done ({time.perf_counter() - t0:.1f}s)")
 
@@ -334,8 +449,9 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         lad = cached(("lad_da", D), lambda: vm.ladder(TD, dec, inp["nd"].to_numpy(), inp["outage"].to_numpy(),
                                                        kind="day_ahead", nodes=nodes_da,
                                                        inputs_time=inp["input_time"].to_numpy()))
-        F = values(lad) - rech_cost(rech[idx])
-        A = _allowed(grid, ev[idx], lad["margin"], p, rech[idx], lad["E"][:, x0])
+        lad_c = corrected(lad, idx)
+        F = minus(values(lad_c), rech_cost(rech[idx]))
+        A = _allowed(grid, ev[idx], lad["margin"], p, rech[idx], lad_c["E"][:, x0])
         V_end = V_ma[idx[-1] + 1]  # Eq. (22): month-ahead continuation value
 
         def solve(V_end):
@@ -367,7 +483,7 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
                 margin_l2 = float(np.sum(fc.stacks.nom)) - float(r.nd_eff) - float(r.req_P + r.req_C + r.req_R)
                 short = float(r.sP + r.sC + r.sR)
                 gp = min(p.guard_price, p.event_recharge_max_price) if (ev[i] and rech[i]) else p.guard_price
-                if margin_l2 < p.guard_margin_mw or float(r.E) > gp or short > 1e-6:
+                if margin_l2 < p.guard_margin_mw or float(r.E) + dE[i] > gp or short > 1e-6:
                     # cancel the charge, or cut it as far as the ramp limit and the month-end
                     # SOC target still allow (the least charging such action)
                     # Eq. (23)
@@ -414,17 +530,25 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     if not cal_check["ok"]:
         warnings_.extend(f"calendar check: {m}" for m in cal_check["messages"])
 
-    bids = []
-    for i, sl in enumerate(slots):
-        x = float(mw[i])
-        layer = "regulation" if x == 0 else ("event" if ev[i] else "energy")
-        bids.append(energy_fixed(sl.date, sl.period, x, cfg, regulation_mw="fill",  # Eq. (12)
-                                 tag=f"full:{layer}:{tag[i]}") if x != 0 else
-                    _reg_only(sl, cfg, p))
+    overlay = None
+    if uses_overlay(p):
+        fcE = da_E if l2 is None else l2["E"].reindex(Ts).to_numpy(float)
+        bids, overlay = _overlay_bids(slots, mw, Y, ev, fcE, cfg, p, tag)
+    else:
+        bids = []
+        for i, sl in enumerate(slots):
+            x = float(mw[i])
+            layer = "regulation" if x == 0 else ("event" if ev[i] else "energy")
+            bids.append(energy_fixed(sl.date, sl.period, x, cfg, regulation_mw="fill",  # Eq. (12)
+                                     tag=f"full:{layer}:{tag[i]}") if x != 0 else
+                        _reg_only(sl, cfg, p))
     frame = pd.DataFrame({"ts": Ts, "date": [s_.date for s_ in slots], "period": [s_.period for s_ in slots]})
     frame["energy_mw"] = mw
     frame["planned_mw"] = planned
-    frame["regulation_mw"] = cfg.power_mw - np.abs(mw)
+    frame["regulation_mw"] = cfg.power_mw - np.abs(mw) if overlay is None else overlay.pop("regulation_mw")
+    if overlay is not None:
+        for k, v in overlay.items():
+            frame[k] = v
     frame["source"] = tag
     frame["event"] = ev
     frame["surge"] = surge
@@ -436,6 +560,8 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
     frame["fc_day_ahead_R"] = da_R
     frame["fc_day_ahead_margin"] = da_margin
     frame["fc_month_ahead_E"] = lad_ma["E"][:, int(np.argmin(np.abs(vm.levels)))]
+    if eb is not None:  # the forecast columns stay uncorrected; this is the correction added
+        frame["fc_event_bias_E"] = dE
     if l2 is not None:
         frame["fc_lead2_E"] = l2["E"].reindex(Ts).to_numpy()
         frame["fc_lead2_R"] = l2["R"].reindex(Ts).to_numpy()
@@ -456,9 +582,151 @@ def plan_month(month: str, infoset, cfg: Config, params: FullParams | None = Non
         "max_ramp_mw": float(steps_mw.max()),
         "warnings": warnings_,
         "calendar_check": cal_check,
+        **({"event_bias": {**eb.to_dict(), "corrected_periods": int(np.count_nonzero(dE)),
+                           "mean_correction": float(dE[dE != 0].mean()) if np.any(dE) else 0.0}}
+           if eb is not None else {}),
         "runtime_s": time.perf_counter() - t0,
     }
+    if overlay is not None:
+        info["overlay"] = {
+            "pr_dis_periods": int((frame["pr_dis_mw"] > 0).sum()),
+            "pr_chg_periods": int((frame["pr_chg_mw"] > 0).sum()),
+            "pr_dis_mw_mean": float(frame["pr_dis_mw"].mean()),
+            "pr_chg_mw_mean": float(frame["pr_chg_mw"].mean()),
+            "reserve_fill_mwh": float(frame["reserve_mw"].sum() * cfg.period_hours),
+            "regulation_mwh": float(frame["regulation_mw"].sum() * cfg.period_hours),
+        }
     return bids, frame, info
+
+
+def uses_overlay(p: FullParams) -> bool:
+    """True if any contingency option changes the bids beyond the plain fixed schedule."""
+    return p.pr_bands != "none" or p.reserve_fill != "none" or p.regulation_soc_rule != "none"
+
+
+def baseline_regulation_mw(cfg: Config, p: FullParams) -> float | None:
+    """Regulation MW of the Regulation-only baseline under the same assumptions: None (the
+    full rating) unless the Regulation sustainability rule is on, in which case the MW that
+    the initial SOC sustains with no energy schedule."""
+    if p.regulation_soc_rule == "none":
+        return None
+    return float(_floor_mw(regulation_cap(cfg.initial_soc_mwh, 0.0, cfg, p.regulation_sustain_h), cfg))
+
+
+def _floor_mw(x, cfg: Config):
+    r = cfg.mw_resolution
+    return np.floor(np.asarray(x, float) / r + 1e-9) * r
+
+
+def _overlay_bids(slots, mw: np.ndarray, Y: np.ndarray, ev: np.ndarray, fcE: np.ndarray, cfg: Config,
+                  p: FullParams, tag) -> tuple[list[PeriodBid], dict]:
+    """Bids for the contingency options: the planned always-clearing schedule ``mw``, plus
+    optional price-responsive bands (``pr_bands``), Regulation capped by the sustainability
+    rule (``regulation_soc_rule``) and a reserve band in the headroom the capacity rule leaves
+    (``reserve_fill``). ``Y``: planned binding SOC at the end of each period; ``fcE``: the
+    energy forecast behind the band prices (T's lead-2 h value, legal at T's gate)."""
+    n = len(slots)
+    P, h, rte = cfg.power_mw, cfg.period_hours, cfg.round_trip_eff
+    s0 = cfg.initial_soc_mwh
+    y_start = np.concatenate([[s0], Y[:-1]])
+    dis = np.clip(mw, 0, None)
+    chg = np.clip(-mw, 0, None)
+    tracker = DeviationTracker(net_stored(dis, chg, cfg), cfg, margin=p.pr_soc_margin_mwh) \
+        if p.pr_bands == "tracker" else None
+    m = cfg.soc_margin_mwh if p.pr_soc_margin_mwh is None else p.pr_soc_margin_mwh
+    ec_hi = max(c for c, _ in cfg.efficiency_conventions)
+    out = {k: np.zeros(n) for k in ("regulation_mw", "pr_dis_mw", "pr_chg_mw", "reserve_mw")}
+    out["pr_dis_price"] = np.full(n, np.nan)
+    out["pr_chg_price"] = np.full(n, np.nan)
+    reg_price = cfg.as_floor_price if p.regulation_price is None else p.regulation_price
+    bids = []
+    for i, sl in enumerate(slots):
+        x = float(mw[i])
+        qd = qc = 0.0
+        pd_ = pc_ = None
+        where = {"idle": x == 0, "all": True, "events": bool(ev[i])}[p.pr_periods]
+        if p.pr_bands != "none" and where and np.isfinite(fcE[i]):
+            if p.pr_sides in ("both", "discharge") and x >= 0:
+                pd_ = round(min(max(fcE[i] + p.pr_discharge_premium, cfg.discharge_floor_price + 0.01),
+                                cfg.offer_price_max), 2)
+                if pd_ > cfg.discharge_floor_price:
+                    qd = min(p.pr_mw, P - abs(x))
+                else:
+                    pd_ = None
+            if p.pr_sides in ("both", "charge") and x <= 0:
+                pc_ = round(max(min(fcE[i] - p.pr_charge_discount, cfg.charge_cap_price - 0.01),
+                                cfg.offer_price_min), 2)
+                if pc_ >= cfg.charge_cap_price or (pd_ is not None and pc_ >= pd_):
+                    pc_ = None
+                else:
+                    qc = min(p.pr_mw, P - abs(x))
+            if tracker is not None:
+                qd = min(qd, tracker.max_discharge(i))
+                qc = min(qc, tracker.max_charge(i))
+            else:  # 'local': this period stays inside the limits on the planned path
+                qd = min(qd, max(0.0, (Y[i] - cfg.soc_min_mwh - m) * rte / (h * ec_hi)))
+                qc = min(qc, max(0.0, (cfg.soc_max_mwh - m - Y[i]) / (h * ec_hi)))
+            qd, qc = round_mw(qd, cfg.mw_resolution), round_mw(qc, cfg.mw_resolution)
+            # the capacity rule decides how much Regulation the extra bands displace
+            if cfg.capacity_rule == "strict":
+                room = P - abs(x)
+                qd = min(qd, room)
+                qc = min(qc, room - qd)
+            if tracker is not None:
+                tracker.step(i, qd, qc)
+        d_tot, c_tot = dis[i] + qd, chg[i] + qc
+        if cfg.capacity_rule == "strict":
+            reg = P - (d_tot + c_tot)
+        else:  # max_side and physical: the larger side
+            reg = P - max(d_tot, c_tot)
+        if p.regulation_soc_rule != "none":
+            reg = min(reg, float(regulation_cap(y_start[i], x, cfg, p.regulation_sustain_h)))
+        reg = round_mw(max(reg, 0.0), cfg.mw_resolution)
+        energy = []
+        if x > 0:
+            energy.append((cfg.discharge_floor_price, x))
+        elif x < 0:
+            energy.append((cfg.charge_cap_price, x))
+        if qd > 0:
+            energy.append((pd_, qd))
+        if qc > 0:
+            energy.append((pc_, -qc))
+        pb = make_period_bid(sl.date, sl.period, cfg, energy=energy,
+                             regulation=[(reg_price, reg)] if reg > 0 else ())
+        res = 0.0
+        if p.reserve_fill != "none":
+            if cfg.capacity_rule == "physical":
+                res = P - d_tot - reg  # only the discharge-side row holds Primary/Contingency
+            else:
+                res = P - offered_capacity(pb, cfg.capacity_rule)
+            if p.regulation_soc_rule != "none":  # an up-reserve must be sustainable too
+                res = min(res, _up_room(y_start[i], x + reg, cfg, p.regulation_sustain_h))
+            res = round_mw(max(res, 0.0), cfg.mw_resolution)
+        if res > 0:
+            kw = {p.reserve_fill: [(cfg.as_floor_price, res)]}
+            pb = make_period_bid(sl.date, sl.period, cfg, energy=energy,
+                                 regulation=[(reg_price, reg)] if reg > 0 else (), **kw)
+        layer = "regulation" if x == 0 else ("event" if ev[i] else "energy")
+        bids.append(PeriodBid(pb.date, pb.period, pb.energy, pb.primary, pb.contingency, pb.regulation,
+                              tag=f"full:{layer}:{tag[i]}"))
+        out["regulation_mw"][i] = reg
+        out["pr_dis_mw"][i], out["pr_chg_mw"][i], out["reserve_mw"][i] = qd, qc, res
+        if qd > 0:
+            out["pr_dis_price"][i] = pd_
+        if qc > 0:
+            out["pr_chg_price"][i] = pc_
+    return bids, out
+
+
+def _up_room(y_start: float, out_mw: float, cfg: Config, hours: float) -> float:
+    """Extra up-reserve MW sustainable for ``hours`` on top of output ``out_mw`` (MW, +
+    discharge), under every convention."""
+    n = (y_start - cfg.initial_soc_mwh) / max(c for c, _ in cfg.efficiency_conventions)
+    room = np.inf
+    for ec, ed in cfg.efficiency_conventions:
+        soc = cfg.initial_soc_mwh + ec * n
+        room = min(room, (soc - cfg.soc_min_mwh) * ed / hours - out_mw)
+    return max(0.0, float(room))
 
 
 def _check_gates(infoset) -> None:

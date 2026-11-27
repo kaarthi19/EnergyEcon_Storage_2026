@@ -1,0 +1,4 @@
+# S2: EMA penalises (or disqualifies for) SOC breaches -> keep a wider SOC margin.
+# 6 MWh inside 5-95 % under every efficiency convention (default 2 MWh). See README.md.
+[bess]
+soc_margin_mwh = 6.0
