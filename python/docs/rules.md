@@ -23,7 +23,7 @@ every read:
 | Data | Usable for a period starting at T when | Accessors |
 |---|---|---|
 | Pre-dispatch | `issue_time <= T - 65 min`. Strict default: only T's own rows, lead 2 h, else lead 3 h | `predispatch_for(T)`, `predispatch_for_many(Ts)`, `predispatch_known_at(t)` |
-| Offer stacks | `assumed_publication_time_sgt <= T - 65 min` (= ts + 28 d 8 h, so stacks lag >= 29 days) | `stacks_for(T)`, `stacks_known_at(t)` |
+| Offer stacks | `assumed_publication_time_sgt <= T - 65 min` (= ts + 28 d 8 h, so a stack is usable at least 28 d 9 h 05 min after its period, and at the same time of day only from 29 days back) | `stacks_for(T)`, `stacks_known_at(t)` |
 | Training clearing | the period ended before the decision time: `ts + 30 min < T - 65 min` | `clearing_for(T)`, `clearing_known_at(t)` |
 
 Compute every per-period feature with that period's own cutoff (`infoset.cutoff(T)`), never

@@ -17,7 +17,7 @@ Planned extension modules: engine, backtest, calendar, netdemand, stackmodel, fo
 planner, soc, and ``strategy_full`` (registered as strategy ``"full"``).
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 from .bids import (  # noqa: E402
     AS_PRODUCTS,

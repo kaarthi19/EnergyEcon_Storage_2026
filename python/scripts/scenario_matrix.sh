@@ -53,8 +53,7 @@ esac
 # soc policy of the walk-forward for each scenario (see config/scenarios/README.md)
 policy_of() {
   case "$1" in
-    s1_*clip*) echo clip ;;
-    s1_*reject*) echo reject ;;
+    s1_*) echo clip ;;   # S1 is also evaluated under reject: see the extra run below
     *) echo none ;;
   esac
 }
@@ -84,6 +83,12 @@ run_one() {
     ln -sfn "$WORK_ABS/cache" "$out/eval/cache"
     "$PY" -m bessbid evaluate --data-dir "$DATA_DIR" --work-dir "$out/eval" --no-pf \
       --soc-policy "$(policy_of "$name")" --config "$cfg" > "$out/eval/eval.log" 2>&1 || true
+    if [[ "$name" == s1_* ]]; then
+      mkdir -p "$out/eval_reject"
+      ln -sfn "$WORK_ABS/cache" "$out/eval_reject/cache"
+      "$PY" -m bessbid evaluate --data-dir "$DATA_DIR" --work-dir "$out/eval_reject" --no-pf \
+        --soc-policy reject --config "$cfg" > "$out/eval_reject/eval.log" 2>&1 || true
+    fi
   fi
   local sha="-"
   if [[ -f "$out/submission.xlsx" ]]; then sha="$("$PY" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$out/submission.xlsx")"; fi

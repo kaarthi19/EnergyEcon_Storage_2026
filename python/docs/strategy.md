@@ -457,7 +457,8 @@ with each config's Aug-Oct gain against the default under the same assumption, i
   penalised, and is dispatch SOC-checked before clearing? The plan keeps a 2 MWh margin and
   relies on every fixed band clearing in full (it did in every backtest and stress
   scenario); a band that did not clear would shift the SOC for the rest of the month. A
-  margin that absorbs any single miss costs about 57k per 30 days (see the investigations).
+  config that makes every single miss safe (`s2_robust_c20_m12.toml`) costs about 27k / 38k
+  per 30 days; see `config/scenarios/README.md`, row S2b.
 - **End-of-month SOC.** Is there a requirement? The plan ends at 50 %.
 - **Folder layout.** If EMA's run folder does not hold the template workbook, pass
   `--template`.
